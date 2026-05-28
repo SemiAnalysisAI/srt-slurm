@@ -181,6 +181,20 @@ class BenchmarkStageMixin:
     def _start_perf_monitor(self) -> list[tuple[str, "subprocess.Popen"]]:
         """Start one perfmon process per worker node.
 
+        Output CSV filenames encode the worker role and index so downstream
+        aggregators can attribute power per worker (prefill vs decode):
+
+            perf_samples_<role>_w<worker_idx>_<host>.csv
+
+        where ``role`` is "prefill", "decode", "agg", or "frontend" (for head
+        nodes that run only the dynamo frontend / nginx and have no backend
+        workers). Per the topology allocator's invariant, prefill and decode
+        never share a node, so a single (role, worker_idx) per node is
+        well-defined. When multiple workers of the same role share a node
+        (e.g. 2 decode workers per 8-GPU node), the lowest worker index is
+        used in the filename and the aggregator splits the node's power
+        equally across the colocated workers.
+
         Failures are non-fatal: a warning is logged and that node is skipped.
 
         Returns:
@@ -195,19 +209,42 @@ class BenchmarkStageMixin:
             logger.warning("No worker nodes to monitor")
             return []
 
+        # Group backend processes by node, then derive (role, worker_idx) per
+        # node. Nodes with no backend processes (head-only / frontend-only)
+        # are labeled "frontend".
+        node_workers: dict[str, list[tuple[str, int]]] = {}
+        for p in self.backend_processes:
+            node_workers.setdefault(p.node, []).append((p.endpoint_mode, p.endpoint_index))
+
+        def _label(node: str) -> str:
+            workers = node_workers.get(node, [])
+            if not workers:
+                return f"frontend_w0_{node}"
+            roles = {role for role, _ in workers}
+            if len(roles) > 1:
+                # Allocator should prevent this — log loudly if it ever happens.
+                logger.warning(
+                    "Node %s has mixed worker roles %s; perfmon filename will use the lowest-index role for downstream parsing",
+                    node, sorted(roles),
+                )
+            role = sorted(roles)[0]
+            worker_idx = min(idx for r, idx in workers if r == role)
+            return f"{role}_w{worker_idx}_{node}"
+
         perfmon_script = Path(__file__).parent.parent.parent / "monitor" / "perfmon.py"
         mounts = dict(self.runtime.container_mounts)
         mounts[perfmon_script] = Path("/tmp/srt_perfmon.py")
 
         procs: list[tuple[str, subprocess.Popen]] = []
         for node in worker_nodes:
+            label = _label(node)
             cmd = [
                 "python3", "/tmp/srt_perfmon.py",
-                "--output-csv", f"/logs/perf_samples_{node}.csv",
-                "--output-json", f"/logs/perf_summary_{node}.json",
+                "--output-csv", f"/logs/perf_samples_{label}.csv",
+                "--output-json", f"/logs/perf_summary_{label}.json",
                 "--interval", str(m.sample_interval),
             ]
-            perf_log = self.runtime.log_dir / f"perf_monitor_{node}.out"
+            perf_log = self.runtime.log_dir / f"perf_monitor_{label}.out"
             try:
                 proc = start_srun_process(
                     command=cmd,
@@ -217,7 +254,7 @@ class BenchmarkStageMixin:
                     container_mounts=mounts,
                 )
                 procs.append((node, proc))
-                logger.info("perf monitor started on %s (interval=%.1fs)", node, m.sample_interval)
+                logger.info("perf monitor started on %s as %s (interval=%.1fs)", node, label, m.sample_interval)
             except Exception as e:
                 logger.warning("Failed to start perf monitor on %s: %s - monitoring skipped for this node", node, e)
 

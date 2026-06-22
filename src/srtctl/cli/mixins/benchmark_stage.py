@@ -164,12 +164,15 @@ class BenchmarkStageMixin:
         # Start perf monitoring on all worker nodes (non-fatal if it fails)
         perf_procs = self._start_perf_monitor()
 
-        # Run the benchmark script
-        benchmark_log = self.runtime.log_dir / "benchmark.out"
-        exit_code = self._run_benchmark_script(runner, benchmark_log, stop_event)
-
-        # Stop monitoring regardless of benchmark outcome
-        self._stop_perf_monitor(perf_procs)
+        # Run the benchmark script. Stop monitoring in a finally so a raised
+        # exception (or any early exit) cannot strand the perfmon srun steps:
+        # an orphaned monitor holds its slurm job in CG, which then wedges the
+        # NEXT run's pre-run `squeue --name=<runner>` cleanup drain.
+        try:
+            benchmark_log = self.runtime.log_dir / "benchmark.out"
+            exit_code = self._run_benchmark_script(runner, benchmark_log, stop_event)
+        finally:
+            self._stop_perf_monitor(perf_procs)
 
         if exit_code != 0:
             logger.error("Benchmark failed with exit code %d", exit_code)
@@ -243,6 +246,11 @@ class BenchmarkStageMixin:
                 "--output-csv", f"/logs/perf_samples_{label}.csv",
                 "--output-json", f"/logs/perf_summary_{label}.json",
                 "--interval", str(m.sample_interval),
+                # Backstop: if this monitor is ever orphaned (orchestrator killed
+                # before teardown, signal missed), self-exit after 4h so it can't
+                # hold the slurm job in CG. Far longer than any benchmark, so it
+                # never truncates a real run.
+                "--max-runtime", "14400",
             ]
             perf_log = self.runtime.log_dir / f"perf_monitor_{label}.out"
             try:

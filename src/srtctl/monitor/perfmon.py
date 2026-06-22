@@ -26,13 +26,17 @@ _QUERY = "index,utilization.gpu,memory.used,memory.total,power.draw,temperature.
 _FIELDS = ["gpu", "util_pct", "mem_used_mb", "mem_total_mb", "power_w", "temp_c"]
 
 
-def _sample() -> list[dict]:
+def _sample(timeout: float = 10.0) -> list[dict]:
     try:
         out = subprocess.check_output(
             ["nvidia-smi", f"--query-gpu={_QUERY}", "--format=csv,noheader,nounits"],
             text=True,
+            timeout=timeout,
         )
-    except (FileNotFoundError, subprocess.CalledProcessError):
+    # TimeoutExpired: nvidia-smi can stall under heavy load or at job teardown.
+    # Bounding the call keeps the loop responsive to stop signals so this step
+    # (and its slurm job) can terminate instead of getting stuck in CG.
+    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return []
     rows = []
     for line in out.strip().splitlines():
@@ -70,22 +74,39 @@ def main() -> None:
     parser.add_argument("--output-csv", required=True)
     parser.add_argument("--output-json", required=True)
     parser.add_argument("--interval", type=float, default=1.0)
+    parser.add_argument(
+        "--max-runtime",
+        type=float,
+        default=0.0,
+        help="self-exit after N seconds even if no stop signal arrives (0=disabled); "
+        "a backstop so an orphaned monitor cannot hold its slurm job in CG",
+    )
     args = parser.parse_args()
 
     samples: list[dict] = []
     stop = False
 
-    def handle_sigint(sig, frame):
+    def handle_stop(sig, frame):
         nonlocal stop
         stop = True
 
-    signal.signal(signal.SIGINT, handle_sigint)
+    # Handle SIGINT (the orchestrator's graceful stop) AND SIGTERM (slurm's
+    # job-cancel signal). Without a SIGTERM handler a cancelled job leaves
+    # teardown to the Python default, which never runs if we are blocked
+    # mid-syscall — stranding this step and wedging its job in CG.
+    signal.signal(signal.SIGINT, handle_stop)
+    signal.signal(signal.SIGTERM, handle_stop)
+
+    sample_timeout = max(10.0, args.interval * 5)
+    deadline = time.monotonic() + args.max_runtime if args.max_runtime > 0 else None
 
     with Path(args.output_csv).open("w", newline="") as f:
         writer: csv.DictWriter | None = None
         while not stop:
+            if deadline is not None and time.monotonic() >= deadline:
+                break
             ts = datetime.now(timezone.utc).isoformat()
-            for row in _sample():
+            for row in _sample(sample_timeout):
                 record = {"timestamp": ts, **row}
                 if writer is None:
                     writer = csv.DictWriter(f, fieldnames=list(record.keys()))

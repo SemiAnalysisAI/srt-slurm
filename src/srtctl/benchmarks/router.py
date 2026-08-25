@@ -43,7 +43,7 @@ class RouterRunner(BenchmarkRunner):
     def validate_config(self, config: SrtConfig) -> list[str]:
         errors = []
 
-        # Router benchmark requires sglang frontend
+        # Router benchmark exercises the SGLang router's prefix-aware policies.
         if config.frontend.type != "sglang":
             errors.append("router benchmark requires frontend.type: sglang")
 

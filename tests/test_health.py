@@ -1,13 +1,47 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for health check parsing (Dynamo and SGLang router)."""
+"""Tests for health check parsing (Dynamo and static routers)."""
+
+import threading
+from unittest.mock import MagicMock, patch
 
 from srtctl.core.health import (
     WorkerHealthResult,
     check_dynamo_health,
-    check_sglang_router_health,
+    check_static_router_health,
+    wait_for_http_endpoints,
 )
+
+
+def test_wait_for_http_endpoints_keeps_2p2d_blocked_while_one_base_is_unavailable() -> None:
+    urls = [f"http://{mode}{index}/health" for mode in ("p", "d") for index in range(2)]
+    responses = [
+        MagicMock(status_code=503),
+        MagicMock(status_code=200),
+        MagicMock(status_code=200),
+        MagicMock(status_code=200),
+        *[MagicMock(status_code=200) for _ in urls],
+    ]
+
+    with (
+        patch("srtctl.core.health.requests.get", side_effect=responses) as get,
+        patch("srtctl.core.health.time.sleep"),
+    ):
+        assert wait_for_http_endpoints(urls, timeout=10.0)
+
+    assert [call.args[0] for call in get.call_args_list] == [*urls, *urls]
+
+
+def test_wait_for_http_endpoints_honors_stop_event() -> None:
+    stop_event = threading.Event()
+    stop_event.set()
+
+    with patch("srtctl.core.health.requests.get") as get:
+        assert not wait_for_http_endpoints(["http://p/health"], stop_event=stop_event)
+
+    get.assert_not_called()
+
 
 # ============================================================================
 # Dynamo Health Check Tests
@@ -203,7 +237,7 @@ class TestSGLangRouterHealthDisaggregated:
             },
         }
 
-        result = check_sglang_router_health(response, expected_prefill=1, expected_decode=2)
+        result = check_static_router_health(response, expected_prefill=1, expected_decode=2)
 
         assert result.ready is True
         assert result.prefill_ready == 1
@@ -222,7 +256,7 @@ class TestSGLangRouterHealthDisaggregated:
             },
         }
 
-        result = check_sglang_router_health(response, expected_prefill=4, expected_decode=8)
+        result = check_static_router_health(response, expected_prefill=4, expected_decode=8)
 
         assert result.ready is True
         assert result.prefill_ready == 4
@@ -241,7 +275,7 @@ class TestSGLangRouterHealthDisaggregated:
             },
         }
 
-        result = check_sglang_router_health(response, expected_prefill=4, expected_decode=8)
+        result = check_static_router_health(response, expected_prefill=4, expected_decode=8)
 
         assert result.ready is True
         assert result.prefill_ready == 6
@@ -259,7 +293,7 @@ class TestSGLangRouterHealthDisaggregated:
             },
         }
 
-        result = check_sglang_router_health(response, expected_prefill=4, expected_decode=8)
+        result = check_static_router_health(response, expected_prefill=4, expected_decode=8)
 
         assert result.ready is False
         assert result.prefill_ready == 2
@@ -278,7 +312,7 @@ class TestSGLangRouterHealthDisaggregated:
             },
         }
 
-        result = check_sglang_router_health(response, expected_prefill=4, expected_decode=8)
+        result = check_static_router_health(response, expected_prefill=4, expected_decode=8)
 
         assert result.ready is False
         assert result.decode_ready == 3
@@ -297,7 +331,7 @@ class TestSGLangRouterHealthDisaggregated:
             },
         }
 
-        result = check_sglang_router_health(response, expected_prefill=2, expected_decode=4)
+        result = check_static_router_health(response, expected_prefill=2, expected_decode=4)
 
         assert result.ready is False
         assert result.prefill_ready == 0
@@ -323,7 +357,7 @@ class TestSGLangRouterHealthAggregated:
         }
 
         # Aggregated: expect 0 prefill, 4 decode (regular counts as decode)
-        result = check_sglang_router_health(response, expected_prefill=0, expected_decode=4)
+        result = check_static_router_health(response, expected_prefill=0, expected_decode=4)
 
         assert result.ready is True
         assert result.decode_ready == 4
@@ -342,7 +376,7 @@ class TestSGLangRouterHealthAggregated:
         }
 
         # Aggregated: expect 0 prefill, N decode
-        result = check_sglang_router_health(response, expected_prefill=0, expected_decode=4)
+        result = check_static_router_health(response, expected_prefill=0, expected_decode=4)
 
         assert result.ready is True
         assert result.decode_ready == 4
@@ -360,7 +394,7 @@ class TestSGLangRouterHealthAggregated:
         }
 
         # Both decode and regular should count
-        result = check_sglang_router_health(response, expected_prefill=0, expected_decode=4)
+        result = check_static_router_health(response, expected_prefill=0, expected_decode=4)
 
         assert result.ready is True
         assert result.decode_ready == 4  # 2 decode + 2 regular
@@ -373,7 +407,7 @@ class TestSGLangRouterHealthErrors:
         """Response missing 'stats' key."""
         response = {"workers": []}
 
-        result = check_sglang_router_health(response, expected_prefill=1, expected_decode=1)
+        result = check_static_router_health(response, expected_prefill=1, expected_decode=1)
 
         assert result.ready is False
         assert "stats" in result.message
@@ -382,7 +416,7 @@ class TestSGLangRouterHealthErrors:
         """Empty response dict."""
         response = {}
 
-        result = check_sglang_router_health(response, expected_prefill=1, expected_decode=1)
+        result = check_static_router_health(response, expected_prefill=1, expected_decode=1)
 
         assert result.ready is False
 
@@ -390,7 +424,7 @@ class TestSGLangRouterHealthErrors:
         """Missing count fields default to 0."""
         response = {"stats": {}}
 
-        result = check_sglang_router_health(response, expected_prefill=1, expected_decode=1)
+        result = check_static_router_health(response, expected_prefill=1, expected_decode=1)
 
         assert result.ready is False
         assert result.prefill_ready == 0

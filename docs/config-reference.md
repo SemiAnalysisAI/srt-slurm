@@ -270,7 +270,8 @@ Frontend/router configuration.
 
 ```yaml
 frontend:
-  # Frontend type: "dynamo" (default), "sglang", or "trtllm_serve"
+  # Frontend type: "dynamo" (default), "sglang", "vllm-router",
+  # "trtllm_serve", or direct "vllm".
   type: dynamo
 
   # Scaling
@@ -290,19 +291,42 @@ frontend:
   # Environment variables for frontend processes
   env:
     MY_VAR: "value"
+
+  # Optional router-specific image; defaults to model.container
+  container_image: "router-image"
 ```
 
 | Field                       | Type | Default       | Description                         |
 | --------------------------- | ---- | ------------- | ----------------------------------- |
-| `type`                      | str  | dynamo        | Frontend type: "dynamo", "sglang", or "trtllm_serve" |
+| `type`                      | str  | dynamo        | Frontend type: `dynamo`, `sglang`, `vllm-router`, `trtllm_serve`, or direct `vllm` |
 | `enable_multiple_frontends` | bool | true          | Scale with nginx + multiple routers |
 | `num_additional_frontends`  | int  | 9             | Additional routers beyond master    |
 | `nginx_container`           | str  | nginx:1.27.4  | Custom nginx container image        |
 | `nginx_raise_ulimit`      | bool | false         | When true with nginx in use, run `ulimit -n 1048576` before nginx and emit `worker_rlimit_nofile 1048576` in generated `nginx.conf`. Off by default so restrictive clusters do not fail. Cluster `srtslurm.yaml` may set `nginx_raise_ulimit` for jobs that omit this field. |
 | `args`                      | dict | null          | CLI args for the frontend           |
 | `env`                       | dict | null          | Env vars for frontend processes     |
+| `container_image`           | str  | null          | Router process image; defaults to `model.container` |
+
+For `vllm-router`, srtctl sets Router's `--worker-startup-timeout-secs` to the
+total `health_check` window so large-model compilation cannot outlive the router.
+Set `frontend.args.worker-startup-timeout-secs` to override it explicitly.
 
 See [SGLang Router](sglang-router.md) for detailed architecture.
+
+### vllm-router frontend
+
+`type: vllm-router` pairs with `backend.type: vllm` and launches the official
+`vllm-router` process against direct private `vllm serve` endpoints. Aggregate
+layouts use `--worker-urls`; disaggregated layouts use
+`--vllm-pd-disaggregation` with the allocated prefill and decode URLs. For
+data-parallel endpoints, srtctl derives Router's
+`--intra-node-data-parallel-size`. Router expands each node-local backend URL
+into DP-aware targets and injects `X-Data-Parallel-Rank`; vLLM continues to own
+the engine processes behind that HTTP server. Multi-node DP endpoints use one
+hybrid-LB `vllm serve` process per node and require
+`backend.dp_launch_mode: per_node`. Direct `frontend.type: vllm` retains its
+existing single-server behavior. No NATS or etcd infrastructure is started for
+this frontend.
 
 ### trtllm_serve frontend
 
@@ -424,9 +448,16 @@ Each worker leader gets a globally unique port starting at 5550:
 
 ### vLLM DP launch mode
 
-vLLM data-parallel endpoints use one process per GPU by default. Set
-`dp_launch_mode: per_node` to launch one process per node and let vLLM
-manage the local DP ranks in a shared CUDA namespace:
+Direct `frontend.type: vllm` and single-node `frontend.type: vllm-router`
+deployments preserve vLLM's native behavior: one `vllm serve` command owns the
+configured TP, PP, PCP, and DP ranks and performs its normal internal DP load
+balancing. `dp_launch_mode` controls only the cases where srtctl must split a
+DP deployment into separately launched processes (Dynamo compatibility or a
+multi-node vLLM Router endpoint).
+
+Set `dp_launch_mode: per_node` for a multi-node DP endpoint. srtctl launches one
+hybrid-LB server per node and derives the local DP rank range from the model
+parallelism and Slurm allocation:
 
 ```yaml
 backend:
@@ -439,26 +470,52 @@ backend:
       data-parallel-size: 16
 ```
 
-| Value      | Process layout                                      |
-| ---------- | --------------------------------------------------- |
-| `per_gpu`  | One process per DP rank/GPU (default)               |
-| `per_node` | One process manages all DP ranks allocated per node |
+| Value      | Process layout                                                        |
+| ---------- | --------------------------------------------------------------------- |
+| `per_rank` | Legacy Dynamo layout: one process per DP rank; requires TP=PP=PCP=1   |
+| `per_node` | One process manages all complete node-local DP replicas               |
 
-`per_gpu` remains the compatibility default for now, but srtslurm will switch
-the default to `per_node` in a future release. Existing vLLM DP configurations
-should set `backend.dp_launch_mode: per_node` now; srtslurm emits a
-configuration-time migration warning while they still use `per_gpu`.
+`per_gpu` remains accepted as a deprecated compatibility alias for `per_rank`.
+The process boundary is the DP rank; it corresponds to one GPU only under the
+required TP=PP=PCP=1 topology.
 
-In `per_node` mode, srtslurm derives `--data-parallel-size-local` and
-`--data-parallel-start-rank` from the allocated topology. Do not set those
-two flags manually. srtslurm also always enables `--data-parallel-hybrid-lb`
-so every node-local process registers with the Dynamo frontend. This is the
-recommended vLLM topology for Dynamo and ensures the frontend can route to
-each node-local DP engine. Do not set `data-parallel-hybrid-lb` manually;
-srtslurm enables it automatically, warns when it is configured, and ignores
-the configured value. `headless` is incompatible with `per_node` DP because a
-headless process does not register with Dynamo, so srtslurm rejects that
-combination during configuration loading.
+For `frontend.type: vllm-router`, Router-native DP expansion keeps one backend
+URL per node and sends `X-Data-Parallel-Rank` to select a node-local engine. A
+single-node endpoint needs no special launch mode. A multi-node DP endpoint must
+use `per_node`; srtctl then derives the global/local DP topology and advertises
+each node-local HTTP server to Router. All routed backends must have the same
+node-local DP size because Router exposes one global
+`--intra-node-data-parallel-size` setting.
+
+For every vLLM Router worker, srtctl validates that the allocation exactly
+matches vLLM's process world: `GPUs = DP * TP * PP * PCP`. In `per_node` mode,
+the derived local DP size is `GPUs on the node / (TP * PP * PCP)`. Non-integral
+or under/over-allocated layouts fail during recipe loading, before Slurm starts.
+
+In `per_node` mode, srtctl owns the scheduling fields
+`data-parallel-size-local`, `data-parallel-start-rank`,
+`data-parallel-address`, `data-parallel-rpc-port`,
+`data-parallel-hybrid-lb`, and `headless`. Recipes must not set them manually;
+srtctl rejects those combinations rather than silently overriding potentially
+contradictory values.
+
+### vLLM device binding compatibility
+
+Direct `vllm` and `vllm-router` frontends use vLLM's `--device-ids` option by
+default. For stable vLLM releases from before
+[vllm-project/vllm#45026](https://github.com/vllm-project/vllm/pull/45026),
+select the existing CUDA namespace binding instead:
+
+```yaml
+backend:
+  type: vllm
+  set_cuda_visible_devices: true
+```
+
+srtslurm then omits `--device-ids` and scopes sub-node workers with
+`CUDA_VISIBLE_DEVICES`. A worker that owns every GPU on its node needs no
+explicit CUDA mask. This setting changes only device binding; worker topology,
+private router ports, and P/D KV-transfer arguments remain unchanged.
 
 ### TRTLLM Backend
 

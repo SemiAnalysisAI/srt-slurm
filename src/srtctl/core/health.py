@@ -9,8 +9,9 @@ This module provides:
 - wait_for_health(): HTTP health check with worker count validation
 - wait_for_etcd(): Wait for etcd to be ready
 - wait_for_model(): Wait for model with worker count validation (replaces bash version)
+- wait_for_http_endpoints(): Wait until every adapter-provided HTTP endpoint is ready
 - check_dynamo_health(): Parse dynamo /health response for worker counts
-- check_sglang_router_health(): Parse sglang /workers response for worker counts
+- check_static_router_health(): Parse static-router /workers response for worker counts
 """
 
 import logging
@@ -46,12 +47,14 @@ class WorkerHealthResult:
 # ============================================================================
 
 
-def check_sglang_router_health(
+# "Static router" means SGLang Router or vLLM Router; both expose worker
+# counts through the same /workers stats.
+def check_static_router_health(
     response_json: dict,
     expected_prefill: int,
     expected_decode: int,
 ) -> WorkerHealthResult:
-    """Check health using sglang router /workers endpoint response.
+    """Check health using the shared static-router /workers response.
 
     Expected response format:
     {
@@ -398,6 +401,60 @@ def wait_for_etcd(
 # ============================================================================
 
 
+def wait_for_http_endpoints(
+    urls: list[str],
+    poll_interval: float = 1.0,
+    timeout: float = 600.0,
+    report_every: float = 60.0,
+    stop_event: threading.Event | None = None,
+) -> bool:
+    """Wait until every URL returns HTTP 200 in the same polling pass.
+
+    Frontend adapters use this for direct backend readiness requirements that
+    are additional to the frontend's own health response.
+    """
+    targets = list(dict.fromkeys(urls))
+    if not targets:
+        return True
+
+    logger.info("Polling %d backend health endpoints every %.1fs", len(targets), poll_interval)
+    start_time = time.time()
+    last_report_time = start_time
+
+    while True:
+        if stop_event and stop_event.is_set():
+            logger.warning("Wait for backend health endpoints aborted by stop event")
+            return False
+
+        if time.time() - start_time >= timeout:
+            logger.error("Backend health endpoints did not all become ready in %.0f seconds", timeout)
+            return False
+
+        pending: list[str] = []
+        for url in targets:
+            try:
+                response = requests.get(url, timeout=5.0)
+                if response.status_code != 200:
+                    pending.append(url)
+            except requests.exceptions.RequestException:
+                pending.append(url)
+
+        if not pending:
+            logger.info("All %d backend health endpoints are ready", len(targets))
+            return True
+
+        if time.time() - last_report_time >= report_every:
+            logger.info(
+                "Waiting for %d/%d backend health endpoints: %s",
+                len(pending),
+                len(targets),
+                ", ".join(pending),
+            )
+            last_report_time = time.time()
+
+        time.sleep(poll_interval)
+
+
 def wait_for_model(
     host: str,
     port: int,
@@ -422,20 +479,25 @@ def wait_for_model(
         poll_interval: Seconds between health checks
         timeout: Maximum wait time in seconds
         report_every: Log progress every N seconds
-        frontend_type: Frontend type - "sglang" uses /workers, "dynamo" uses /health
+        frontend_type: Registered frontend type; its adapter selects and parses
+            the appropriate health endpoint.
         stop_event: Optional threading.Event to abort waiting
 
     Returns:
         True if model is ready with expected workers, False if timeout/aborted
     """
-    if frontend_type == "sglang":
-        health_url = f"http://{host}:{port}/workers"
+    from srtctl.frontends import get_frontend
+
+    frontend = get_frontend(frontend_type)
+    health_url = f"http://{host}:{port}{frontend.health_endpoint}"
+    if frontend.health_endpoint == "/workers":
         logger.info(
-            "Polling %s every %.1fs for %d prefills and %d decodes (sglang frontend)",
+            "Polling %s every %.1fs for %d prefills and %d decodes (%s frontend)",
             health_url,
             poll_interval,
             n_prefill,
             n_decode,
+            frontend_type,
         )
     else:
         health_url = f"http://{host}:{port}/health"
@@ -484,11 +546,7 @@ def wait_for_model(
 
                 response_json = response.json()
 
-                # Check worker counts based on frontend type
-                if frontend_type == "sglang":
-                    result = check_sglang_router_health(response_json, n_prefill, n_decode)
-                else:
-                    result = check_dynamo_health(response_json, n_prefill, n_decode)
+                result = frontend.parse_health(response_json, n_prefill, n_decode)
 
                 if result.ready:
                     logger.info(result.message)

@@ -19,6 +19,7 @@ import yaml
 
 from srtctl.core.health import WorkerHealthResult, check_trtllm_serve_health, wait_for_health
 from srtctl.core.slurm import get_hostname_ip, start_srun_process
+from srtctl.frontends.base import register_frontend
 
 if TYPE_CHECKING:
     from srtctl.core.processes import ManagedProcess
@@ -28,6 +29,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+@register_frontend("trtllm_serve")
 class TRTLLMServeFrontend:
     """trtllm-serve disaggregated frontend.
 
@@ -52,6 +54,11 @@ class TRTLLMServeFrontend:
     ) -> WorkerHealthResult:
         """Parse trtllm-serve /health response (200 => ready)."""
         return check_trtllm_serve_health(response_json, expected_prefill, expected_decode)
+
+    def get_backend_health_urls(self, backend: Any, backend_processes: list["Process"]) -> list[str]:
+        """trtllm-serve gates its configured workers before its own health succeeds."""
+        del backend, backend_processes
+        return []
 
     def get_frontend_args_list(self, args: dict[str, Any] | None) -> list[str]:
         """Convert frontend args dict to CLI arguments."""

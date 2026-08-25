@@ -34,10 +34,9 @@ from .formatting import FormattablePath, FormattableString
 from .health import (
     WorkerHealthResult,
     check_dynamo_health,
-    check_static_router_health,
+    check_sglang_router_health,
     wait_for_etcd,
     wait_for_health,
-    wait_for_http_endpoints,
     wait_for_model,
     wait_for_port,
 )
@@ -120,7 +119,7 @@ __all__ = [
     "WorkerHealthResult",
     "allocate_endpoints",
     "check_dynamo_health",
-    "check_static_router_health",
+    "check_sglang_router_health",
     "endpoints_to_processes",
     "find_cluster_config_path",
     "get_container_mounts_str",
@@ -141,7 +140,6 @@ __all__ = [
     "start_srun_process",
     "wait_for_etcd",
     "wait_for_health",
-    "wait_for_http_endpoints",
     "wait_for_model",
     # Health checks
     "wait_for_port",

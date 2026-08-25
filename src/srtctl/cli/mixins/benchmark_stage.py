@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from srtctl.core.fingerprint import format_identity_verification, verify_identity
-from srtctl.core.health import wait_for_http_endpoints, wait_for_model
+from srtctl.core.health import wait_for_model
 from srtctl.core.lockfile import collect_worker_fingerprints
 from srtctl.core.slurm import get_hostname_ip, start_srun_process
 from srtctl.core.status import JobStage, JobStatus, StatusReporter
@@ -54,7 +54,7 @@ def _vllm_health_entries(
 ) -> int:
     """Return expected Dynamo generate registrations for a vLLM worker mode."""
     dp_size = _vllm_data_parallel_size(config, mode)
-    if dp_size > 1 and getattr(config.backend, "dp_launch_mode", "per_rank") == "per_node":
+    if dp_size > 1 and getattr(config.backend, "dp_launch_mode", "per_gpu") == "per_node":
         if backend_processes is None:
             raise ValueError("backend_processes are required for per-node DP health expectations")
         endpoint_mode = "agg" if mode == "aggregated" else mode
@@ -70,9 +70,8 @@ def _get_health_expectations(
 
     Dynamo's /health endpoint reports registered generate instances. For vLLM
     DP workers, per-GPU launch registers one entry per DP rank, while per-node
-    launch registers one entry per node-local process. vLLM Router expands each
-    routed backend URL into its node-local DP ranks. Other frontends keep using
-    logical worker counts.
+    launch registers one entry per node-local process. Other frontends keep
+    using logical worker counts.
     """
     r = config.resources
 
@@ -94,24 +93,6 @@ def _get_health_expectations(
             n_decode = _vllm_health_entries(config, "decode", logical_decode, backend_processes)
 
         count_desc = f"{n_prefill}P + {n_decode}D Dynamo generate instances; logical workers: {worker_desc}"
-        return n_prefill, n_decode, count_desc, n_prefill + n_decode
-
-    if config.frontend.type == "vllm-router" and backend_processes is not None:
-        from srtctl.frontends.vllm_router import node_local_data_parallel_size
-
-        local_dp_size = node_local_data_parallel_size(config.backend, backend_processes)
-
-        n_prefill = sum(
-            local_dp_size
-            for process in backend_processes
-            if process.endpoint_mode == "prefill" and process.http_port > 0
-        )
-        n_decode = sum(
-            local_dp_size
-            for process in backend_processes
-            if process.endpoint_mode in {"decode", "agg"} and process.http_port > 0
-        )
-        count_desc = f"{n_prefill}P + {n_decode}D Router DP workers; logical workers: {worker_desc}"
         return n_prefill, n_decode, count_desc, n_prefill + n_decode
 
     count_desc = worker_desc
@@ -165,10 +146,11 @@ class BenchmarkStageMixin:
         )
 
     def _logical_worker_endpoints(self) -> list[tuple[str, str, int]]:
-        """Return ``(mode, IP, port)`` for every routable worker endpoint.
+        """Return ``(mode, IP, port)`` for every logical worker leader.
 
-        ``backend_processes`` may contain non-routable TP followers (HTTP port
-        zero) or multiple node-local vLLM DP pools (one positive port per pool).
+        ``backend_processes`` contains one process per physical node for
+        multi-node workers. Only rank zero owns the logical worker endpoint,
+        so follower ranks must not be advertised to benchmark clients.
 
         Dynamo exposes worker metrics on each leader's system port. Other
         frontends expose them on the worker HTTP port, matching the endpoint
@@ -177,7 +159,7 @@ class BenchmarkStageMixin:
         use_sys_port = self.config.frontend.type == "dynamo"
         endpoints: list[tuple[str, str, int]] = []
         for process in self.backend_processes:
-            if use_sys_port and not process.is_leader:
+            if not process.is_leader:
                 continue
             port = process.sys_port if use_sys_port else process.http_port
             if port <= 0:
@@ -226,27 +208,6 @@ class BenchmarkStageMixin:
             if reporter:
                 reporter.report(JobStatus.FAILED, JobStage.BENCHMARK, "Workers failed health check")
             return 1
-
-        from srtctl.frontends import get_frontend
-
-        frontend = get_frontend(self.config.frontend.type)
-        backend_health_urls = frontend.get_backend_health_urls(self.config.backend, self.backend_processes)
-        if backend_health_urls:
-            logger.info(
-                "Frontend requires direct readiness from %d advertised backend URLs",
-                len(backend_health_urls),
-            )
-            if not wait_for_http_endpoints(
-                backend_health_urls,
-                poll_interval=float(hc.interval_seconds),
-                timeout=float(hc.max_attempts * hc.interval_seconds),
-                report_every=60.0,
-                stop_event=stop_event,
-            ):
-                logger.error("Advertised backend URLs did not become healthy")
-                if reporter:
-                    reporter.report(JobStatus.FAILED, JobStage.BENCHMARK, "Backends failed direct health check")
-                return 1
 
         logger.info("Server is healthy - starting benchmark")
 
@@ -511,14 +472,11 @@ class BenchmarkStageMixin:
                 logical_endpoints = self._logical_worker_endpoints()
             urls = [f"http://{host}:{port}/metrics" for _, host, port in logical_endpoints]
         else:
-            if self.config.frontend.type in {"vllm", "vllm-router"}:
+            if self.config.frontend.type == "vllm":
                 for process in self.backend_processes:
-                    if self.config.frontend.type == "vllm" and process.is_leader:
+                    if process.endpoint_mode == "agg" and process.is_leader:
                         host = get_hostname_ip(process.node, self.runtime.network_interface)
                         urls.append(f"http://{host}:{FRONTEND_PUBLIC_PORT}/metrics")
-                    elif self.config.frontend.type == "vllm-router" and process.http_port > 0:
-                        host = get_hostname_ip(process.node, self.runtime.network_interface)
-                        urls.append(f"http://{host}:{process.http_port}/metrics")
                 if urls:
                     return {"AIPERF_SERVER_METRICS_URLS": ",".join(sorted(set(urls)))}
 

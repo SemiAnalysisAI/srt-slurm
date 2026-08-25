@@ -1,7 +1,6 @@
 # SGLang Router Mode
 
-This page explains the first-class SGLang Model Gateway router mode for aggregate
-and prefill-decode (PD) topologies, an alternative to the default Dynamo frontend.
+This page explains the sglang router mode for prefill-decode (PD) disaggregation, an alternative to the default Dynamo frontend architecture.
 
 ## Table of Contents
 
@@ -43,9 +42,7 @@ frontend:
   type: sglang
 ```
 
-Workers launch with `sglang.launch_server` instead of `dynamo.sglang`, and the
-router receives only logical worker-leader URLs from srtctl's allocated
-topology.
+That's it. The workers will launch with `sglang.launch_server` instead of `dynamo.sglang`, and the router will handle request distribution.
 
 ### Router Arguments
 

@@ -10,10 +10,8 @@ Frontend types handle:
 - Building CLI arguments from config
 """
 
-import shlex
 import threading
-from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 if TYPE_CHECKING:
     from srtctl.core.health import WorkerHealthResult
@@ -22,45 +20,7 @@ if TYPE_CHECKING:
     from srtctl.core.topology import Process
 
 # Supported frontend types - extensible by adding new literals
-FrontendType = Literal["dynamo", "sglang", "trtllm_serve", "vllm", "vllm-router"]
-
-FrontendFactory = Callable[[], "FrontendProtocol"]
-_FRONTEND_REGISTRY: dict[str, FrontendFactory] = {}
-_FrontendClass = TypeVar("_FrontendClass", bound=type)
-
-
-def register_frontend(*names: str) -> Callable[[_FrontendClass], _FrontendClass]:
-    """Register a frontend implementation under one or more config names."""
-
-    def decorator(frontend_class: _FrontendClass) -> _FrontendClass:
-        for name in names:
-            if name in _FRONTEND_REGISTRY:
-                raise ValueError(f"Frontend type {name!r} is already registered")
-            _FRONTEND_REGISTRY[name] = frontend_class
-        return frontend_class
-
-    return decorator
-
-
-def _load_builtin_frontends() -> None:
-    """Import built-ins once so their registration decorators run."""
-    from srtctl.frontends import dynamo, sglang, trtllm_serve, vllm, vllm_router  # noqa: F401
-
-
-def build_setup_script_preamble(setup_script: str | None) -> str | None:
-    """Build the standard in-container recipe setup-script invocation."""
-    if not setup_script:
-        return None
-    script_name = shlex.quote(setup_script)
-    return (
-        f"setup_script={script_name} && "
-        'script_path="/configs/${setup_script}" && '
-        'patch_script_path="/configs/patches/${setup_script}" && '
-        'echo "Running setup script: ${script_path} (fallback ${patch_script_path})" && '
-        'if [ -f "${script_path}" ]; then bash "${script_path}"; '
-        'elif [ -f "${patch_script_path}" ]; then bash "${patch_script_path}"; '
-        'else echo "WARNING: ${script_path} or ${patch_script_path} not found"; fi'
-    )
+FrontendType = Literal["dynamo", "sglang", "trtllm_serve", "vllm"]
 
 
 class FrontendProtocol(Protocol):
@@ -89,19 +49,6 @@ class FrontendProtocol(Protocol):
         expected_decode: int,
     ) -> "WorkerHealthResult":
         """Parse health check response and return worker status."""
-        ...
-
-    def get_backend_health_urls(
-        self,
-        backend: Any,
-        backend_processes: list["Process"],
-    ) -> list[str]:
-        """Return backend URLs that must be directly healthy before benchmarking.
-
-        Frontends that discover or gate their own backends return an empty list.
-        Static adapters may use this hook to require readiness at the exact URLs
-        they advertise to their router.
-        """
         ...
 
     def start_frontends(
@@ -146,10 +93,19 @@ def get_frontend(frontend_type: str) -> FrontendProtocol:
     Raises:
         ValueError: If frontend type is unknown
     """
-    _load_builtin_frontends()
-    try:
-        factory = _FRONTEND_REGISTRY[frontend_type]
-    except KeyError as exc:
-        supported = ", ".join(sorted(_FRONTEND_REGISTRY))
-        raise ValueError(f"Unknown frontend type: {frontend_type!r}. Supported: {supported}") from exc
-    return factory()
+    # Import here to avoid circular imports
+    from srtctl.frontends.dynamo import DynamoFrontend
+    from srtctl.frontends.sglang import SGLangFrontend
+    from srtctl.frontends.trtllm_serve import TRTLLMServeFrontend
+    from srtctl.frontends.vllm import VLLMFrontend
+
+    if frontend_type == "dynamo":
+        return DynamoFrontend()
+    elif frontend_type == "sglang":
+        return SGLangFrontend()
+    elif frontend_type == "trtllm_serve":
+        return TRTLLMServeFrontend()
+    elif frontend_type == "vllm":
+        return VLLMFrontend()
+    else:
+        raise ValueError(f"Unknown frontend type: {frontend_type!r}. Supported: dynamo, sglang, trtllm_serve, vllm")

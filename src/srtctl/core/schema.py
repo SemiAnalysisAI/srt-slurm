@@ -1437,8 +1437,7 @@ class FrontendConfig:
     """Frontend/router configuration.
 
     Attributes:
-        type: Frontend type - "dynamo" (default), "sglang", "vllm-router",
-            "trtllm_serve", or direct "vllm".
+        type: Frontend type - "dynamo" (default), "sglang", "trtllm_serve", or "vllm"
         enable_multiple_frontends: Scale with nginx + multiple routers.
             When ``True`` (default), srtctl stands up nginx and fans out
             to ``num_additional_frontends + 1`` router replicas. When
@@ -1464,8 +1463,6 @@ class FrontendConfig:
             carry the session id in that header instead.
         args: CLI arguments passed to the frontend/router process
         env: Environment variables for frontend processes
-        container_image: Optional router-specific container image. Defaults to
-            the model/backend container when omitted.
     """
 
     type: str = "dynamo"
@@ -1478,7 +1475,6 @@ class FrontendConfig:
     nginx_keepalive_timeout: str = "600s"
     args: dict[str, Any] | None = None
     env: dict[str, str] | None = None
-    container_image: str | None = None
     # trtllm_serve orchestrator (ser.yaml) options; ignored by other frontends.
     ctx_router: dict[str, Any] | None = None  # context_servers.router, e.g. {type: conversation}
     gen_router: dict[str, Any] | None = None  # generation_servers.router
@@ -1592,8 +1588,6 @@ class SrtConfig:
         self._validate_het_jobs()
         self._validate_trtllm_serve()
         self._validate_vllm_frontend()
-        self._validate_static_router_frontend()
-        self._validate_sglang_data_parallelism()
 
     def _validate_trtllm_serve(self):
         """Catch trtllm_serve misconfigurations at load time (dry-run) instead of
@@ -1640,112 +1634,6 @@ class SrtConfig:
             raise ValidationError("frontend.type: vllm requires resources.agg_workers >= 1")
         if (self.resources.agg_nodes or 1) != 1:
             raise ValidationError("frontend.type: vllm currently supports single-node aggregate jobs only")
-        try:
-            dp_size = int(self.backend._get_dp_size("agg") or 1)
-            if dp_size < 1:
-                raise ValueError(f"vLLM agg data-parallel-size must be a positive integer; got {dp_size!r}")
-            model_parallel_size = self.backend._get_model_parallel_size("agg")
-        except (TypeError, ValueError) as exc:
-            raise ValidationError(str(exc)) from exc
-        required_gpus = dp_size * model_parallel_size
-        if required_gpus != self.resources.gpus_per_agg:
-            raise ValidationError(
-                f"direct vLLM parallelism requires DP*TP*PP*PCP={dp_size}*{model_parallel_size}="
-                f"{required_gpus} GPUs, but resources allocate {self.resources.gpus_per_agg} GPUs per worker"
-            )
-
-    def _validate_static_router_frontend(self):
-        """Validate native static-router/backend pairings and endpoint shape."""
-        required_backend = {
-            "sglang": "sglang",
-            "vllm-router": "vllm",
-        }.get(self.frontend.type)
-        if required_backend is None:
-            return
-        if self.backend_type != required_backend:
-            raise ValidationError(
-                f"frontend.type: {self.frontend.type} requires backend.type: {required_backend}; "
-                f"got {self.backend_type!r}"
-            )
-
-        if self.frontend.type == "vllm-router":
-            endpoint_gpu_counts = {
-                "prefill": self.resources.gpus_per_prefill if self.resources.num_prefill else 0,
-                "decode": self.resources.gpus_per_decode if self.resources.num_decode else 0,
-                "agg": self.resources.gpus_per_agg if self.resources.num_agg else 0,
-            }
-            multi_node_modes = [
-                mode for mode, count in endpoint_gpu_counts.items() if count > self.resources.gpus_per_node
-            ]
-            if multi_node_modes and self.backend.dp_launch_mode != "per_node":
-                raise ValidationError("multi-node vLLM Router DP endpoints require backend.dp_launch_mode: per_node")
-            for mode in multi_node_modes:
-                if not self.backend._is_dp_mode(mode):
-                    raise ValidationError(
-                        f"multi-node vLLM Router {mode} endpoints require data-parallel-size; "
-                        "multi-node TP-only direct serving is not supported"
-                    )
-
-            local_dp_sizes: dict[str, int] = {}
-            for mode, gpu_count in endpoint_gpu_counts.items():
-                if gpu_count == 0:
-                    continue
-                try:
-                    dp_size = int(self.backend._get_dp_size(mode) or 1)
-                    if dp_size < 1:
-                        raise ValueError(f"vLLM {mode} data-parallel-size must be a positive integer; got {dp_size!r}")
-                    model_parallel_size = self.backend._get_model_parallel_size(mode)
-                except (TypeError, ValueError) as exc:
-                    raise ValidationError(str(exc)) from exc
-                required_gpus = int(dp_size) * model_parallel_size
-                if required_gpus != gpu_count:
-                    raise ValidationError(
-                        f"vLLM Router {mode} parallelism requires DP*TP*PP*PCP="
-                        f"{int(dp_size)}*{model_parallel_size}={required_gpus} GPUs, "
-                        f"but resources allocate {gpu_count} GPUs per worker"
-                    )
-                local_gpu_count = min(gpu_count, self.resources.gpus_per_node)
-                try:
-                    local_dp_sizes[mode] = self.backend._get_local_dp_size(mode, local_gpu_count)
-                except ValueError as exc:
-                    raise ValidationError(str(exc)) from exc
-
-            if len(set(local_dp_sizes.values())) > 1:
-                sizes = ", ".join(f"{mode}={size}" for mode, size in local_dp_sizes.items())
-                raise ValidationError(
-                    "vLLM Router requires the same node-local data-parallel size for every routed backend; "
-                    f"derived {sizes}"
-                )
-
-    def _validate_sglang_data_parallelism(self):
-        """Reject SGLang TP/DP combinations that the server cannot initialize.
-
-        SGLang partitions each tensor-parallel group across its data-parallel
-        attention ranks, so ``tp_size`` must be divisible by ``dp_size``.  Its
-        CLI otherwise accepts the flags and fails later in ``ServerArgs`` after
-        the Slurm allocation and container have already started.
-        """
-        if self.backend_type != "sglang":
-            return
-
-        sglang_cfg = getattr(self.backend, "sglang_config", None)
-        if sglang_cfg is None:
-            return
-
-        for mode, mode_cfg in (
-            ("prefill", sglang_cfg.prefill),
-            ("decode", sglang_cfg.decode),
-            ("aggregated", sglang_cfg.aggregated),
-        ):
-            if not mode_cfg:
-                continue
-            tp_size = int(mode_cfg.get("tp-size", mode_cfg.get("tp_size", 1)))
-            dp_size = int(mode_cfg.get("dp-size", mode_cfg.get("dp_size", 1)))
-            if tp_size % dp_size != 0:
-                raise ValidationError(
-                    f"sglang_config.{mode}: tp-size={tp_size} must be divisible by "
-                    f"dp-size={dp_size}; SGLang rejects this data-parallel layout"
-                )
 
     def _validate_het_jobs(self):
         """When ``resources.het_jobs`` is set to True, enforce supported shape.

@@ -541,48 +541,6 @@ class TestSGLangProtocol:
         assert config.is_grpc_mode("decode") is True
         assert config.is_grpc_mode("agg") is False
 
-    @pytest.mark.parametrize(
-        ("frontend_type", "mode", "expected"),
-        [
-            ("sglang", "prefill", True),
-            ("sglang", "decode", True),
-            ("sglang", "agg", False),
-            ("dynamo", "decode", False),
-        ],
-    )
-    def test_static_router_pd_workers_skip_local_fake_bootstrap_warmup(
-        self, frontend_type: str, mode: str, expected: bool
-    ) -> None:
-        """Only native P/D routing relies on the router-level warmup."""
-        from unittest.mock import MagicMock, patch
-
-        from srtctl.core.topology import Process
-
-        process = Process(
-            node="node0",
-            gpu_indices=frozenset(range(8)),
-            sys_port=8081,
-            http_port=6100,
-            endpoint_mode=mode,
-            endpoint_index=0,
-            node_rank=0,
-            bootstrap_port=7200,
-        )
-        runtime = MagicMock()
-        runtime.model_path = Path("/model")
-        runtime.is_hf_model = False
-        runtime.request_plane = "tcp"
-
-        with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):
-            command = SGLangProtocol().build_worker_command(
-                process=process,
-                endpoint_processes=[process],
-                runtime=runtime,
-                frontend_type=frontend_type,
-            )
-
-        assert ("--skip-server-warmup" in command) is expected
-
 
 class TestServedModelName:
     """Tests for served_model_name property extraction from backend configs."""
@@ -856,26 +814,6 @@ class TestFrontendConfig:
         assert resolved["telemetry"]["container_image"] == "/path/to/scraper.sqsh"
         assert resolved["telemetry"]["dcgm_exporter"]["container_image"] == "/path/to/dcgm.sqsh"
         assert resolved["telemetry"]["node_exporter"]["container_image"] == "/path/to/node.sqsh"
-
-    def test_router_container_alias_resolves(self):
-        from srtctl.core.config import resolve_config_with_defaults
-
-        user_config = {
-            "name": "test",
-            "model": {"path": "/model", "container": "worker", "precision": "fp8"},
-            "resources": {"gpu_type": "h100", "gpus_per_node": 8, "agg_nodes": 1},
-            "frontend": {"type": "vllm-router", "container_image": "router"},
-        }
-        cluster_config = {
-            "containers": {
-                "worker": "/path/to/worker.sqsh",
-                "router": "/path/to/router.sqsh",
-            }
-        }
-
-        resolved = resolve_config_with_defaults(user_config, cluster_config)
-
-        assert resolved["frontend"]["container_image"] == "/path/to/router.sqsh"
 
     def test_telemetry_literal_paths_pass_through(self):
         from srtctl.core.config import resolve_config_with_defaults
@@ -1953,11 +1891,6 @@ class TestVLLMDataParallelMode:
         assert backend._is_dp_mode("prefill") is False
         assert backend._is_dp_mode("decode") is False
 
-        backend_dp_one = VLLMProtocol(
-            vllm_config=VLLMServerConfig(prefill={"tensor-parallel-size": 4, "data-parallel-size": 1})
-        )
-        assert backend_dp_one._is_dp_mode("prefill") is False
-
         # DP mode detected when data-parallel-size is set
         backend_dp = VLLMProtocol(
             vllm_config=VLLMServerConfig(
@@ -1969,17 +1902,8 @@ class TestVLLMDataParallelMode:
         assert backend_dp._is_dp_mode("decode") is True
         assert backend_dp._get_dp_size("prefill") == 16
 
-    def test_dp_size_must_be_positive(self):
-        """A zero DP size must not silently fall back to vLLM's default."""
-        from marshmallow import ValidationError
-
-        from srtctl.backends import VLLMProtocol, VLLMServerConfig
-
-        with pytest.raises(ValidationError, match="must be a positive integer"):
-            VLLMProtocol(vllm_config=VLLMServerConfig(aggregated={"data-parallel-size": 0}))
-
-    def test_dp_mode_creates_per_rank_processes(self):
-        """Test that DP mode creates one process per DP rank instead of per node."""
+    def test_dp_mode_creates_per_gpu_processes(self):
+        """Test that DP mode creates one process per GPU instead of per node."""
         from srtctl.backends import VLLMProtocol, VLLMServerConfig
         from srtctl.core.topology import Endpoint
 
@@ -2000,7 +1924,7 @@ class TestVLLMDataParallelMode:
 
         processes = backend.endpoints_to_processes([endpoint])
 
-        # Should create 16 processes (1 per DP rank), not 2 (1 per node)
+        # Should create 16 processes (1 per GPU), not 2 (1 per node)
         assert len(processes) == 16
 
         # Each process should have exactly 1 GPU
@@ -2022,29 +1946,6 @@ class TestVLLMDataParallelMode:
         # dp_rank (stored in node_rank) should go from 0 to 15
         dp_ranks = [p.node_rank for p in processes]
         assert dp_ranks == list(range(16))
-
-    def test_per_gpu_remains_a_compatibility_alias_for_per_rank(self):
-        """Existing recipes retain the original one-process-per-rank behavior."""
-        from srtctl.backends import VLLMProtocol, VLLMServerConfig
-        from srtctl.core.topology import Endpoint
-
-        config = VLLMServerConfig(aggregated={"data-parallel-size": 2})
-        endpoint = Endpoint(
-            mode="agg",
-            index=0,
-            nodes=("node0",),
-            gpu_indices=frozenset(range(2)),
-            gpus_per_node=2,
-        )
-
-        canonical = VLLMProtocol(dp_launch_mode="per_rank", vllm_config=config)
-        compatibility = VLLMProtocol(dp_launch_mode="per_gpu", vllm_config=config)
-
-        canonical_processes = canonical.endpoints_to_processes([endpoint])
-        compatibility_processes = compatibility.endpoints_to_processes([endpoint])
-
-        assert [process.node_rank for process in compatibility_processes] == [0, 1]
-        assert compatibility_processes == canonical_processes
 
     def test_dp_per_node_mode_creates_per_node_processes(self):
         """Per-node DP owns all local GPUs and reserves rank-sized port blocks."""
@@ -2133,30 +2034,19 @@ class TestVLLMDataParallelMode:
             gpus_per_node=4,
         )
 
-        with pytest.raises(ValueError, match=r"DP\*TP\*PP\*PCP=7\*1=7 GPUs"):
+        with pytest.raises(ValueError, match="data-parallel-size=7"):
             backend.endpoints_to_processes([endpoint])
 
-    @pytest.mark.parametrize(
-        "managed_field",
-        [
-            "data-parallel-size-local",
-            "data-parallel-start-rank",
-            "data-parallel-address",
-            "data-parallel-rpc-port",
-            "data-parallel-hybrid-lb",
-            "headless",
-        ],
-    )
-    def test_dp_per_node_mode_rejects_manually_managed_topology(self, managed_field):
-        """Slurm-derived DP topology cannot be contradicted by raw vLLM flags."""
+    def test_dp_per_node_mode_rejects_headless(self):
+        """Headless node processes cannot satisfy per-node Dynamo health expectations."""
         from marshmallow import ValidationError
 
         from srtctl.backends import VLLMProtocol, VLLMServerConfig
 
-        with pytest.raises(ValidationError, match="srt-slurm derives the node-local DP topology"):
+        with pytest.raises(ValidationError, match="remove headless"):
             VLLMProtocol(
                 dp_launch_mode="per_node",
-                vllm_config=VLLMServerConfig(decode={"data-parallel-size": 8, managed_field: True}),
+                vllm_config=VLLMServerConfig(decode={"data-parallel-size": 8, "headless": True}),
             )
 
     def test_direct_vllm_dp_mode_keeps_single_process(self):
@@ -2227,257 +2117,6 @@ class TestVLLMDataParallelMode:
         assert cmd[cmd.index("--device-ids") + 1] == "0,1,2,3"
         assert "--request-plane" not in cmd
         assert "dynamo.vllm" not in cmd
-
-    def test_vllm_router_keeps_one_direct_server_per_logical_endpoint(self):
-        """vLLM Router uses direct private servers rather than Dynamo runtimes."""
-        from srtctl.backends import VLLMProtocol
-        from srtctl.core.topology import Endpoint
-
-        backend = VLLMProtocol()
-        endpoints = [
-            Endpoint(
-                mode="agg",
-                index=index,
-                nodes=(node,),
-                gpu_indices=frozenset(range(8)),
-                gpus_per_node=8,
-            )
-            for index, node in enumerate(("node0", "node1"))
-        ]
-
-        processes = backend.endpoints_to_processes(endpoints, frontend_type="vllm-router")
-
-        assert len(processes) == 2
-        assert all(process.is_leader for process in processes)
-        assert len({process.http_port for process in processes}) == 1  # ports may repeat on distinct nodes
-
-    def test_vllm_router_uses_one_backend_url_for_single_node_dep4(self):
-        """Router expands one direct backend URL into four node-local DP ranks."""
-        from srtctl.backends import VLLMProtocol, VLLMServerConfig
-        from srtctl.core.topology import Endpoint
-
-        backend = VLLMProtocol(
-            vllm_config=VLLMServerConfig(
-                aggregated={"data-parallel-size": 4, "enable-expert-parallel": True},
-            ),
-        )
-        endpoint = Endpoint(
-            mode="agg",
-            index=0,
-            nodes=("node0",),
-            gpu_indices=frozenset(range(4)),
-            gpus_per_node=4,
-        )
-
-        processes = backend.endpoints_to_processes([endpoint], frontend_type="vllm-router")
-
-        assert len(processes) == 1
-        assert processes[0].gpu_indices == frozenset(range(4))
-        assert processes[0].http_port > 0
-
-    def test_vllm_router_single_node_tp2_dp2_preserves_native_vllm_args(self):
-        """Explicit per_node does not inject hybrid flags into a native one-node server."""
-        from pathlib import Path
-        from unittest.mock import MagicMock, patch
-
-        from srtctl.backends import VLLMProtocol, VLLMServerConfig
-        from srtctl.core.topology import Endpoint
-
-        backend = VLLMProtocol(
-            dp_launch_mode="per_node",
-            vllm_config=VLLMServerConfig(aggregated={"tensor-parallel-size": 2, "data-parallel-size": 2}),
-        )
-        endpoint = Endpoint(
-            mode="agg",
-            index=0,
-            nodes=("node0",),
-            gpu_indices=frozenset(range(4)),
-            gpus_per_node=4,
-        )
-        processes = backend.endpoints_to_processes([endpoint], frontend_type="vllm-router")
-        runtime = MagicMock(model_path=Path("/model"), is_hf_model=False, frontend_port=8000)
-
-        with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):
-            command = backend.build_worker_command(
-                process=processes[0],
-                endpoint_processes=processes,
-                runtime=runtime,
-                frontend_type="vllm-router",
-            )
-
-        assert command[command.index("--tensor-parallel-size") + 1] == "2"
-        assert command[command.index("--data-parallel-size") + 1] == "2"
-        assert "--data-parallel-size-local" not in command
-        assert "--data-parallel-start-rank" not in command
-        assert "--data-parallel-hybrid-lb" not in command
-
-    def test_vllm_router_multinode_dep8_uses_hybrid_node_local_pools(self):
-        """Two DEP8 nodes expose two DP4 HTTP pools sharing one global coordinator."""
-        from pathlib import Path
-        from unittest.mock import MagicMock, patch
-
-        from srtctl.backends import VLLMProtocol, VLLMServerConfig
-        from srtctl.core.topology import Endpoint
-
-        backend = VLLMProtocol(
-            dp_launch_mode="per_node",
-            vllm_config=VLLMServerConfig(
-                aggregated={
-                    "data-parallel-size": 8,
-                    "enable-expert-parallel": True,
-                },
-            ),
-        )
-        endpoint = Endpoint(
-            mode="agg",
-            index=0,
-            nodes=("node0", "node1"),
-            gpu_indices=frozenset(range(4)),
-            gpus_per_node=4,
-        )
-        processes = backend.endpoints_to_processes([endpoint], frontend_type="vllm-router")
-        runtime = MagicMock()
-        runtime.model_path = Path("/model")
-        runtime.is_hf_model = False
-        runtime.frontend_port = 8000
-
-        with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):
-            commands = [
-                backend.build_worker_command(
-                    process=process,
-                    endpoint_processes=processes,
-                    runtime=runtime,
-                    frontend_type="vllm-router",
-                )
-                for process in processes
-            ]
-
-        assert len(processes) == 2
-        assert [process.node_rank for process in processes] == [0, 4]
-        assert all(process.http_port > 0 for process in processes)
-        assert len({process.dp_rpc_port for process in processes}) == 1
-        for start_rank, command in zip((0, 4), commands, strict=True):
-            assert command[command.index("--data-parallel-size") + 1] == "8"
-            assert command[command.index("--data-parallel-size-local") + 1] == "4"
-            assert command[command.index("--data-parallel-start-rank") + 1] == str(start_rank)
-            assert command[command.index("--data-parallel-address") + 1] == "10.0.0.1"
-            assert "--data-parallel-hybrid-lb" in command
-
-    def test_vllm_router_multinode_tp2_dp4_derives_local_dp2(self):
-        """Hybrid flags count DP replicas rather than raw GPUs on each node."""
-        from pathlib import Path
-        from unittest.mock import MagicMock, patch
-
-        from srtctl.backends import VLLMProtocol, VLLMServerConfig
-        from srtctl.core.topology import Endpoint
-
-        backend = VLLMProtocol(
-            dp_launch_mode="per_node",
-            vllm_config=VLLMServerConfig(aggregated={"tensor-parallel-size": 2, "data-parallel-size": 4}),
-        )
-        endpoint = Endpoint(
-            mode="agg",
-            index=0,
-            nodes=("node0", "node1"),
-            gpu_indices=frozenset(range(4)),
-            gpus_per_node=4,
-        )
-        processes = backend.endpoints_to_processes([endpoint], frontend_type="vllm-router")
-        runtime = MagicMock(model_path=Path("/model"), is_hf_model=False, frontend_port=8000)
-
-        with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):
-            commands = [
-                backend.build_worker_command(
-                    process=process,
-                    endpoint_processes=processes,
-                    runtime=runtime,
-                    frontend_type="vllm-router",
-                )
-                for process in processes
-            ]
-
-        assert [process.node_rank for process in processes] == [0, 2]
-        assert [command[command.index("--data-parallel-size-local") + 1] for command in commands] == ["2", "2"]
-        assert [command[command.index("--data-parallel-start-rank") + 1] for command in commands] == ["0", "2"]
-
-    def test_vllm_router_worker_uses_private_port_and_pd_connector(self):
-        """Disaggregated vLLM Router workers are direct servers with KV transfer."""
-        from pathlib import Path
-        from unittest.mock import MagicMock, patch
-
-        from srtctl.backends import VLLMProtocol, VLLMServerConfig
-        from srtctl.core.topology import Process
-
-        backend = VLLMProtocol(
-            connector="nixl",
-            vllm_config=VLLMServerConfig(prefill={"tensor-parallel-size": 8}),
-        )
-        process = Process(
-            node="node0",
-            gpu_indices=frozenset(range(8)),
-            sys_port=8081,
-            http_port=30123,
-            endpoint_mode="prefill",
-            endpoint_index=0,
-            node_rank=0,
-            bootstrap_port=30001,
-        )
-        runtime = MagicMock()
-        runtime.model_path = Path("/model")
-        runtime.is_hf_model = False
-        runtime.frontend_port = 8000
-
-        with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):
-            cmd = backend.build_worker_command(
-                process=process,
-                endpoint_processes=[process],
-                runtime=runtime,
-                frontend_type="vllm-router",
-            )
-
-        assert cmd[:3] == ["vllm", "serve", "/model"]
-        assert cmd[cmd.index("--port") + 1] == "30123"
-        assert "dynamo.vllm" not in cmd
-        kv_config = json.loads(cmd[cmd.index("--kv-transfer-config") + 1])
-        assert kv_config == {"kv_connector": "NixlConnector", "kv_role": "kv_both"}
-
-    def test_vllm_router_stable_release_uses_legacy_cuda_binding(self):
-        """Stable vLLM builds can avoid the newer --device-ids CLI."""
-        from pathlib import Path
-        from unittest.mock import MagicMock, patch
-
-        from srtctl.backends import VLLMProtocol, VLLMServerConfig
-        from srtctl.core.topology import Process
-
-        backend = VLLMProtocol(
-            set_cuda_visible_devices=True,
-            vllm_config=VLLMServerConfig(decode={"tensor-parallel-size": 4}),
-        )
-        process = Process(
-            node="node0",
-            gpu_indices=frozenset(range(4)),
-            sys_port=8081,
-            http_port=30123,
-            endpoint_mode="decode",
-            endpoint_index=0,
-            node_rank=0,
-        )
-        runtime = MagicMock()
-        runtime.model_path = Path("/model")
-        runtime.is_hf_model = False
-        runtime.frontend_port = 8000
-
-        with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):
-            cmd = backend.build_worker_command(
-                process=process,
-                endpoint_processes=[process],
-                runtime=runtime,
-                frontend_type="vllm-router",
-            )
-
-        assert cmd[:3] == ["vllm", "serve", "/model"]
-        assert "--device-ids" not in cmd
-        assert backend.should_set_cuda_visible_devices(process)
 
     def test_direct_vllm_command_keeps_iteration_profiler_config(self):
         """Direct vllm serve retains main's profiling-derived server option."""
@@ -2656,6 +2295,10 @@ class TestVLLMDataParallelMode:
             vllm_config=VLLMServerConfig(
                 decode={
                     "data-parallel-size": 8,
+                    "data-parallel-size-local": 99,
+                    "data-parallel-start-rank": 99,
+                    "data-parallel-rpc-port": 13345,
+                    "data-parallel-hybrid-lb": True,
                     "enable-expert-parallel": True,
                 },
             ),
@@ -2706,7 +2349,7 @@ class TestVLLMDataParallelMode:
 
         backend = VLLMProtocol(
             dp_launch_mode="per_node",
-            vllm_config=VLLMServerConfig(decode={"data-parallel-size": 8}),
+            vllm_config=VLLMServerConfig(decode={"data-parallel-size": 8, "data_parallel_hybrid_lb": False}),
         )
         leader = Process(
             node="node0",
@@ -2762,7 +2405,7 @@ class TestVLLMDataParallelMode:
 
         processes = backend.endpoints_to_processes([endpoint])
 
-        # Should create 2 processes (1 per node), not 16 (1 per DP rank)
+        # Should create 2 processes (1 per node), not 16 (1 per GPU)
         assert len(processes) == 2
         assert processes[0].node == "node0"
         assert processes[1].node == "node1"

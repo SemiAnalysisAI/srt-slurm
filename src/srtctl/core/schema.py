@@ -1833,7 +1833,9 @@ class SrtConfig:
 
     def _validate_static_router_frontend(self):
         """Validate static-router/backend pairings and vLLM DP ownership."""
-        required_backend = {"atomesh": "atom", "sglang": "sglang", "vllm-router": "vllm"}.get(self.frontend.type)
+        required_backend = {"atomesh": "atom", "infera": "atom", "sglang": "sglang", "vllm-router": "vllm"}.get(
+            self.frontend.type
+        )
         if required_backend is None:
             return
         if self.backend_type != required_backend:

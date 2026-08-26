@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal
 from marshmallow import Schema
 from marshmallow_dataclass import dataclass
 
-from srtctl.ports import DYN_SYSTEM_PORT_BASE
+from srtctl.ports import DYN_SYSTEM_PORT_BASE, ETCD_CLIENT_PORT
 
 if TYPE_CHECKING:
     from srtctl.backends.base import SrunConfig
@@ -47,6 +47,7 @@ class AtomProtocol:
     aggregated_environment: dict[str, str] = field(default_factory=dict)
     atom_config: AtomServerConfig | None = None
     connector: Literal["mooncake"] = "mooncake"
+    enable_kv_events: bool = False
 
     Schema: ClassVar[builtins.type[Schema]] = Schema
 
@@ -151,8 +152,8 @@ class AtomProtocol:
         profiling: ProfilingConfig | None = None,
     ) -> list[str]:
         del dump_config_path, profiling
-        if frontend_type != "atomesh":
-            raise ValueError(f"backend.type: atom requires frontend.type: atomesh (got {frontend_type!r})")
+        if frontend_type not in {"atomesh", "infera"}:
+            raise ValueError(f"backend.type: atom requires frontend.type: atomesh or infera (got {frontend_type!r})")
         if len({item.node for item in endpoint_processes}) != 1:
             raise ValueError("ATOM currently requires each logical endpoint to fit on one Slurm node")
 
@@ -166,6 +167,34 @@ class AtomProtocol:
             raise ValueError(f"ATOM config cannot override srtctl-managed argument(s): {sorted(overlap)}")
 
         command = ["env", f"ATOM_HOST_IP={worker_ip}", *(nsys_prefix or [])]
+        if frontend_type == "infera":
+            command.extend(
+                [
+                    "python3",
+                    "-m",
+                    "infera.engine.atom",
+                    "--model",
+                    runtime.worker_model_arg,
+                    "--host",
+                    "0.0.0.0",
+                    "--server-port",
+                    str(process.http_port),
+                    "--port",
+                    str(process.sys_port),
+                    "-tp",
+                    str(len(process.gpu_indices)),
+                    "--advertise-host",
+                    worker_ip,
+                    "--etcd-endpoint",
+                    f"{runtime.infra_node_ip}:{ETCD_CLIENT_PORT}",
+                ]
+            )
+            if self.enable_kv_events:
+                command.append("--enable-kv-events")
+            if process.endpoint_mode in {"prefill", "decode"}:
+                command.extend(["--kv-transfer-config", self._kv_transfer_config(process)])
+            command.extend(_config_to_cli_args(config))
+            return command
         command.extend(
             [
                 "python3",

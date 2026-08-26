@@ -18,6 +18,7 @@ from srtctl.frontends.base import (
     get_frontend,
 )
 from srtctl.frontends.dynamo import DynamoFrontend
+from srtctl.frontends.infera import InferaFrontend
 from srtctl.frontends.sglang import SGLangFrontend
 from srtctl.frontends.trtllm_serve import TRTLLMServeFrontend
 from srtctl.frontends.vllm import VLLMFrontend
@@ -28,6 +29,7 @@ __all__ = [
     "DynamoFrontend",
     "FrontendProtocol",
     "FrontendType",
+    "InferaFrontend",
     "SGLangFrontend",
     "TRTLLMServeFrontend",
     "VLLMFrontend",

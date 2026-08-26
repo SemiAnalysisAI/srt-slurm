@@ -33,6 +33,7 @@ from srtctl.core.fingerprint import (
     generate_capture_script,
     load_fingerprint,
     probe_cpu,
+    probe_frameworks,
     write_fingerprint,
 )
 
@@ -164,6 +165,20 @@ class TestProbes:
         assert r.ok is False
         assert r.value == UNAVAILABLE
         assert r.error == "broken"
+
+    def test_probe_frameworks_includes_native_router_and_amd_transport(self, monkeypatch):
+        versions = {"sglang-router": "0.3.2", "amd_mori": "0.5.16.dev0"}
+
+        def fake_run(command: str):
+            return next((version for package, version in versions.items() if f"'{package}'" in command), None)
+
+        monkeypatch.setattr("srtctl.core.fingerprint._run_cmd", fake_run)
+
+        result = probe_frameworks()
+
+        assert result.ok is True
+        assert result.value["sglang-router"] == "0.3.2"
+        assert result.value["amd-mori"] == "0.5.16.dev0"
 
     def test_cpu_model_prefers_x86_model_name(self):
         assert cpu_model_from_cpuinfo("processor: 0\nmodel name: Intel(R) Xeon(R) Platinum\n") == (

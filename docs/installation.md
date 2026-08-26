@@ -51,6 +51,17 @@ If you are trying to deploy onto Grace (GH200, GB200, etc.), you need to use the
 make setup ARCH=aarch64  # or ARCH=x86_64
 ```
 
+Native SGLang Router, vLLM Router, and direct-backend deployments do not run
+the Dynamo control plane. CI or cluster launchers for those paths can install
+only the compute-architecture `uv` binary:
+
+```bash
+make setup-compute ARCH=aarch64  # or ARCH=x86_64
+```
+
+This target does not download NATS or etcd and does not create
+`srtslurm.yaml`; provide the cluster profile separately.
+
 The setup will:
 
 1. Download NATS, ETCD, uv, and the Tachometer scraper for your compute-node architecture
@@ -120,7 +131,10 @@ default_time_limit: "4:00:00"
 gpus_per_node: 4
 
 # SLURM directive compatibility
-use_gpus_per_node_directive: true # Set false if cluster doesn't support --gpus-per-node
+gpu_sbatch_directive: gpus-per-node # Use gres for --gres=gpu:N clusters, or none
+# Legacy compatibility: use_gpus_per_node_directive: true
+accelerator_vendor: nvidia        # Use amd for ROCm clusters
+runtime_config_transport: shared-filesystem # Use embedded for node-local output paths
 use_segment_sbatch_directive: true # Set false if cluster doesn't support --segment
 use_exclusive_sbatch_directive: false # Set true if cluster requires --exclusive
 

@@ -75,6 +75,19 @@ class TestValidateSetup:
         with pytest.raises(SystemExit):
             validate_setup(tmp_path)
 
+    def test_static_frontend_setup_only_requires_compute_uv(self, tmp_path: Path, capsys):
+        """Native routers must not require unused Dynamo infrastructure binaries."""
+        (tmp_path / "bin").mkdir()
+        (tmp_path / "bin" / "uv").touch()
+        (tmp_path / "bin" / "tachometer-scraper").touch()
+
+        validate_setup(tmp_path, requires_head_infrastructure=False)
+
+        (tmp_path / "bin" / "uv").unlink()
+        with pytest.raises(SystemExit):
+            validate_setup(tmp_path, requires_head_infrastructure=False)
+        assert "make setup-compute ARCH=<compute_arch>" in capsys.readouterr().out
+
 
 class TestMakefileArchDetection:
     """Test that the file | grep pattern used in Makefile matches correctly.

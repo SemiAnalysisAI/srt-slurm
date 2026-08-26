@@ -35,6 +35,17 @@ Complete reference for job configuration YAML files.
 
 ## Overview
 
+### ATOM with AToMesh
+
+Use `backend.type: atom` with `frontend.type: atomesh` to launch native
+`atom.entrypoints.openai_server` workers and the official AToMesh router. Both
+aggregate workers and prefill/decode topologies use static HTTP endpoints;
+disaggregated workers receive topology-owned Mooncake handshake ports.
+
+Engine flags belong under `backend.atom_config.prefill`, `decode`, or
+`aggregated`. srt-slurm owns the model path, HTTP port, tensor parallel size,
+and KV-transfer contract, so recipes cannot override those arguments.
+
 ```yaml
 name: "my-benchmark"           # Required: job name
 

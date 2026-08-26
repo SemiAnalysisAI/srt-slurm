@@ -1,6 +1,6 @@
 # srtctl
 
-Command-line tool for distributed LLM inference benchmarks on SLURM clusters and direct GPU hosts using TensorRT LLM, SGLang and vLLM. Replace complex shell scripts and 50+ CLI flags with declarative YAML configuration.
+Command-line tool for distributed LLM inference benchmarks on SLURM clusters and direct GPU hosts using ATOM, TensorRT LLM, SGLang and vLLM. Replace complex shell scripts and 50+ CLI flags with declarative YAML configuration.
 
 ## Quick Start
 

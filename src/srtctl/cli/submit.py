@@ -468,6 +468,17 @@ def validate_setup(
         raise SystemExit(1)
 
 
+def _requires_head_infrastructure(frontend_type: str) -> bool:
+    """Return whether a frontend needs the managed NATS/etcd head services."""
+    return frontend_type not in {
+        "atomesh",
+        "sglang",
+        "trtllm_serve",
+        "vllm",
+        "vllm-router",
+    }
+
+
 def generate_minimal_sbatch_script(
     config: SrtConfig,
     config_path: Path,
@@ -784,12 +795,7 @@ def submit_with_orchestrator(
     # Validate setup before submitting (not during dry-run)
     srtctl_root = get_srtslurm_setting("srtctl_root")
     srtctl_source = Path(srtctl_root) if srtctl_root else Path(__file__).parent.parent.parent.parent
-    requires_head_infrastructure = config.frontend.type not in {
-        "sglang",
-        "trtllm_serve",
-        "vllm",
-        "vllm-router",
-    }
+    requires_head_infrastructure = _requires_head_infrastructure(config.frontend.type)
     validate_setup(
         srtctl_source,
         requires_head_infrastructure=requires_head_infrastructure,

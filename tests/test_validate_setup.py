@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from srtctl.cli.submit import validate_setup
+from srtctl.cli.submit import _requires_head_infrastructure, validate_setup
 
 
 class TestValidateSetup:
@@ -97,6 +97,13 @@ class TestValidateSetup:
         with pytest.raises(SystemExit):
             validate_setup(tmp_path, requires_head_infrastructure=False)
         assert "make setup-compute ARCH=<compute_arch>" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("frontend_type", ["atomesh", "sglang", "trtllm_serve", "vllm", "vllm-router"])
+    def test_native_frontends_do_not_require_managed_head_services(self, frontend_type: str):
+        assert not _requires_head_infrastructure(frontend_type)
+
+    def test_dynamo_requires_managed_head_services(self):
+        assert _requires_head_infrastructure("dynamo")
 
 
 class TestMakefileArchDetection:

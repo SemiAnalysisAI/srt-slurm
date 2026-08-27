@@ -47,6 +47,7 @@ class AtomProtocol:
     aggregated_environment: dict[str, str] = field(default_factory=dict)
     atom_config: AtomServerConfig | None = None
     connector: Literal["mooncake"] = "mooncake"
+    mooncake_protocol: Literal["rdma", "tcp"] | None = None
 
     Schema: ClassVar[builtins.type[Schema]] = Schema
 
@@ -138,6 +139,8 @@ class AtomProtocol:
             "kv_connector": self.connector,
             "handshake_port": process.nixl_port,
         }
+        if self.mooncake_protocol is not None:
+            payload["protocol"] = self.mooncake_protocol
         return json.dumps(payload, separators=(",", ":"))
 
     def build_worker_command(

@@ -1905,7 +1905,8 @@ class SrtConfig:
                 )
 
             local_gpu_count = min(gpu_count, self.resources.gpus_per_node)
-            if replica_size > local_gpu_count:
+            nodes_per_worker = (gpu_count + self.resources.gpus_per_node - 1) // self.resources.gpus_per_node
+            if replica_size > local_gpu_count or nodes_per_worker > 1:
                 expansion_by_mode[mode] = 1
             else:
                 try:

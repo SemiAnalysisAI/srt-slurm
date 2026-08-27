@@ -191,9 +191,10 @@ class AtomProtocol:
 
 
 def _config_to_cli_args(config: dict[str, Any]) -> list[str]:
+    """Convert recipe config keys to ATOM's kebab-case CLI flags."""
     args: list[str] = []
     for key, value in sorted(config.items()):
-        flag = key if key.startswith("-") else f"--{key}"
+        flag = f"--{key.replace('_', '-')}"
         if value is True:
             args.append(flag)
         elif value is False or value is None:

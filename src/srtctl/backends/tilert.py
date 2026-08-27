@@ -51,6 +51,7 @@ class TileRTProtocol:
     decode_environment: dict[str, str] = field(default_factory=dict)
     tilert_config: TileRTServerConfig | None = None
     model_profile: str = "glm5"
+    weight_model_type: str = "glm-5"
     weights_dir: str = "/tilert_weights"
     max_seq_len: int = 202752
     kv_cache_dtype: str = "fp8"
@@ -99,7 +100,7 @@ class TileRTProtocol:
             source=source,
             is_hf_model=runtime.is_hf_model,
             weights_dir=self.weights_dir,
-            model_profile=self.model_profile,
+            weight_model_type=self.weight_model_type,
         )
         return BackendPreparation(
             command=["bash", "-ceu", script],
@@ -286,7 +287,7 @@ def _reject_managed_args(config: dict[str, Any], reserved: set[str]) -> None:
         raise ValueError(f"TileRT config cannot override srtctl-managed argument(s): {sorted(overlap)}")
 
 
-def _weight_preparation_script(*, source: str, is_hf_model: bool, weights_dir: str, model_profile: str) -> str:
+def _weight_preparation_script(*, source: str, is_hf_model: bool, weights_dir: str, weight_model_type: str) -> str:
     """Build a lock-safe, atomic TileRT conversion command."""
     resolve_source = (
         f"from huggingface_hub import snapshot_download; source = snapshot_download({source!r}, local_files_only=True)"
@@ -319,7 +320,7 @@ with lock_path.open("w") as lock:
             "-m",
             "tilert.models.preprocess.weight_converter",
             "--model_type",
-            {model_profile!r},
+            {weight_model_type!r},
             "--model_dir",
             str(source_path),
             "--save_dir",

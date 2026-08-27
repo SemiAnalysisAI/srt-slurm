@@ -48,8 +48,12 @@ case "${TILERT_ROLE:-}" in
         install_exact nixl "${NIXL_VERSION}"
         "${PYTHON}" -c 'import tilert.pd_vllm.prefill_connector'
         ;;
+    router)
+        install_exact tilert "${TILERT_VERSION}"
+        "${PYTHON}" -c 'import tilert.pd_vllm.pd_router'
+        ;;
     *)
-        echo "TILERT_ROLE must be prefill or decode (got ${TILERT_ROLE:-unset})" >&2
+        echo "TILERT_ROLE must be prefill, decode, or router (got ${TILERT_ROLE:-unset})" >&2
         exit 1
         ;;
 esac

@@ -926,6 +926,18 @@ class TestLMEvalRunner:
             "/infmax-workspace",
         ]
 
+    def test_script_uses_writable_job_local_python(self):
+        """Eval installs never mutate a serving image's system environment."""
+        from pathlib import Path
+
+        from srtctl.benchmarks.lm_eval import LMEvalRunner
+
+        script = Path(LMEvalRunner().local_script_dir) / "bench.sh"
+        content = script.read_text()
+        assert "python3 -m venv --system-site-packages" in content
+        assert 'export PATH="${LM_EVAL_VENV}/bin:${PATH}"' in content
+        assert "sys.prefix" in content
+
 
 class TestGSM8KRunner:
     """Test the unified GSM8K runner (backend auto-detect)."""

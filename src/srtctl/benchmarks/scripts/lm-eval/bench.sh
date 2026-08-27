@@ -17,6 +17,27 @@ PORT=$(echo "$ENDPOINT" | sed -E 's|.*:([0-9]+).*|\1|')
 
 echo "lm-eval Config: endpoint=${ENDPOINT}; host=${HOST}; port=${PORT}; workspace=${INFMAX_WORKSPACE}"
 
+# Serving images commonly make their system Python environment read-only.  The
+# InferenceX eval harness installs a pinned lm-eval runtime before executing, so
+# give it a job-local writable environment while retaining the serving image's
+# already-installed framework dependencies.  Prepending the venv to PATH keeps
+# benchmark_lib.sh's existing `python3 -m ...` interface unchanged.
+LM_EVAL_RUNTIME_DIR="${SRTCTL_LM_EVAL_RUNTIME_DIR:-${TMPDIR:-/tmp}/srtctl-lm-eval-${SLURM_JOB_ID:-$$}}"
+LM_EVAL_VENV="${LM_EVAL_RUNTIME_DIR}/venv"
+if [[ ! -x "${LM_EVAL_VENV}/bin/python3" ]]; then
+    rm -rf "${LM_EVAL_VENV}"
+    mkdir -p "${LM_EVAL_RUNTIME_DIR}"
+    python3 -m venv --system-site-packages "${LM_EVAL_VENV}"
+fi
+export PATH="${LM_EVAL_VENV}/bin:${PATH}"
+hash -r
+
+if [[ "$(python3 -c 'import sys; print(sys.prefix)')" != "${LM_EVAL_VENV}" ]]; then
+    echo "ERROR: failed to activate writable lm-eval runtime at ${LM_EVAL_VENV}" >&2
+    exit 1
+fi
+echo "lm-eval Runtime: python=$(command -v python3); prefix=${LM_EVAL_VENV}"
+
 # Auto-discover the served model name from /v1/models if MODEL_NAME is not set.
 # This ensures we use the exact name the server recognizes, regardless of what
 # $MODEL (the HuggingFace ID from the workflow) is set to.

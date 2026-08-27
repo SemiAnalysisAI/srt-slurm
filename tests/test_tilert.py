@@ -4,6 +4,7 @@
 """High-signal contracts for heterogeneous TileRT P/D orchestration."""
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 from srtctl.backends import TileRTProtocol
@@ -123,3 +124,12 @@ def test_tilert_router_uses_exact_prefill_and_decode_endpoints() -> None:
         "--model-path",
         "zai-org/GLM-5.1-FP8",
     ]
+
+
+def test_tilert_router_setup_pins_transformers_v5_tokenizer_contract() -> None:
+    setup = (Path(__file__).parents[1] / "configs" / "tilert_setup.sh").read_text()
+
+    assert 'readonly TRANSFORMERS_VERSION="${TILERT_TRANSFORMERS_VERSION:-5.16.1}"' in setup
+    router_setup = setup.split("    router)", 1)[1].split("        ;;", 1)[0]
+    assert 'install_exact transformers "${TRANSFORMERS_VERSION}"' in router_setup
+    assert "from transformers import TokenizersBackend" in router_setup

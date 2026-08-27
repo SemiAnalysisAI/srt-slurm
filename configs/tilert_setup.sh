@@ -8,6 +8,7 @@ readonly TILERT_VERSION="${TILERT_VERSION:-0.1.5.post3}"
 readonly NIXL_VERSION="${TILERT_NIXL_VERSION:-1.3.1}"
 readonly FASTAPI_VERSION="${TILERT_FASTAPI_VERSION:-0.141.1}"
 readonly UVICORN_VERSION="${TILERT_UVICORN_VERSION:-0.52.4}"
+readonly TRANSFORMERS_VERSION="${TILERT_TRANSFORMERS_VERSION:-5.16.1}"
 
 if [[ -d /opt/conda/envs/tilert/bin ]]; then
     export PATH="/opt/conda/envs/tilert/bin:${PATH}"
@@ -57,10 +58,16 @@ case "${TILERT_ROLE:-}" in
         ;;
     router)
         install_exact tilert "${TILERT_VERSION}"
+        # GLM-5.1 tokenizer metadata names the Transformers v5
+        # TokenizersBackend class.  TileRT's broad >=4.46.3 dependency leaves
+        # its native router on the image's incompatible 4.x release unless we
+        # make the router-side tokenizer contract explicit.
+        install_exact transformers "${TRANSFORMERS_VERSION}"
         # The native router uses the same undeclared FastAPI/Uvicorn stack as
         # the decode server and must be self-contained on the frontend host.
         install_exact fastapi "${FASTAPI_VERSION}"
         install_exact uvicorn "${UVICORN_VERSION}"
+        "${PYTHON}" -c 'from transformers import TokenizersBackend'
         "${PYTHON}" -c 'import tilert.pd_vllm.pd_router'
         ;;
     *)

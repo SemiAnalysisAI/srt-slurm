@@ -6,6 +6,8 @@ set -euo pipefail
 
 readonly TILERT_VERSION="${TILERT_VERSION:-0.1.5.post3}"
 readonly NIXL_VERSION="${TILERT_NIXL_VERSION:-1.3.1}"
+readonly FASTAPI_VERSION="${TILERT_FASTAPI_VERSION:-0.141.1}"
+readonly UVICORN_VERSION="${TILERT_UVICORN_VERSION:-0.52.4}"
 
 if [[ -d /opt/conda/envs/tilert/bin ]]; then
     export PATH="/opt/conda/envs/tilert/bin:${PATH}"
@@ -40,6 +42,11 @@ case "${TILERT_ROLE:-}" in
     decode)
         install_exact tilert "${TILERT_VERSION}"
         install_exact nixl "${NIXL_VERSION}"
+        # TileRT's wheel does not declare the HTTP service dependencies used
+        # by its native decode server.  Install them explicitly before the
+        # import preflight so the image is made runnable deterministically.
+        install_exact fastapi "${FASTAPI_VERSION}"
+        install_exact uvicorn "${UVICORN_VERSION}"
         "${PYTHON}" -c 'import tilert.pd_vllm.decode_server'
         ;;
     prefill)
@@ -50,6 +57,10 @@ case "${TILERT_ROLE:-}" in
         ;;
     router)
         install_exact tilert "${TILERT_VERSION}"
+        # The native router uses the same undeclared FastAPI/Uvicorn stack as
+        # the decode server and must be self-contained on the frontend host.
+        install_exact fastapi "${FASTAPI_VERSION}"
+        install_exact uvicorn "${UVICORN_VERSION}"
         "${PYTHON}" -c 'import tilert.pd_vllm.pd_router'
         ;;
     *)

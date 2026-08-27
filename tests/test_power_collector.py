@@ -9,6 +9,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -718,6 +719,10 @@ class TestRequiredReadinessGate:
         config.telemetry.required = required
         config.frontend.type = "dynamo"
         config.profiling.enabled = False
+        # This harness does not exercise backend-owned preparation. Use a
+        # concrete backend stub so MagicMock does not synthesize the optional
+        # get_preparation hook added for TileRT.
+        config.backend = SimpleNamespace()
         runtime = MagicMock()
         runtime.log_dir = tmp_path
         runtime.job_id = "12345"

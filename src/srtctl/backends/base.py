@@ -58,6 +58,7 @@ class BackendPreparation:
     mode: str
     log_name: str
     timeout_seconds: int = 21600
+    gpus_per_task: int | None = None
 
 
 class BackendProtocol(Protocol):

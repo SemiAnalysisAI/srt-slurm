@@ -115,6 +115,7 @@ class TileRTProtocol:
             node=decode_leaders[0].node,
             mode="decode",
             log_name="tilert_weight_conversion.out",
+            gpus_per_task=1,
         )
 
     def should_set_visible_devices(self, process: Process) -> bool:

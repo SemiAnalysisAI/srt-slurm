@@ -180,6 +180,7 @@ def test_backend_preparation_requests_a_gpu_step(tmp_path: Path) -> None:
         node="node-a",
         mode="decode",
         log_name="conversion.out",
+        gpus_per_task=1,
     )
     backend.get_environment_for_mode.return_value = {}
     backend.get_process_environment.return_value = {}

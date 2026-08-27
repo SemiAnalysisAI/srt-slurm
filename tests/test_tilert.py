@@ -85,6 +85,7 @@ def test_tilert_prepares_weights_once_on_decode_runtime() -> None:
 
     assert preparation.node == "d0"
     assert preparation.mode == "decode"
+    assert preparation.gpus_per_task == 1
     assert "fcntl.LOCK_EX" in script
     assert "snapshot_download('zai-org/GLM-5.1-FP8')" in script
     assert "local_files_only=True" not in script

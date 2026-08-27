@@ -43,18 +43,11 @@ def _redacted_command(
     required_secrets: set[str] = set()
 
     if srun_export_env:
+        required_secrets.update(name for name in srun_export_env if _is_secret_name(name))
         for idx, arg in enumerate(replay):
             if not arg.startswith("--export=ALL,"):
                 continue
-            exports = []
-            for item in arg.removeprefix("--export=ALL,").split(","):
-                name, separator, value = item.partition("=")
-                if separator and _is_secret_name(name):
-                    exports.append(name)
-                    required_secrets.add(name)
-                else:
-                    exports.append(item)
-            replay[idx] = "--export=ALL," + ",".join(exports)
+            replay[idx] = "--export=ALL," + ",".join(srun_export_env)
 
     if env_to_set:
         bash_index = next((idx for idx in range(len(replay) - 1) if replay[idx : idx + 2] == ["bash", "-c"]), None)
@@ -104,7 +97,11 @@ class LaunchPlanRecorder:
             sequence = len(self._entries) + 1
             filename = f"{sequence:03d}-{_slug(label)}.sh"
             script_path = self.directory / filename
-            rendered = self._render_script(replay, required_secrets=required_secrets)
+            rendered = self._render_script(
+                replay,
+                required_secrets=required_secrets,
+                srun_export_env=srun_export_env,
+            )
             script_path.write_text(rendered)
             script_path.chmod(0o750)
 
@@ -123,7 +120,13 @@ class LaunchPlanRecorder:
             self._write_manifest()
             return script_path
 
-    def _render_script(self, command: list[str], *, required_secrets: list[str]) -> str:
+    def _render_script(
+        self,
+        command: list[str],
+        *,
+        required_secrets: list[str],
+        srun_export_env: dict[str, str] | None,
+    ) -> str:
         lines = [
             "#!/usr/bin/env bash",
             "set -euo pipefail",
@@ -135,6 +138,9 @@ class LaunchPlanRecorder:
             lines.append("# Required secret environment (values intentionally omitted): " + ", ".join(required_secrets))
             for name in required_secrets:
                 lines.append(f': "${{{name}:?Set {name} to replay this step}}"')
+        for name, value in (srun_export_env or {}).items():
+            if not _is_secret_name(name):
+                lines.append(f"export {name}={shlex.quote(value)}")
         lines.extend(["", "exec " + shlex.join(command), ""])
         return "\n".join(lines)
 

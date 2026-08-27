@@ -321,10 +321,16 @@ def start_srun_process(
         container_export_env.setdefault("NVIDIA_DRIVER_CAPABILITIES", "compute,utility")
 
     # Set env vars in the task environment so the container runtime (enroot/pyxis)
-    # sees them at container-creation time. Prefix ALL to preserve srun's normal
-    # full-environment propagation and only add these on top.
+    # sees them at container-creation time. Values are placed in the environment
+    # of the srun process and --export names them rather than serializing values
+    # inline. Slurm uses commas as --export delimiters, so an inline value such as
+    # NVIDIA_DRIVER_CAPABILITIES=compute,utility would otherwise be truncated to
+    # ``compute``. Prefix ALL to preserve srun's normal full-env propagation.
+    srun_process_env: dict[str, str] | None = None
     if container_export_env:
-        exports = ",".join(f"{k}={v}" for k, v in container_export_env.items())
+        srun_process_env = os.environ.copy()
+        srun_process_env.update(container_export_env)
+        exports = ",".join(container_export_env)
         srun_cmd.append(f"--export=ALL,{exports}")
 
     # Build the actual command to run
@@ -392,7 +398,7 @@ def start_srun_process(
         srun_cmd,
         stdout=subprocess.PIPE if not output else None,
         stderr=subprocess.STDOUT if not output else None,
-        env=None,  # Inherit environment
+        env=srun_process_env,
     )
 
     return proc

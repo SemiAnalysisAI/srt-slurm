@@ -89,7 +89,11 @@ def test_secret_environment_values_are_not_persisted(tmp_path: Path) -> None:
         tmp_path,
         output=str(tmp_path / "logs" / "benchmark.out"),
         env_to_set={"HF_TOKEN": "hf-super-secret", "PUBLIC_VALUE": "visible"},
-        srun_export_env={"AWS_SECRET_ACCESS_KEY": "aws-super-secret", "ENROOT_REMAP_ROOT": "yes"},
+        srun_export_env={
+            "AWS_SECRET_ACCESS_KEY": "aws-super-secret",
+            "ENROOT_REMAP_ROOT": "yes",
+            "NVIDIA_DRIVER_CAPABILITIES": "compute,utility",
+        },
     )
 
     script = next(plan_dir.glob("*.sh")).read_text()
@@ -98,7 +102,9 @@ def test_secret_environment_values_are_not_persisted(tmp_path: Path) -> None:
     assert "hf-super-secret" not in combined
     assert "aws-super-secret" not in combined
     assert 'export HF_TOKEN="${HF_TOKEN:?Set HF_TOKEN to replay this step}"' in script
-    assert "--export=ALL,AWS_SECRET_ACCESS_KEY,ENROOT_REMAP_ROOT=yes" in script
+    assert "--export=ALL,AWS_SECRET_ACCESS_KEY,ENROOT_REMAP_ROOT,NVIDIA_DRIVER_CAPABILITIES" in script
+    assert "export ENROOT_REMAP_ROOT=yes" in script
+    assert "export NVIDIA_DRIVER_CAPABILITIES=compute,utility" in script
     assert "export PUBLIC_VALUE=visible" in script
 
     manifest = json.loads(manifest_text)

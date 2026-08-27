@@ -19,6 +19,7 @@ import subprocess
 from collections.abc import Sequence
 from pathlib import Path
 
+from .accelerator import AcceleratorVendor
 from .ip_utils import get_node_ip
 from .launch_plan import record_srun_command
 
@@ -199,6 +200,7 @@ def start_srun_process(
     bash_preamble: str | None = None,
     srun_options: dict[str, str] | None = None,
     srun_export_env: dict[str, str] | None = None,
+    accelerator_vendor: AcceleratorVendor | None = None,
     overlap: bool = True,
     use_bash_wrapper: bool = True,
     mpi: str | None = None,
@@ -233,6 +235,7 @@ def start_srun_process(
             ``--export=ALL,K=V,...``). Unlike env_to_set (which exports inside the
             container after it starts), these reach the container runtime at creation
             time — required for vars like ENROOT_REMAP_ROOT that enroot reads up front.
+        accelerator_vendor: Accelerator runtime whose container hooks must be enabled.
         overlap: Use --overlap flag (default: True)
         use_bash_wrapper: Wrap command in bash -c (default: True)
         mpi: MPI type (e.g., "pmix" for TRTLLM)
@@ -306,11 +309,22 @@ def start_srun_process(
             else:
                 srun_cmd.append(f"--{key}")
 
+    # NVIDIA's enroot hook runs before the wrapped command and is activated by
+    # NVIDIA_VISIBLE_DEVICES, not CUDA_VISIBLE_DEVICES.  The latter is still the
+    # correct per-task mask inside the container, but exporting it only from the
+    # bash wrapper is too late for the hook to mount the driver and devices.
+    # Request all hook-visible devices here and rely on Slurm's device cgroup and
+    # CUDA_VISIBLE_DEVICES for the actual per-task restriction.
+    container_export_env = dict(srun_export_env or {})
+    if container_image and accelerator_vendor == "nvidia":
+        container_export_env.setdefault("NVIDIA_VISIBLE_DEVICES", "all")
+        container_export_env.setdefault("NVIDIA_DRIVER_CAPABILITIES", "compute,utility")
+
     # Set env vars in the task environment so the container runtime (enroot/pyxis)
     # sees them at container-creation time. Prefix ALL to preserve srun's normal
     # full-environment propagation and only add these on top.
-    if srun_export_env:
-        exports = ",".join(f"{k}={v}" for k, v in srun_export_env.items())
+    if container_export_env:
+        exports = ",".join(f"{k}={v}" for k, v in container_export_env.items())
         srun_cmd.append(f"--export=ALL,{exports}")
 
     # Build the actual command to run
@@ -370,7 +384,7 @@ def start_srun_process(
         het_group=het_group,
         container_image=str(container_image) if container_image else None,
         env_to_set=env_to_set,
-        srun_export_env=srun_export_env,
+        srun_export_env=container_export_env or None,
     )
 
     # Start the process

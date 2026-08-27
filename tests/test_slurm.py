@@ -210,6 +210,7 @@ def test_backend_preparation_requests_a_gpu_step(tmp_path: Path) -> None:
         stage.prepare_backend()
 
     assert mock_srun.call_args.kwargs["gpus_per_task"] == 1
+    assert mock_srun.call_args.kwargs["accelerator_vendor"] == "nvidia"
 
 
 def test_srun_export_env_renders_export_with_all_prefix() -> None:
@@ -226,6 +227,45 @@ def test_srun_export_env_renders_export_with_all_prefix() -> None:
     srun_cmd = mock_popen.call_args.args[0]
     # ALL prefix preserves srun's normal full-env propagation; the var is added on top.
     assert "--export=ALL,ENROOT_REMAP_ROOT=yes" in srun_cmd
+
+
+def test_nvidia_worker_activates_enroot_driver_hook_before_container_start() -> None:
+    with (
+        patch("srtctl.core.slurm.get_slurm_job_id", return_value="12345"),
+        patch("srtctl.core.slurm._get_cluster_bash_preamble", return_value=None),
+        patch("subprocess.Popen") as mock_popen,
+    ):
+        mock_popen.return_value = MagicMock()
+        start_srun_process(
+            ["python3", "-m", "server"],
+            container_image="/container.sqsh",
+            accelerator_vendor="nvidia",
+            srun_export_env={"ENROOT_REMAP_ROOT": "yes"},
+        )
+
+    srun_cmd = mock_popen.call_args.args[0]
+    export_arg = next(arg for arg in srun_cmd if str(arg).startswith("--export="))
+    assert export_arg == (
+        "--export=ALL,ENROOT_REMAP_ROOT=yes,NVIDIA_VISIBLE_DEVICES=all,"
+        "NVIDIA_DRIVER_CAPABILITIES=compute,utility"
+    )
+
+
+def test_amd_worker_does_not_activate_nvidia_container_hook() -> None:
+    with (
+        patch("srtctl.core.slurm.get_slurm_job_id", return_value="12345"),
+        patch("srtctl.core.slurm._get_cluster_bash_preamble", return_value=None),
+        patch("subprocess.Popen") as mock_popen,
+    ):
+        mock_popen.return_value = MagicMock()
+        start_srun_process(
+            ["python3", "-m", "server"],
+            container_image="/container.sqsh",
+            accelerator_vendor="amd",
+        )
+
+    srun_cmd = mock_popen.call_args.args[0]
+    assert not any(str(arg).startswith("--export") for arg in srun_cmd)
 
 
 def test_srun_export_env_omitted_adds_no_export_flag() -> None:

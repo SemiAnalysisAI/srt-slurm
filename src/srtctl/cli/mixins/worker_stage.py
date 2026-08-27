@@ -289,6 +289,7 @@ class WorkerStageMixin:
             bash_preamble=bash_preamble,
             srun_options=self.runtime.srun_options,
             srun_export_env=CONTAINER_REMAP_ROOT_EXPORT if installs_dynamo(self.config) else None,
+            accelerator_vendor=getattr(self.runtime, "accelerator_vendor", None),
             het_group=process.het_group,
         )
 
@@ -422,6 +423,7 @@ class WorkerStageMixin:
             env_to_set=env_to_set,
             bash_preamble=bash_preamble,
             srun_export_env=CONTAINER_REMAP_ROOT_EXPORT if installs_dynamo(self.config) else None,
+            accelerator_vendor=getattr(self.runtime, "accelerator_vendor", None),
             mpi=srun_config.mpi,
             oversubscribe=srun_config.oversubscribe,
             cpu_bind=srun_config.cpu_bind,
@@ -575,6 +577,7 @@ class WorkerStageMixin:
             env_to_set=env_to_set or None,
             bash_preamble=self._build_worker_preamble(),
             srun_options=self.runtime.srun_options,
+            accelerator_vendor=getattr(self.runtime, "accelerator_vendor", None),
             het_group=process.het_group,
         )
         try:

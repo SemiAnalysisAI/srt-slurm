@@ -18,7 +18,7 @@ from marshmallow_dataclass import dataclass
 from srtctl.ports import DYN_SYSTEM_PORT_BASE
 
 if TYPE_CHECKING:
-    from srtctl.backends.base import SrunConfig
+    from srtctl.backends.base import BackendPreparation, SrunConfig
     from srtctl.core.runtime import RuntimeContext
     from srtctl.core.schema import ProfilingConfig
     from srtctl.core.topology import Endpoint, NodePortAllocator, Process
@@ -86,6 +86,27 @@ class TileRTProtocol:
 
     def get_served_model_name(self, default: str) -> str:
         return default
+
+    def get_preparation(self, runtime: RuntimeContext, processes: list[Process]) -> BackendPreparation:
+        """Materialize converted TileRT weights once under a shared lock."""
+        from srtctl.backends.base import BackendPreparation
+
+        decode_leaders = [process for process in processes if process.endpoint_mode == "decode" and process.is_leader]
+        if not decode_leaders:
+            raise ValueError("TileRT model preparation requires a decode worker")
+        source = str(runtime.model_path) if runtime.is_hf_model else runtime.worker_model_arg
+        script = _weight_preparation_script(
+            source=source,
+            is_hf_model=runtime.is_hf_model,
+            weights_dir=self.weights_dir,
+            model_profile=self.model_profile,
+        )
+        return BackendPreparation(
+            command=["bash", "-ceu", script],
+            node=decode_leaders[0].node,
+            mode="decode",
+            log_name="tilert_weight_conversion.out",
+        )
 
     def should_set_visible_devices(self, process: Process) -> bool:
         del process
@@ -263,3 +284,63 @@ def _reject_managed_args(config: dict[str, Any], reserved: set[str]) -> None:
     overlap = {key.lstrip("-").replace("_", "-") for key in config}.intersection(reserved)
     if overlap:
         raise ValueError(f"TileRT config cannot override srtctl-managed argument(s): {sorted(overlap)}")
+
+
+def _weight_preparation_script(*, source: str, is_hf_model: bool, weights_dir: str, model_profile: str) -> str:
+    """Build a lock-safe, atomic TileRT conversion command."""
+    resolve_source = (
+        f"from huggingface_hub import snapshot_download; source = snapshot_download({source!r}, local_files_only=True)"
+        if is_hf_model
+        else f"source = {source!r}"
+    )
+    python = f"""
+import fcntl
+import os
+import shutil
+import subprocess
+from pathlib import Path
+
+{resolve_source}
+source_path = Path(source)
+target = Path({weights_dir!r})
+target.parent.mkdir(parents=True, exist_ok=True)
+lock_path = target.parent / f".{{target.name}}.convert.lock"
+with lock_path.open("w") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    index = target / "model.safetensors.index.json"
+    if index.is_file():
+        print(f"TileRT weight cache hit: {{target}}", flush=True)
+        raise SystemExit(0)
+    tmp = target.parent / f".{{target.name}}.tmp.{{os.environ.get('SLURM_JOB_ID', os.getpid())}}"
+    shutil.rmtree(tmp, ignore_errors=True)
+    subprocess.run(
+        [
+            "python",
+            "-m",
+            "tilert.models.preprocess.weight_converter",
+            "--model_type",
+            {model_profile!r},
+            "--model_dir",
+            str(source_path),
+            "--save_dir",
+            str(tmp),
+        ],
+        check=True,
+    )
+    for item in source_path.iterdir():
+        if not item.is_file() or item.suffix == ".safetensors" or item.name == "model.safetensors.index.json":
+            continue
+        shutil.copy2(item, tmp / item.name)
+    converted_index = tmp / "model.safetensors.index.json"
+    if not converted_index.is_file():
+        raise RuntimeError(f"TileRT conversion produced no index: {{converted_index}}")
+    if not (tmp / "chat_template.jinja").is_file():
+        raise RuntimeError(f"TileRT conversion produced no chat template: {{tmp}}")
+    if not ((tmp / "tokenizer.json").is_file() or (tmp / "tokenizer_config.json").is_file()):
+        raise RuntimeError(f"TileRT conversion produced no tokenizer metadata: {{tmp}}")
+    if target.exists():
+        shutil.rmtree(target)
+    os.replace(tmp, target)
+    print(f"TileRT weight cache ready: {{target}}", flush=True)
+"""
+    return f"python - <<'PY'\n{python}PY\n"

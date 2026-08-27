@@ -49,6 +49,17 @@ class SrunConfig:
     cpu_bind: str | None = None
 
 
+@dataclass(frozen=True)
+class BackendPreparation:
+    """One synchronous backend-owned preparation step before worker launch."""
+
+    command: list[str]
+    node: str
+    mode: str
+    log_name: str
+    timeout_seconds: int = 21600
+
+
 class BackendProtocol(Protocol):
     """Protocol that all backend configurations must implement.
 

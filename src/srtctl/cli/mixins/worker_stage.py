@@ -9,6 +9,7 @@ Handles starting backend worker processes (prefill/decode/agg).
 
 import logging
 import shlex
+import subprocess
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -530,3 +531,58 @@ class WorkerStageMixin:
 
         logger.info("Started %d worker processes", len(result))
         return result
+
+    def prepare_backend(self) -> None:
+        """Run an optional backend-owned preparation command once."""
+        get_preparation = getattr(self.backend, "get_preparation", None)
+        if not callable(get_preparation):
+            return
+        preparation = get_preparation(self.runtime, self.backend_processes)
+        if preparation is None:
+            return
+
+        process = next(
+            (
+                item
+                for item in self.backend_processes
+                if item.node == preparation.node and item.endpoint_mode == preparation.mode
+            ),
+            None,
+        )
+        if process is None:
+            raise RuntimeError(
+                f"Backend preparation requested missing {preparation.mode} process on {preparation.node}"
+            )
+        env_to_set = dict(self.runtime.environment)
+        env_to_set.update(self.backend.get_environment_for_mode(preparation.mode))
+        env_to_set.update(self.backend.get_process_environment(process))
+        env_to_set.update(self._visible_device_environment(process))
+        container_for_mode = getattr(self.backend, "get_container_image_for_mode", None)
+        container_image = (
+            container_for_mode(preparation.mode, str(self.runtime.container_image))
+            if callable(container_for_mode)
+            else str(self.runtime.container_image)
+        )
+        log_path = self.runtime.log_dir / preparation.log_name
+        logger.info("Running backend preparation on %s: %s", preparation.node, shlex.join(preparation.command))
+        proc = start_srun_process(
+            command=preparation.command,
+            nodelist=[preparation.node],
+            output=str(log_path),
+            container_image=container_image,
+            container_mounts=self.runtime.container_mounts,
+            env_to_set=env_to_set or None,
+            bash_preamble=self._build_worker_preamble(),
+            srun_options=self.runtime.srun_options,
+            het_group=process.het_group,
+        )
+        try:
+            return_code = proc.wait(timeout=preparation.timeout_seconds)
+        except subprocess.TimeoutExpired as error:
+            proc.kill()
+            proc.wait()
+            raise RuntimeError(
+                f"Backend preparation timed out after {preparation.timeout_seconds}s; see {log_path}"
+            ) from error
+        if return_code != 0:
+            raise RuntimeError(f"Backend preparation failed with exit code {return_code}; see {log_path}")

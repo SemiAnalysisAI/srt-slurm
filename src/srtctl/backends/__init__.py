@@ -10,7 +10,7 @@ Supported backends:
 """
 
 from .atom import AtomProtocol, AtomServerConfig
-from .base import BackendProtocol, BackendType, SrunConfig
+from .base import BackendPreparation, BackendProtocol, BackendType, SrunConfig
 from .mocker import MockerProtocol, MockerServerConfig
 from .sglang import SGLangProtocol, SGLangServerConfig
 from .tilert import TileRTProtocol, TileRTServerConfig
@@ -25,6 +25,7 @@ __all__ = [
     "AtomProtocol",
     "AtomServerConfig",
     "BackendConfig",
+    "BackendPreparation",
     # Base types
     "BackendProtocol",
     "BackendType",

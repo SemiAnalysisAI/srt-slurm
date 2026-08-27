@@ -68,6 +68,27 @@ def test_tilert_builds_managed_prefill_and_decode_commands() -> None:
     assert "--with-mtp" in decode_command
 
 
+def test_tilert_prepares_weights_once_on_decode_runtime() -> None:
+    backend = TileRTProtocol(weights_dir="/shared/tilert/glm5.1-fp8")
+    runtime = SimpleNamespace(
+        is_hf_model=True,
+        model_path="zai-org/GLM-5.1-FP8",
+        worker_model_arg="zai-org/GLM-5.1-FP8",
+    )
+    prefill = Process("p0", frozenset(range(8)), 7500, 6100, "prefill", 0)
+    decode = Process("d0", frozenset(range(8)), 7501, 6100, "decode", 0)
+
+    preparation = backend.get_preparation(runtime, [prefill, decode])
+    script = preparation.command[-1]
+
+    assert preparation.node == "d0"
+    assert preparation.mode == "decode"
+    assert "fcntl.LOCK_EX" in script
+    assert "snapshot_download('zai-org/GLM-5.1-FP8', local_files_only=True)" in script
+    assert "tilert.models.preprocess.weight_converter" in script
+    assert "os.replace(tmp, target)" in script
+
+
 def test_tilert_router_uses_exact_prefill_and_decode_endpoints() -> None:
     frontend = TileRTRouterFrontend()
     workers = [

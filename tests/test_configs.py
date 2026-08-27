@@ -470,6 +470,41 @@ class TestSGLangProtocol:
         assert config.get_environment_for_mode("decode") == {"DECODE_VAR": "1"}
         assert config.get_environment_for_mode("agg") == {}
 
+    @pytest.mark.parametrize(
+        ("mode", "frontend_type", "frontend_args", "dp_size", "expected"),
+        [
+            ("prefill", "sglang", {"dp-aware": True}, 8, True),
+            ("decode", "sglang", {"dp_aware": True}, 8, True),
+            ("prefill", "sglang", {"dp-aware": True}, 1, False),
+            ("prefill", "sglang", {}, 8, False),
+            ("prefill", "dynamo", {"dp-aware": True}, 8, False),
+            ("agg", "sglang", {"dp-aware": True}, 8, False),
+        ],
+    )
+    def test_dp_aware_router_bootstrap_rank_environment(
+        self,
+        mode,
+        frontend_type,
+        frontend_args,
+        dp_size,
+        expected,
+    ):
+        config = SGLangProtocol(
+            sglang_config=SGLangServerConfig(
+                prefill={"dp-size": dp_size},
+                decode={"dp-size": dp_size},
+                aggregated={"dp-size": dp_size},
+            )
+        )
+
+        environment = config.get_frontend_integration_environment(
+            mode,
+            frontend_type,
+            frontend_args,
+        )
+
+        assert (environment.get("SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK") == "1") is expected
+
     def test_kv_events_config_global_bool(self):
         """Test kv_events_config=True enables prefill+decode with defaults."""
         config = SGLangProtocol(kv_events_config=True)

@@ -567,6 +567,10 @@ class WorkerStageMixin:
         logger.info("Running backend preparation on %s: %s", preparation.node, shlex.join(preparation.command))
         proc = start_srun_process(
             command=preparation.command,
+            # TileRT's converter allocates CUDA tensors. An explicit step-level
+            # GPU request is required for Pyxis to expose the driver/devices on
+            # clusters where a nested srun does not inherit job-level GRES.
+            gpus_per_task=1,
             nodelist=[preparation.node],
             output=str(log_path),
             container_image=container_image,

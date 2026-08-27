@@ -188,6 +188,7 @@ def start_srun_process(
     nodes: int = 1,
     ntasks: int = 1,
     cpus_per_task: int | None = None,
+    gpus_per_task: int | None = None,
     nodelist: Sequence[str] | None = None,
     output: str | None = None,
     container_image: str | None = None,
@@ -215,6 +216,10 @@ def start_srun_process(
         nodes: Number of nodes (default: 1)
         ntasks: Number of tasks (default: 1)
         cpus_per_task: CPUs per task (optional)
+        gpus_per_task: GPUs per task (optional). Requesting a GPU on the step is
+            also what makes Slurm/Pyxis inject the accelerator devices into the
+            container on clusters that do not expose job-level GRES to every
+            nested step automatically.
         nodelist: Specific nodes to run on (optional)
         output: Output file path (optional)
         container_image: Container image path (optional)
@@ -270,6 +275,8 @@ def start_srun_process(
 
     if cpus_per_task:
         srun_cmd.extend(["--cpus-per-task", str(cpus_per_task)])
+    if gpus_per_task:
+        srun_cmd.extend(["--gpus-per-task", str(gpus_per_task)])
 
     if nodelist:
         srun_cmd.extend(["--nodelist", ",".join(nodelist)])

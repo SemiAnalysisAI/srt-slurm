@@ -10,6 +10,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from srtctl.backends.base import BackendPreparation
 from srtctl.cli.do_sweep import SweepOrchestrator
 from srtctl.cli.mixins.worker_stage import WorkerStageMixin
 from srtctl.core.schema import ObservabilityConfig
@@ -145,6 +146,69 @@ def test_srun_options_use_equals_separator() -> None:
     assert "--cpu-bind=none" in srun_cmd
     assert "--export=ALL" in srun_cmd
     assert "--exclusive" in srun_cmd
+
+
+def test_start_srun_requests_step_gpu_resources() -> None:
+    with (
+        patch("srtctl.core.slurm.get_slurm_job_id", return_value="12345"),
+        patch("srtctl.core.slurm._get_cluster_bash_preamble", return_value=None),
+        patch("subprocess.Popen") as mock_popen,
+    ):
+        mock_popen.return_value = MagicMock()
+        start_srun_process(["python3", "convert.py"], gpus_per_task=1)
+
+    srun_cmd = mock_popen.call_args.args[0]
+    assert srun_cmd[srun_cmd.index("--gpus-per-task") + 1] == "1"
+
+
+def test_backend_preparation_requests_a_gpu_step(tmp_path: Path) -> None:
+    class PreparationStage(WorkerStageMixin):
+        @property
+        def backend_processes(self):
+            return self._backend_processes
+
+    process = SimpleNamespace(
+        endpoint_mode="decode",
+        node="node-a",
+        gpu_indices=list(range(8)),
+        cuda_visible_devices="0,1,2,3,4,5,6,7",
+        het_group=None,
+    )
+    backend = MagicMock()
+    backend.get_preparation.return_value = BackendPreparation(
+        command=["python3", "convert.py"],
+        node="node-a",
+        mode="decode",
+        log_name="conversion.out",
+    )
+    backend.get_environment_for_mode.return_value = {}
+    backend.get_process_environment.return_value = {}
+    backend.should_set_visible_devices.return_value = False
+
+    stage = PreparationStage()
+    stage._backend_processes = [process]
+    stage.config = SimpleNamespace(
+        backend=backend,
+        setup_script=None,
+        frontend=SimpleNamespace(type="tilert-router"),
+        dynamo=SimpleNamespace(install=False),
+    )
+    stage.runtime = SimpleNamespace(
+        environment={},
+        container_image=Path("/container.sqsh"),
+        container_mounts={tmp_path: Path("/logs")},
+        log_dir=tmp_path,
+        gpus_per_node=8,
+        accelerator_vendor="nvidia",
+        srun_options={},
+    )
+
+    child = MagicMock()
+    child.wait.return_value = 0
+    with patch("srtctl.cli.mixins.worker_stage.start_srun_process", return_value=child) as mock_srun:
+        stage.prepare_backend()
+
+    assert mock_srun.call_args.kwargs["gpus_per_task"] == 1
 
 
 def test_srun_export_env_renders_export_with_all_prefix() -> None:

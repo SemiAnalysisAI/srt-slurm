@@ -297,8 +297,13 @@ def _reject_managed_args(config: dict[str, Any], reserved: set[str]) -> None:
 
 def _weight_preparation_script(*, source: str, is_hf_model: bool, weights_dir: str, weight_model_type: str) -> str:
     """Build a lock-safe, atomic TileRT conversion command."""
+    # Backend preparation is the final completeness boundary before conversion.
+    # The best-effort orchestrator pre-download may time out, and
+    # ``local_files_only=True`` can still resolve a partially populated snapshot.
+    # Let snapshot_download resume missing files here under its normal HF cache
+    # locks; a complete cache remains a metadata-only fast path.
     resolve_source = (
-        f"from huggingface_hub import snapshot_download; source = snapshot_download({source!r}, local_files_only=True)"
+        f"from huggingface_hub import snapshot_download; source = snapshot_download({source!r})"
         if is_hf_model
         else f"source = {source!r}"
     )

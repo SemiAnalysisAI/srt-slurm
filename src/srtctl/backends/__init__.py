@@ -13,11 +13,12 @@ from .atom import AtomProtocol, AtomServerConfig
 from .base import BackendProtocol, BackendType, SrunConfig
 from .mocker import MockerProtocol, MockerServerConfig
 from .sglang import SGLangProtocol, SGLangServerConfig
+from .tilert import TileRTProtocol, TileRTServerConfig
 from .trtllm import TRTLLMProtocol, TRTLLMServerConfig
 from .vllm import VLLMProtocol, VLLMServerConfig
 
 # Union type for all backend configs
-BackendConfig = AtomProtocol | SGLangProtocol | TRTLLMProtocol | VLLMProtocol | MockerProtocol
+BackendConfig = AtomProtocol | SGLangProtocol | TRTLLMProtocol | TileRTProtocol | VLLMProtocol | MockerProtocol
 
 __all__ = [
     # ATOM
@@ -37,6 +38,9 @@ __all__ = [
     # TRTLLM
     "TRTLLMProtocol",
     "TRTLLMServerConfig",
+    # TileRT
+    "TileRTProtocol",
+    "TileRTServerConfig",
     # vLLM
     "VLLMProtocol",
     "VLLMServerConfig",

@@ -151,6 +151,20 @@ def resolve_config_with_defaults(user_config: dict[str, Any], cluster_config: di
         model["container"] = resolved_container
         logger.debug(f"Resolved container alias '{container}' -> '{resolved_container}'")
 
+    # Heterogeneous backends may use a role-specific image in addition to the
+    # model/decode image. Resolve it through the same cluster container map.
+    backend = config.get("backend", {})
+    prefill_container = backend.get("prefill_container", "")
+    if containers and prefill_container in containers:
+        resolved_prefill = containers[prefill_container]
+        backend["prefill_container"] = resolved_prefill
+        config["backend"] = backend
+        logger.debug(
+            "Resolved backend.prefill_container alias '%s' -> '%s'",
+            prefill_container,
+            resolved_prefill,
+        )
+
     # Apply reporting defaults (if not specified in user config)
     if "reporting" not in config and cluster_config.get("reporting"):
         config["reporting"] = cluster_config["reporting"]

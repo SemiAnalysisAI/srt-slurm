@@ -38,6 +38,7 @@ from srtctl.backends import (
     BackendConfig,
     MockerProtocol,
     SGLangProtocol,
+    TileRTProtocol,
     TRTLLMProtocol,
     VLLMProtocol,
 )
@@ -302,7 +303,9 @@ class BackendConfigField(fields.Field):
             # Default to SGLang
             return SGLangProtocol()
 
-        if isinstance(value, AtomProtocol | SGLangProtocol | TRTLLMProtocol | VLLMProtocol | MockerProtocol):
+        if isinstance(
+            value, AtomProtocol | SGLangProtocol | TileRTProtocol | TRTLLMProtocol | VLLMProtocol | MockerProtocol
+        ):
             return value
 
         if not isinstance(value, dict):
@@ -313,6 +316,8 @@ class BackendConfigField(fields.Field):
 
         if backend_type == "atom":
             return AtomProtocol.Schema().load(value)
+        elif backend_type == "tilert":
+            return TileRTProtocol.Schema().load(value)
         elif backend_type == "sglang":
             schema = SGLangProtocol.Schema()
             return schema.load(value)
@@ -327,7 +332,7 @@ class BackendConfigField(fields.Field):
             return schema.load(value)
         else:
             raise ValidationError(
-                f"Unknown backend type: {backend_type!r}. Supported types: atom, sglang, trtllm, vllm, mocker"
+                f"Unknown backend type: {backend_type!r}. Supported types: atom, tilert, sglang, trtllm, vllm, mocker"
             )
 
     def _serialize(self, value: Any | None, attr: str | None, obj: Any, **kwargs) -> Any:
@@ -336,6 +341,8 @@ class BackendConfigField(fields.Field):
             return None
         if isinstance(value, AtomProtocol):
             return AtomProtocol.Schema().dump(value)
+        if isinstance(value, TileRTProtocol):
+            return TileRTProtocol.Schema().dump(value)
         if isinstance(value, SGLangProtocol):
             return SGLangProtocol.Schema().dump(value)
         if isinstance(value, TRTLLMProtocol):
@@ -1833,7 +1840,12 @@ class SrtConfig:
 
     def _validate_static_router_frontend(self):
         """Validate static-router/backend pairings and vLLM DP ownership."""
-        required_backend = {"atomesh": "atom", "sglang": "sglang", "vllm-router": "vllm"}.get(self.frontend.type)
+        required_backend = {
+            "atomesh": "atom",
+            "sglang": "sglang",
+            "tilert-router": "tilert",
+            "vllm-router": "vllm",
+        }.get(self.frontend.type)
         if required_backend is None:
             return
         if self.backend_type != required_backend:
@@ -1841,6 +1853,23 @@ class SrtConfig:
                 f"frontend.type: {self.frontend.type} requires backend.type: {required_backend}; "
                 f"got {self.backend_type!r}"
             )
+
+        if self.frontend.type == "tilert-router":
+            if self.frontend.enable_multiple_frontends:
+                raise ValidationError(
+                    "TileRT keeps decode availability in router-local state; "
+                    "set frontend.enable_multiple_frontends: false"
+                )
+            if self.resources.num_prefill != 1 or self.resources.num_decode < 1 or self.resources.num_agg:
+                raise ValidationError(
+                    "TileRT requires exactly one prefill worker, at least one decode worker, and no aggregate workers"
+                )
+            if (
+                self.resources.gpus_per_prefill > self.resources.gpus_per_node
+                or self.resources.gpus_per_decode > self.resources.gpus_per_node
+            ):
+                raise ValidationError("TileRT currently requires every prefill and decode worker to fit on one node")
+            return
 
         if self.frontend.type != "vllm-router":
             return

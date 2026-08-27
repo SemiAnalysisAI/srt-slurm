@@ -271,11 +271,17 @@ class WorkerStageMixin:
         endpoint_nodes = {endpoint_process.node for endpoint_process in endpoint_processes}
         env_to_unset = ["VLLM_PORT"] if self.backend.type == "vllm" and len(endpoint_nodes) > 1 else None
 
+        container_for_mode = getattr(self.backend, "get_container_image_for_mode", None)
+        container_image = (
+            container_for_mode(mode, str(self.runtime.container_image))
+            if callable(container_for_mode)
+            else str(self.runtime.container_image)
+        )
         proc = start_srun_process(
             command=cmd,
             nodelist=[process.node],
             output=str(worker_log),
-            container_image=str(self.runtime.container_image),
+            container_image=container_image,
             container_mounts=self.runtime.container_mounts,
             env_to_set=env_to_set,
             env_to_unset=env_to_unset,

@@ -47,7 +47,11 @@ def test_atom_atomesh_schema_roundtrip() -> None:
 
 
 def test_atom_builds_native_aggregate_command() -> None:
-    backend = AtomProtocol(atom_config=AtomServerConfig(aggregated={"trust-remote-code": True}))
+    backend = AtomProtocol(
+        atom_config=AtomServerConfig(
+            aggregated={"trust-remote-code": True, "gpu_memory_utilization": 0.9}
+        )
+    )
     process = Process("node0", frozenset(range(8)), 7500, 6100, "agg", 0, nixl_port=5400)
     runtime = SimpleNamespace(worker_model_arg="/model", network_interface="hsn0")
 
@@ -58,6 +62,8 @@ def test_atom_builds_native_aggregate_command() -> None:
     assert command[command.index("--server-port") + 1] == "6100"
     assert command[command.index("-tp") + 1] == "8"
     assert "--kv-transfer-config" not in command
+    assert command[command.index("--gpu-memory-utilization") + 1] == "0.9"
+    assert "--gpu_memory_utilization" not in command
     assert command[-1] == "--trust-remote-code"
 
 

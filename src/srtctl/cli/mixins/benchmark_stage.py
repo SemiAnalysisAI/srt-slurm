@@ -222,7 +222,12 @@ class BenchmarkStageMixin:
         for process in self.backend_processes:
             if self.config.frontend.type != "vllm-router" and not process.is_leader:
                 continue
-            if self.config.frontend.type == "dynamo":
+            get_metrics_port = getattr(self.config.backend, "get_metrics_port", None)
+            if callable(get_metrics_port):
+                port = get_metrics_port(process)
+                if port is None:
+                    continue
+            elif self.config.frontend.type == "dynamo":
                 port = process.sys_port
             elif self.config.frontend.type == "vllm":
                 port = self.runtime.frontend_port

@@ -88,6 +88,14 @@ class TileRTProtocol:
     def get_served_model_name(self, default: str) -> str:
         return default
 
+    def get_metrics_port(self, process: Process) -> int | None:
+        """Return only real Prometheus endpoints.
+
+        The vLLM prefill API exports ``/metrics``. TileRT's decode API exports
+        health and token-transfer routes but no Prometheus handler.
+        """
+        return process.http_port if process.endpoint_mode == "prefill" else None
+
     def get_preparation(self, runtime: RuntimeContext, processes: list[Process]) -> BackendPreparation:
         """Materialize converted TileRT weights once under a shared lock."""
         from srtctl.backends.base import BackendPreparation

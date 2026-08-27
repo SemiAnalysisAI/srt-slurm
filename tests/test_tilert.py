@@ -66,6 +66,8 @@ def test_tilert_builds_managed_prefill_and_decode_commands() -> None:
     assert decode_command[decode_command.index("--ctrl-port") + 1] == "7501"
     assert decode_command[decode_command.index("--http-port") + 1] == "6100"
     assert "--with-mtp" in decode_command
+    assert backend.get_metrics_port(prefill) == 6100
+    assert backend.get_metrics_port(decode) is None
 
 
 def test_tilert_prepares_weights_once_on_decode_runtime() -> None:
@@ -86,7 +88,7 @@ def test_tilert_prepares_weights_once_on_decode_runtime() -> None:
     assert "fcntl.LOCK_EX" in script
     assert "snapshot_download('zai-org/GLM-5.1-FP8', local_files_only=True)" in script
     assert "tilert.models.preprocess.weight_converter" in script
-    assert '"--model_type",\n            \'glm-5\'' in script
+    assert "\"--model_type\",\n            'glm-5'" in script
     assert "os.replace(tmp, target)" in script
 
 

@@ -60,7 +60,7 @@ class TestValidateSetup:
             validate_setup(tmp_path)
 
     def test_fails_when_tachometer_scraper_missing(self, tmp_path: Path):
-        """validate_setup fails when the compute-architecture scraper is missing."""
+        """An enabled Tachometer collector requires its compute-architecture scraper."""
         (tmp_path / "configs").mkdir()
         (tmp_path / "configs" / "nats-server").touch()
         (tmp_path / "configs" / "etcd").touch()
@@ -68,7 +68,17 @@ class TestValidateSetup:
         (tmp_path / "bin" / "uv").touch()
 
         with pytest.raises(SystemExit):
-            validate_setup(tmp_path)
+            validate_setup(tmp_path, requires_tachometer=True)
+
+    def test_tachometer_scraper_is_optional_when_collection_is_disabled(self, tmp_path: Path):
+        """Recipes that do not enable Tachometer must not require its binary."""
+        (tmp_path / "configs").mkdir()
+        (tmp_path / "configs" / "nats-server").touch()
+        (tmp_path / "configs" / "etcd").touch()
+        (tmp_path / "bin").mkdir()
+        (tmp_path / "bin" / "uv").touch()
+
+        validate_setup(tmp_path)
 
     def test_fails_when_all_missing(self, tmp_path: Path):
         """validate_setup fails when nothing has been set up."""

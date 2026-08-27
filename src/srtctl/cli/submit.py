@@ -430,11 +430,18 @@ def show_config_details(config: SrtConfig) -> None:
         console.print(Panel(details, border_style="blue"))
 
 
-def validate_setup(srtctl_source: Path, *, requires_head_infrastructure: bool = True) -> None:
+def validate_setup(
+    srtctl_source: Path,
+    *,
+    requires_head_infrastructure: bool = True,
+    requires_tachometer: bool = False,
+) -> None:
     """Validate that make setup has been run and required binaries exist.
 
-    Checks for NATS, etcd, Tachometer, and compute-arch uv binaries. Raises SystemExit
-    with a clear error message if anything is missing.
+    Checks for the binaries required by the resolved recipe. NATS and etcd are
+    needed only by frontends that launch head-node infrastructure, while the
+    Tachometer scraper is needed only when native Tachometer collection is
+    enabled. Compute-architecture uv is always required.
     """
     missing = []
 
@@ -446,7 +453,7 @@ def validate_setup(srtctl_source: Path, *, requires_head_infrastructure: bool = 
             missing.append("configs/etcd")
     if not (srtctl_source / "bin" / "uv").exists():
         missing.append("bin/uv (compute-arch uv)")
-    if not (srtctl_source / "bin" / "tachometer-scraper").exists():
+    if requires_tachometer and not (srtctl_source / "bin" / "tachometer-scraper").exists():
         missing.append("bin/tachometer-scraper (compute-arch Tachometer scraper)")
 
     if missing:
@@ -784,7 +791,11 @@ def submit_with_orchestrator(
         "vllm",
         "vllm-router",
     }
-    validate_setup(srtctl_source, requires_head_infrastructure=requires_head_infrastructure)
+    validate_setup(
+        srtctl_source,
+        requires_head_infrastructure=requires_head_infrastructure,
+        requires_tachometer=config.observability.tachometer.enabled,
+    )
 
     # Write script to temp file
     fd, script_path = tempfile.mkstemp(suffix=".slurm", prefix="srtctl_", text=True)

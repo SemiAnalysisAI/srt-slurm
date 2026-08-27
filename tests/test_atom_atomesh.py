@@ -77,6 +77,18 @@ def test_atom_builds_official_mooncake_pd_contract() -> None:
     }
 
 
+def test_atom_can_select_mooncake_tcp_for_rocm_correctness() -> None:
+    backend = AtomProtocol(mooncake_protocol="tcp")
+    process = Process("node0", frozenset(range(4)), 7500, 6100, "decode", 0, nixl_port=6301)
+    runtime = SimpleNamespace(worker_model_arg="/model", network_interface=None)
+
+    with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.20"):
+        command = backend.build_worker_command(process, [process], runtime)
+
+    payload = json.loads(command[command.index("--kv-transfer-config") + 1])
+    assert payload["protocol"] == "tcp"
+
+
 def test_atomesh_builds_native_static_pd_command() -> None:
     frontend = AtomeshFrontend()
     workers = [

@@ -158,6 +158,19 @@ export SRTCTL_SOURCE_DIR="${SRTCTL_SOURCE}"
 export {{ key }}={{ value }}
 {% endfor %}
 
+{% if host_setup_script %}
+HOST_SETUP_SCRIPT={{ host_setup_script }}
+if [ ! -f "${HOST_SETUP_SCRIPT}" ]; then
+    echo "ERROR: host setup script not found: ${HOST_SETUP_SCRIPT}" >&2
+    exit 1
+fi
+echo "Running host setup script on every allocated node: ${HOST_SETUP_SCRIPT}"
+srun --overlap --nodes="${SLURM_JOB_NUM_NODES}" --ntasks="${SLURM_JOB_NUM_NODES}" \
+    --ntasks-per-node=1 --cpus-per-task=1 --cpu-bind=none \
+    bash "${HOST_SETUP_SCRIPT}"
+echo "Host setup completed on every allocated node."
+{% endif %}
+
 echo ""
 echo "Preparing srtctl environment..."
 

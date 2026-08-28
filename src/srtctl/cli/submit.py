@@ -625,6 +625,7 @@ def generate_minimal_sbatch_script(
         srtctl_source=str(srtctl_source.resolve()),
         output_base=output_base,
         setup_script=setup_script,
+        host_setup_script=(shlex.quote(str(config.host_setup_script)) if config.host_setup_script else None),
         serve_only=serve_only,
         config_environment={key: shlex.quote(str(value)) for key, value in config_environment.items()},
     )

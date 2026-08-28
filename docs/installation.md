@@ -281,3 +281,18 @@ You can run custom initialization scripts on worker nodes before starting SGLang
 The script will be executed on each worker node (prefill, decode, or aggregated) before installing Dynamo from PyPI and starting the SGLang workers. The script must be located in the `configs/` directory, which is mounted into containers at `/configs/`.
 
 **Note**: Setup scripts only run when you explicitly specify `--setup-script`. No default setup script will run if this flag is omitted.
+
+### Host Setup Scripts
+
+For node preparation that must happen outside the worker container, set
+`host_setup_script` to an absolute script path on a filesystem shared by the
+allocated compute nodes:
+
+```yaml
+host_setup_script: /shared/cluster/prepare-node.sh
+```
+
+The generated Slurm job runs the script once per allocated node before any
+frontend or model worker starts. This is intentionally separate from
+`setup_script`, which runs inside worker containers. No host script is run
+unless the recipe opts in explicitly.

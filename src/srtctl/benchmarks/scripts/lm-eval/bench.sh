@@ -38,6 +38,15 @@ if [[ "$(python3 -c 'import sys; print(sys.prefix)')" != "${LM_EVAL_VENV}" ]]; t
 fi
 echo "lm-eval Runtime: python=$(command -v python3); prefix=${LM_EVAL_VENV}"
 
+# Some serving images seed virtual environments with a pip version old enough
+# that it does not recognize --break-system-packages.  InferenceX's shared eval
+# installer passes that option, so make the job-local pip understand it before
+# handing control to benchmark_lib.sh.  This only mutates the disposable venv.
+if ! python3 -m pip install --help 2>/dev/null | grep -q -- '--break-system-packages'; then
+    echo "lm-eval Runtime: upgrading job-local pip for --break-system-packages support"
+    python3 -m pip install --upgrade 'pip>=23.0'
+fi
+
 # Auto-discover the served model name from /v1/models if MODEL_NAME is not set.
 # This ensures we use the exact name the server recognizes, regardless of what
 # $MODEL (the HuggingFace ID from the workflow) is set to.

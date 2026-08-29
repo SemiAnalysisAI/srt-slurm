@@ -937,6 +937,8 @@ class TestLMEvalRunner:
         assert "python3 -m venv --system-site-packages" in content
         assert 'export PATH="${LM_EVAL_VENV}/bin:${PATH}"' in content
         assert "sys.prefix" in content
+        assert "pip install --help" in content
+        assert "python3 -m pip install --upgrade 'pip>=23.0'" in content
 
 
 class TestGSM8KRunner:

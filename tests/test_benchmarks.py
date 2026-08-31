@@ -946,6 +946,9 @@ class TestLMEvalRunner:
         assert 'export HF_HOME="${LM_EVAL_CACHE_DIR}/huggingface"' in content
         assert 'export HF_DATASETS_CACHE="${HF_HOME}/datasets"' in content
         assert 'mkdir -p "${XDG_CACHE_HOME}" "${HF_HUB_CACHE}" "${HF_DATASETS_CACHE}"' in content
+        assert 'LM_EVAL_RESULT_DIR="${SRTCTL_LM_EVAL_RESULT_DIR:-}"' in content
+        assert 'if [[ -n "${LM_EVAL_RESULT_DIR}" ]]' in content
+        assert 'cp -v meta_env.json "${LM_EVAL_RESULT_DIR}/"' in content
 
 
 class TestGSM8KRunner:

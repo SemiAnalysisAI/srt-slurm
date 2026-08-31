@@ -25,6 +25,7 @@ echo "lm-eval Config: endpoint=${ENDPOINT}; host=${HOST}; port=${PORT}; workspac
 LM_EVAL_RUNTIME_DIR="${SRTCTL_LM_EVAL_RUNTIME_DIR:-${TMPDIR:-/tmp}/srtctl-lm-eval-${SLURM_JOB_ID:-$$}}"
 LM_EVAL_VENV="${LM_EVAL_RUNTIME_DIR}/venv"
 LM_EVAL_CACHE_DIR="${SRTCTL_LM_EVAL_CACHE_DIR:-${LM_EVAL_RUNTIME_DIR}/cache}"
+LM_EVAL_RESULT_DIR="${SRTCTL_LM_EVAL_RESULT_DIR:-}"
 
 # Serving containers often expose the host user's home and shared model cache
 # read-only. lm-eval still needs writable Hugging Face and XDG caches for task
@@ -144,6 +145,17 @@ echo "Copying eval artifacts to /logs/eval_results/..."
 cp -v meta_env.json /logs/eval_results/ 2>/dev/null || true
 cp -v results*.json /logs/eval_results/ 2>/dev/null || true
 cp -v sample*.jsonl /logs/eval_results/ 2>/dev/null || true
+
+# Integrations that maintain a separate result tree can request an additional
+# copy without coupling this benchmark to a particular host mount layout. The
+# default remains /logs/eval_results for existing srt-slurm consumers.
+if [[ -n "${LM_EVAL_RESULT_DIR}" ]]; then
+    mkdir -p "${LM_EVAL_RESULT_DIR}"
+    echo "Copying eval artifacts to ${LM_EVAL_RESULT_DIR}/..."
+    cp -v meta_env.json "${LM_EVAL_RESULT_DIR}/" 2>/dev/null || true
+    cp -v results*.json "${LM_EVAL_RESULT_DIR}/" 2>/dev/null || true
+    cp -v sample*.jsonl "${LM_EVAL_RESULT_DIR}/" 2>/dev/null || true
+fi
 
 if [[ "$eval_rc" -ne 0 ]]; then
     echo "lm-eval evaluation failed with exit code ${eval_rc}"

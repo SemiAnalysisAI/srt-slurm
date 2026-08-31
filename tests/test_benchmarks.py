@@ -939,6 +939,9 @@ class TestLMEvalRunner:
         assert "sys.prefix" in content
         assert "pip install --help" in content
         assert "python3 -m pip install --upgrade 'pip>=23.0'" in content
+        assert "/opt/venv/bin/python3" in content
+        assert "srtctl-framework.pth" in content
+        assert "job-local lm-eval runtime cannot import serving-image torch" in content
 
 
 class TestGSM8KRunner:

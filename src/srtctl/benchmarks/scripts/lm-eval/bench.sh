@@ -24,11 +24,40 @@ echo "lm-eval Config: endpoint=${ENDPOINT}; host=${HOST}; port=${PORT}; workspac
 # benchmark_lib.sh's existing `python3 -m ...` interface unchanged.
 LM_EVAL_RUNTIME_DIR="${SRTCTL_LM_EVAL_RUNTIME_DIR:-${TMPDIR:-/tmp}/srtctl-lm-eval-${SLURM_JOB_ID:-$$}}"
 LM_EVAL_VENV="${LM_EVAL_RUNTIME_DIR}/venv"
+
+# The Slurm step can receive a reduced PATH even when the serving image keeps
+# its ROCm/PyTorch environment under /opt/venv.  lm-eval imports torch for its
+# API client helpers, so preserve the framework environment's site-packages in
+# the disposable eval venv instead of downloading a second (and potentially
+# incompatible) torch build.  Prefer an explicit override, then the standard
+# SGLang image environment, and finally the Python visible on PATH.
+LM_EVAL_FRAMEWORK_PYTHON="${SRTCTL_LM_EVAL_FRAMEWORK_PYTHON:-}"
+if [[ -z "${LM_EVAL_FRAMEWORK_PYTHON}" ]]; then
+    for candidate in /opt/venv/bin/python3 "$(command -v python3)"; do
+        if [[ -x "${candidate}" ]] && "${candidate}" -c 'import torch' >/dev/null 2>&1; then
+            LM_EVAL_FRAMEWORK_PYTHON="${candidate}"
+            break
+        fi
+    done
+fi
+if [[ -z "${LM_EVAL_FRAMEWORK_PYTHON}" ]]; then
+    echo "ERROR: no serving-image Python with torch is available for lm-eval" >&2
+    exit 1
+fi
+LM_EVAL_FRAMEWORK_SITE_PACKAGES="$("${LM_EVAL_FRAMEWORK_PYTHON}" - <<'PY'
+import sys
+
+print("\n".join(path for path in sys.path if "site-packages" in path))
+PY
+)"
+
 if [[ ! -x "${LM_EVAL_VENV}/bin/python3" ]]; then
     rm -rf "${LM_EVAL_VENV}"
     mkdir -p "${LM_EVAL_RUNTIME_DIR}"
     python3 -m venv --system-site-packages "${LM_EVAL_VENV}"
 fi
+LM_EVAL_SITE_PACKAGES="$("${LM_EVAL_VENV}/bin/python3" -c 'import site; print(site.getsitepackages()[0])')"
+printf '%s\n' "${LM_EVAL_FRAMEWORK_SITE_PACKAGES}" > "${LM_EVAL_SITE_PACKAGES}/srtctl-framework.pth"
 export PATH="${LM_EVAL_VENV}/bin:${PATH}"
 hash -r
 
@@ -37,6 +66,10 @@ if [[ "$(python3 -c 'import sys; print(sys.prefix)')" != "${LM_EVAL_VENV}" ]]; t
     exit 1
 fi
 echo "lm-eval Runtime: python=$(command -v python3); prefix=${LM_EVAL_VENV}"
+python3 -c 'import torch' || {
+    echo "ERROR: job-local lm-eval runtime cannot import serving-image torch" >&2
+    exit 1
+}
 
 # Some serving images seed virtual environments with a pip version old enough
 # that it does not recognize --break-system-packages.  InferenceX's shared eval

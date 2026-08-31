@@ -24,6 +24,19 @@ echo "lm-eval Config: endpoint=${ENDPOINT}; host=${HOST}; port=${PORT}; workspac
 # benchmark_lib.sh's existing `python3 -m ...` interface unchanged.
 LM_EVAL_RUNTIME_DIR="${SRTCTL_LM_EVAL_RUNTIME_DIR:-${TMPDIR:-/tmp}/srtctl-lm-eval-${SLURM_JOB_ID:-$$}}"
 LM_EVAL_VENV="${LM_EVAL_RUNTIME_DIR}/venv"
+LM_EVAL_CACHE_DIR="${SRTCTL_LM_EVAL_CACHE_DIR:-${LM_EVAL_RUNTIME_DIR}/cache}"
+
+# Serving containers often expose the host user's home and shared model cache
+# read-only. lm-eval still needs writable Hugging Face and XDG caches for task
+# datasets, even when model weights are already present. Keep all client-side
+# downloads inside the disposable job-local runtime instead of mutating the
+# serving cache or relying on $HOME/.cache.
+export XDG_CACHE_HOME="${LM_EVAL_CACHE_DIR}/xdg"
+export HF_HOME="${LM_EVAL_CACHE_DIR}/huggingface"
+export HF_HUB_CACHE="${HF_HOME}/hub"
+export HUGGINGFACE_HUB_CACHE="${HF_HUB_CACHE}"
+export HF_DATASETS_CACHE="${HF_HOME}/datasets"
+mkdir -p "${XDG_CACHE_HOME}" "${HF_HUB_CACHE}" "${HF_DATASETS_CACHE}"
 
 # The Slurm step can receive a reduced PATH even when the serving image keeps
 # its ROCm/PyTorch environment under /opt/venv.  lm-eval imports torch for its

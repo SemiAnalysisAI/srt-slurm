@@ -605,7 +605,14 @@ class SweepOrchestrator(
 
         # Pass through eval-related env vars. InferenceX writes multi-node
         # metadata from these variables in append_lm_eval_summary().
-        env_to_set = {}
+        # Post-eval replaces the configured benchmark runner with lm-eval, but
+        # it is still a benchmark process. Preserve the recipe's benchmark
+        # environment so integrations can pass runner-specific settings such
+        # as an additional artifact sink through this substituted path.
+        env_to_set = {
+            key: self.runtime.format_string(value)
+            for key, value in self.config.benchmark.env.items()
+        }
         for var in [
             "RUN_EVAL",
             "EVAL_ONLY",

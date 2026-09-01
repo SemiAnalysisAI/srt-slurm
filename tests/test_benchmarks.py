@@ -1460,6 +1460,34 @@ class TestRunPostEval:
         assert env_to_set["MODEL"] == "test-model"
         assert env_to_set["MODEL_NAME"] == "test-model"
 
+    def test_benchmark_env_passthrough(self):
+        """Eval-only substitution preserves the configured benchmark env."""
+        import os
+        import threading
+        from unittest.mock import MagicMock, patch
+
+        orch = self._make_orchestrator()
+        orch.config.benchmark.env["SRTCTL_LM_EVAL_RESULT_DIR"] = "/results/{job_id}/eval"
+        stop = threading.Event()
+
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 0
+        mock_proc.returncode = 0
+        captured_kwargs = {}
+
+        def capture_srun(**kwargs):
+            captured_kwargs.update(kwargs)
+            return mock_proc
+
+        with (
+            patch.dict(os.environ, {"EVAL_ONLY": "false"}, clear=False),
+            patch("srtctl.cli.do_sweep.wait_for_port", return_value=True),
+            patch("srtctl.cli.do_sweep.start_srun_process", side_effect=capture_srun),
+        ):
+            orch._run_post_eval(stop)
+
+        assert captured_kwargs["env_to_set"]["SRTCTL_LM_EVAL_RESULT_DIR"] == "/results/12345/eval"
+
     def test_eval_conc_from_env(self):
         """EVAL_CONC from env takes priority over benchmark concurrencies."""
         import os

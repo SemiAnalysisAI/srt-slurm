@@ -49,7 +49,12 @@ def test_atom_atomesh_schema_roundtrip() -> None:
 def test_atom_builds_native_aggregate_command() -> None:
     backend = AtomProtocol(
         atom_config=AtomServerConfig(
-            aggregated={"trust-remote-code": True, "gpu_memory_utilization": 0.9}
+            aggregated={
+                "trust-remote-code": True,
+                "gpu-memory-utilization": 0.9,
+                "kv_cache_dtype": "fp8",
+                "no-enable_prefix_caching": True,
+            }
         )
     )
     process = Process("node0", frozenset(range(8)), 7500, 6100, "agg", 0, nixl_port=5400)
@@ -64,6 +69,10 @@ def test_atom_builds_native_aggregate_command() -> None:
     assert "--kv-transfer-config" not in command
     assert command[command.index("--gpu-memory-utilization") + 1] == "0.9"
     assert "--gpu_memory_utilization" not in command
+    assert command[command.index("--kv_cache_dtype") + 1] == "fp8"
+    assert "--no-enable_prefix_caching" in command
+    assert "--kv-cache-dtype" not in command
+    assert "--no-enable-prefix-caching" not in command
     assert command[-1] == "--trust-remote-code"
 
 
@@ -79,6 +88,7 @@ def test_atom_builds_official_mooncake_pd_contract() -> None:
     assert payload == {
         "kv_role": "kv_producer",
         "kv_connector": "mooncake",
+        "proxy_ip": "10.0.0.20",
         "handshake_port": 6301,
     }
 

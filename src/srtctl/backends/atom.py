@@ -129,7 +129,7 @@ class AtomProtocol:
 
         return endpoints_to_processes(endpoints, base_sys_port=base_sys_port, port_allocator=port_allocator)
 
-    def _kv_transfer_config(self, process: Process) -> str:
+    def _kv_transfer_config(self, process: Process, worker_ip: str) -> str:
         if process.endpoint_mode not in {"prefill", "decode"}:
             raise ValueError("ATOM KV transfer is only valid for prefill/decode workers")
         if process.nixl_port is None:
@@ -137,6 +137,7 @@ class AtomProtocol:
         payload = {
             "kv_role": "kv_producer" if process.endpoint_mode == "prefill" else "kv_consumer",
             "kv_connector": self.connector,
+            "proxy_ip": worker_ip,
             "handshake_port": process.nixl_port,
         }
         if self.mooncake_protocol is not None:
@@ -185,16 +186,16 @@ class AtomProtocol:
             ]
         )
         if process.endpoint_mode in {"prefill", "decode"}:
-            command.extend(["--kv-transfer-config", self._kv_transfer_config(process)])
+            command.extend(["--kv-transfer-config", self._kv_transfer_config(process, worker_ip)])
         command.extend(_config_to_cli_args(config))
         return command
 
 
 def _config_to_cli_args(config: dict[str, Any]) -> list[str]:
-    """Convert recipe config keys to ATOM's kebab-case CLI flags."""
+    """Preserve ATOM's native CLI spelling, which mixes hyphens and underscores."""
     args: list[str] = []
     for key, value in sorted(config.items()):
-        flag = f"--{key.replace('_', '-')}"
+        flag = f"--{key}"
         if value is True:
             args.append(flag)
         elif value is False or value is None:

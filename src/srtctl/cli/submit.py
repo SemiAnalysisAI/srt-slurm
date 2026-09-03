@@ -625,7 +625,6 @@ def generate_minimal_sbatch_script(
         srtctl_source=str(srtctl_source.resolve()),
         output_base=output_base,
         setup_script=setup_script,
-        host_setup_script=(shlex.quote(str(config.host_setup_script)) if config.host_setup_script else None),
         serve_only=serve_only,
         config_environment={key: shlex.quote(str(value)) for key, value in config_environment.items()},
     )
@@ -1625,6 +1624,10 @@ def main():
         help="YAML config file, or file:selector for overrides",
     )
 
+    wait_parser = subparsers.add_parser("wait", help="Wait for a submitted Slurm job and return its exit status")
+    wait_parser.add_argument("job_id", help="Slurm job ID returned by apply --json")
+    wait_parser.add_argument("--log-file", type=Path, help="Stream this shared-filesystem log while waiting")
+
     monitor_parser = subparsers.add_parser("monitor", help="Live dashboard for srt-slurm jobs", add_help=False)
     monitor_parser.add_argument("args", nargs=argparse.REMAINDER)
 
@@ -1759,6 +1762,23 @@ def main():
             console.print(format_check_results([]))
         restore_console()
         sys.exit(1 if all_results else 0)
+
+    if args.command == "wait":
+        from srtctl.core.slurm import wait_for_job
+
+        try:
+            result = wait_for_job(args.job_id, log_path=args.log_file)
+        except (ValueError, OSError) as error:
+            console.print(f"[bold red]Error:[/] {error}")
+            restore_console()
+            sys.exit(1)
+        except KeyboardInterrupt:
+            console.print("Stopped observing; the Slurm job has not been cancelled.")
+            restore_console()
+            sys.exit(130)
+        console.print(f"Job {result.job_id}: {result.state} ({result.exit_code}:{result.signal})")
+        restore_console()
+        sys.exit(result.returncode)
 
     if args.command == "monitor":
         from srtctl.cli.monitor import main as _monitor_main

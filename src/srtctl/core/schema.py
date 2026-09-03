@@ -1733,12 +1733,6 @@ class SrtConfig:
     # e.g. "custom-setup.sh" -> runs /configs/custom-setup.sh
     setup_script: str | None = None
 
-    # Optional host-side preparation script. The generated Slurm job runs this
-    # once on every allocated node, outside the worker container, before any
-    # runtime services or model workers start. The path must be visible from
-    # every compute node (normally through a shared filesystem).
-    host_setup_script: str | None = None
-
     # Virtual identity — declares what *should* be running (verified against fingerprint)
     identity: IdentityConfig = field(default_factory=IdentityConfig)
 

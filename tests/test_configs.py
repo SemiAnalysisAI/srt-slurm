@@ -989,47 +989,6 @@ class TestSetupScript:
         )
         assert 'export SRTCTL_SETUP_SCRIPT="install-sglang-main.sh"' in script
 
-    def test_sbatch_template_runs_host_setup_on_every_node(self):
-        """Host preparation runs once per allocated node before the orchestrator."""
-        from pathlib import Path
-
-        from srtctl.cli.submit import generate_minimal_sbatch_script
-        from srtctl.core.schema import ModelConfig, ResourceConfig, SrtConfig
-
-        config = SrtConfig(
-            name="test",
-            model=ModelConfig(path="/model", container="/container.sqsh", precision="fp8"),
-            resources=ResourceConfig(gpu_type="mi355x", gpus_per_node=8, agg_nodes=2),
-            host_setup_script="/shared/runtime/prepare host.sh",
-        )
-
-        script = generate_minimal_sbatch_script(config, Path("/tmp/test.yaml"))
-
-        assert "HOST_SETUP_SCRIPT='/shared/runtime/prepare host.sh'" in script
-        assert '--nodes="${SLURM_JOB_NUM_NODES}"' in script
-        assert '--ntasks="${SLURM_JOB_NUM_NODES}"' in script
-        assert "--ntasks-per-node=1 --cpus-per-task=1 --cpu-bind=none" in script
-        assert 'bash "${HOST_SETUP_SCRIPT}"' in script
-        assert script.index("Running host setup script") < script.index("Preparing srtctl environment")
-
-    def test_sbatch_template_omits_host_setup_when_unconfigured(self):
-        """Existing recipes do not gain a host mutation unless they opt in."""
-        from pathlib import Path
-
-        from srtctl.cli.submit import generate_minimal_sbatch_script
-        from srtctl.core.schema import ModelConfig, ResourceConfig, SrtConfig
-
-        config = SrtConfig(
-            name="test",
-            model=ModelConfig(path="/model", container="/container.sqsh", precision="fp8"),
-            resources=ResourceConfig(gpu_type="h100", gpus_per_node=8, agg_nodes=1),
-        )
-
-        script = generate_minimal_sbatch_script(config, Path("/tmp/test.yaml"))
-
-        assert "HOST_SETUP_SCRIPT" not in script
-        assert "Running host setup script" not in script
-
     def test_sbatch_template_accepts_node_local_runtime_source(self, monkeypatch):
         """A login-node submission can target a separately staged compute checkout."""
         from pathlib import Path

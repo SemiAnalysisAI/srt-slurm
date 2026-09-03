@@ -7,6 +7,8 @@ import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
+
 from srtctl.backends import AtomProtocol, AtomServerConfig
 from srtctl.core.schema import SrtConfig
 from srtctl.core.topology import Process
@@ -44,6 +46,28 @@ def test_atom_atomesh_schema_roundtrip() -> None:
     assert isinstance(config.backend, AtomProtocol)
     assert isinstance(get_frontend("atomesh"), AtomeshFrontend)
     assert SrtConfig.Schema().load(SrtConfig.Schema().dump(config)) == config
+
+
+@pytest.mark.parametrize(
+    ("model_path", "stage_dir", "expected"),
+    [
+        ("hf:deepseek-ai/DeepSeek-V4-Pro", None, "deepseek-ai/DeepSeek-V4-Pro"),
+        ("/shared/DeepSeek-V4-Pro", None, "/model"),
+        ("/shared/DeepSeek-V4-Pro", "/scratch/models", "/scratch/models/DeepSeek-V4-Pro"),
+    ],
+)
+def test_atom_served_name_matches_worker_model_argument(model_path: str, stage_dir: str | None, expected: str) -> None:
+    """ATOM advertises its literal --model, not the path basename used by other engines."""
+    data = _config()
+    data["model"].update(path=model_path, stage_dir=stage_dir)
+    config = SrtConfig.Schema().load(data)
+    process = Process("node0", frozenset(range(8)), 7500, 6100, "prefill", 0, nixl_port=5400)
+    runtime = SimpleNamespace(worker_model_arg=expected, network_interface=None)
+
+    with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.20"):
+        command = config.backend.build_worker_command(process, [process], runtime)
+
+    assert config.served_model_name == command[command.index("--model") + 1] == expected
 
 
 def test_atom_builds_native_aggregate_command() -> None:

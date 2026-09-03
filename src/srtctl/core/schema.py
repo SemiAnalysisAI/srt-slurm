@@ -2278,6 +2278,17 @@ class SrtConfig:
     def served_model_name(self) -> str:
         """Get the served model name from backend config or model path."""
         default = Path(self.model.path).name
+        if isinstance(self.backend, AtomProtocol):
+            # ATOM advertises the literal --model argument; unlike SGLang/vLLM,
+            # it has no separate served-model-name alias. Match the worker's
+            # HF ID or container-visible path, including node-local staging.
+            model_path = os.path.expandvars(self.model.path)
+            if model_path.startswith("hf:"):
+                default = model_path[3:]
+            elif self.model.stage_dir:
+                default = str(Path(os.path.expandvars(self.model.stage_dir)) / Path(model_path).resolve().name)
+            else:
+                default = "/model"
         return self.backend.get_served_model_name(default)
 
     @property

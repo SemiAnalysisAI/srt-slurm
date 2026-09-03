@@ -609,10 +609,7 @@ class SweepOrchestrator(
         # it is still a benchmark process. Preserve the recipe's benchmark
         # environment so integrations can pass runner-specific settings such
         # as an additional artifact sink through this substituted path.
-        env_to_set = {
-            key: self.runtime.format_string(value)
-            for key, value in self.config.benchmark.env.items()
-        }
+        env_to_set = {key: self.runtime.format_string(value) for key, value in self.config.benchmark.env.items()}
         for var in [
             "RUN_EVAL",
             "EVAL_ONLY",

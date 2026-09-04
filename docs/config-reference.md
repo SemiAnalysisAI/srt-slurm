@@ -35,6 +35,17 @@ Complete reference for job configuration YAML files.
 
 ## Overview
 
+### ATOM with AToMesh
+
+Use `backend.type: atom` with `frontend.type: atomesh` to launch native
+`atom.entrypoints.openai_server` workers and the official AToMesh router. Both
+aggregate workers and prefill/decode topologies use static HTTP endpoints;
+disaggregated workers receive topology-owned Mooncake handshake ports.
+
+Engine flags belong under `backend.atom_config.prefill`, `decode`, or
+`aggregated`. srt-slurm owns the model path, HTTP port, tensor parallel size,
+and KV-transfer contract, so recipes cannot override those arguments.
+
 ```yaml
 name: "my-benchmark"           # Required: job name
 
@@ -322,10 +333,12 @@ See [SGLang Router](sglang-router.md) for detailed architecture.
 layouts use `--worker-urls`; disaggregated layouts use
 `--vllm-pd-disaggregation` with the allocated prefill and decode URLs. For
 data-parallel endpoints, srtctl derives Router's
-`--intra-node-data-parallel-size`. Router expands each node-local backend URL
-into DP-aware targets and injects `X-Data-Parallel-Rank`; vLLM continues to own
-the engine processes behind that HTTP server. Multi-node DP endpoints use one
-hybrid-LB `vllm serve` process per node and require
+`--intra-node-data-parallel-size` when one base URL owns the complete logical
+endpoint. Router then expands that URL into DP-aware targets and injects
+`X-Data-Parallel-Rank`; vLLM continues to own the engine processes behind that
+HTTP server. Multi-node DP endpoints instead expose one unexpanded hybrid-LB
+`vllm serve` pool per node, preserving each pool's nonzero global DP-rank
+offset, and require
 `backend.dp_launch_mode: per_node`. Direct `frontend.type: vllm` retains its
 existing single-server behavior. No NATS or etcd infrastructure is started for
 this frontend.

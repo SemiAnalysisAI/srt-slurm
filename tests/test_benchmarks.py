@@ -3,6 +3,8 @@
 
 """Tests for benchmark runners."""
 
+from pathlib import Path
+
 import pytest
 
 from srtctl.benchmarks import get_runner, list_benchmarks
@@ -926,6 +928,30 @@ class TestLMEvalRunner:
             "/infmax-workspace",
         ]
 
+    def test_script_uses_writable_job_local_python(self):
+        """Eval installs never mutate a serving image's system environment."""
+        from pathlib import Path
+
+        from srtctl.benchmarks.lm_eval import LMEvalRunner
+
+        script = Path(LMEvalRunner().local_script_dir) / "bench.sh"
+        content = script.read_text()
+        assert "python3 -m venv --system-site-packages" in content
+        assert 'export PATH="${LM_EVAL_VENV}/bin:${PATH}"' in content
+        assert "sys.prefix" in content
+        assert "pip install --help" in content
+        assert "python3 -m pip install --upgrade 'pip>=23.0'" in content
+        assert "/opt/venv/bin/python3" in content
+        assert "srtctl-framework.pth" in content
+        assert "job-local lm-eval runtime cannot import serving-image torch" in content
+        assert 'export XDG_CACHE_HOME="${LM_EVAL_CACHE_DIR}/xdg"' in content
+        assert 'export HF_HOME="${LM_EVAL_CACHE_DIR}/huggingface"' in content
+        assert 'export HF_DATASETS_CACHE="${HF_HOME}/datasets"' in content
+        assert 'mkdir -p "${XDG_CACHE_HOME}" "${HF_HUB_CACHE}" "${HF_DATASETS_CACHE}"' in content
+        assert 'LM_EVAL_RESULT_DIR="${SRTCTL_LM_EVAL_RESULT_DIR:-}"' in content
+        assert 'if [[ -n "${LM_EVAL_RESULT_DIR}" ]]' in content
+        assert 'cp -v meta_env.json "${LM_EVAL_RESULT_DIR}/"' in content
+
 
 class TestGSM8KRunner:
     """Test the unified GSM8K runner (backend auto-detect)."""
@@ -1436,6 +1462,34 @@ class TestRunPostEval:
         assert env_to_set["MODEL"] == "test-model"
         assert env_to_set["MODEL_NAME"] == "test-model"
 
+    def test_benchmark_env_passthrough(self):
+        """Eval-only substitution preserves the configured benchmark env."""
+        import os
+        import threading
+        from unittest.mock import MagicMock, patch
+
+        orch = self._make_orchestrator()
+        orch.config.benchmark.env["SRTCTL_LM_EVAL_RESULT_DIR"] = "/results/{job_id}/eval"
+        stop = threading.Event()
+
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 0
+        mock_proc.returncode = 0
+        captured_kwargs = {}
+
+        def capture_srun(**kwargs):
+            captured_kwargs.update(kwargs)
+            return mock_proc
+
+        with (
+            patch.dict(os.environ, {"EVAL_ONLY": "false"}, clear=False),
+            patch("srtctl.cli.do_sweep.wait_for_port", return_value=True),
+            patch("srtctl.cli.do_sweep.start_srun_process", side_effect=capture_srun),
+        ):
+            orch._run_post_eval(stop)
+
+        assert captured_kwargs["env_to_set"]["SRTCTL_LM_EVAL_RESULT_DIR"] == "/results/12345/eval"
+
     def test_eval_conc_from_env(self):
         """EVAL_CONC from env takes priority over benchmark concurrencies."""
         import os
@@ -1520,6 +1574,43 @@ class TestSweepRunEvalIntegration:
     @staticmethod
     def _make_orchestrator():
         return TestRunPostEval._make_orchestrator()
+
+    @pytest.mark.parametrize("frontend_type, needs_infra", [("atomesh", False), ("sglang", False), ("dynamo", True)])
+    def test_only_dynamo_starts_head_infrastructure(
+        self, frontend_type: str, needs_infra: bool, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Native routers reach the benchmark without NATS; Dynamo still starts it."""
+        from dataclasses import replace
+        from unittest.mock import MagicMock, patch
+
+        from srtctl.backends import AtomProtocol
+        from srtctl.core.schema import FrontendConfig
+
+        orch = self._make_orchestrator()
+        orch.config = replace(
+            orch.config,
+            frontend=FrontendConfig(type=frontend_type),
+            backend=AtomProtocol() if frontend_type == "atomesh" else orch.config.backend,
+        )
+        orch.runtime = replace(orch.runtime, log_dir=tmp_path / "logs")
+        orch.runtime.log_dir.mkdir()
+        monkeypatch.setenv("EVAL_ONLY", "false")
+        monkeypatch.setenv("RUN_EVAL", "false")
+        with (
+            patch.object(orch, "start_head_infrastructure", return_value=MagicMock()) as head,
+            patch.object(orch, "start_all_workers", return_value={}),
+            patch.object(orch, "start_frontend", return_value=[]),
+            patch.object(orch, "run_benchmark", return_value=0) as benchmark,
+            patch.object(orch, "run_postprocess"),
+            patch("srtctl.cli.do_sweep.StatusReporter"),
+        ):
+            assert orch.run() == 0
+
+        benchmark.assert_called_once()
+        if needs_infra:
+            head.assert_called_once()
+        else:
+            head.assert_not_called()
 
     def test_run_eval_only_mode(self):
         """EVAL_ONLY=true skips benchmark and runs _run_post_eval."""

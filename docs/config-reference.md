@@ -113,6 +113,9 @@ The `srtslurm.yaml` file can contain the following fields:
 | `default_time_limit`            | string | Default job time limit                                |
 | `gpus_per_node`                 | int    | Default GPUs per node                                 |
 | `network_interface`             | string | Network interface for NCCL                            |
+| `accelerator_vendor`            | string | Accelerator runtime: `nvidia` (default) or `amd`      |
+| `gpu_sbatch_directive`          | string | GPU allocation directive: `gpus-per-node`, `gres`, or `none` |
+| `runtime_config_transport`      | string | Runtime config transport: `shared-filesystem` (default) or `embedded` |
 | `srtctl_root`                   | string | Root directory for srtctl                             |
 | `output_dir`                    | string | Custom output directory (overrides srtctl_root/outputs) |
 | `model_paths`                   | dict   | Model path aliases                                    |
@@ -122,6 +125,8 @@ The `srtslurm.yaml` file can contain the following fields:
 | `nginx_raise_ulimit`          | bool   | Optional default for `frontend.nginx_raise_ulimit`  |
 
 **output_dir**: When set, job logs are written to `output_dir/{job_id}/logs` instead of `srtctl_root/outputs/{job_id}/logs`. Useful for CI/CD and ephemeral environments.
+
+**runtime_config_transport**: Leave this as `shared-filesystem` when the submitter and compute nodes see the same output directory. Use `embedded` when the output path is node-local: srtctl safely embeds the exact resolved recipe and active `srtslurm.yaml` in the Slurm script, materializes both with owner-only permissions on the allocated head node, points compute-side cluster lookups at that embedded profile, and bootstraps the Slurm log from the existing output base into the normal per-job log directory. This preserves container aliases, mounts, accelerator settings, and network selection even when the login and compute nodes do not share the original cluster-profile path. Embedded payloads are data-safe but not a secrets store: users who can inspect Slurm batch scripts can decode them.
 
 **default_bash_preamble**: A shell snippet (e.g. `"ulimit -n 1048576 -s unlimited -u 1048576"`) prepended to every container srun launched by srtctl — workers, frontends, telemetry, benchmark, postprocess. Runs before per-call `bash_preamble` and the main command, so cluster-wide ulimits apply to everything downstream. Silently dropped for distroless containers (e.g. `prom/node-exporter`) that bypass the bash wrapper; a WARNING log is emitted in that case.
 
@@ -309,6 +314,34 @@ frontend:
 | `container_image`           | str  | null          | Static-router image; falls back to `model.container` |
 
 See [SGLang Router](sglang-router.md) for detailed architecture.
+
+### vllm-router frontend
+
+`type: vllm-router` pairs with `backend.type: vllm` and launches the official
+`vllm-router` process against direct private `vllm serve` endpoints. Aggregate
+layouts use `--worker-urls`; disaggregated layouts use
+`--vllm-pd-disaggregation` with the allocated prefill and decode URLs. For
+data-parallel endpoints, srtctl derives Router's
+`--intra-node-data-parallel-size`. Router expands each node-local backend URL
+into DP-aware targets and injects `X-Data-Parallel-Rank`; vLLM continues to own
+the engine processes behind that HTTP server. Multi-node DP endpoints use one
+hybrid-LB `vllm serve` process per node and require
+`backend.dp_launch_mode: per_node`. Direct `frontend.type: vllm` retains its
+existing single-server behavior. No NATS or etcd infrastructure is started for
+this frontend.
+
+For ROCm P/D deployments, `backend.connector: moriio` switches the same
+frontend to vLLM Router's ZMQ discovery mode. srtctl supplies
+`--kv-connector moriio`, owns the discovery port, and generates each direct
+`vllm serve` worker's role-aware `MoRIIOConnector` JSON from the realized Slurm
+node address and HTTP port. This mode requires one router on the head node, so
+set `frontend.enable_multiple_frontends: false`.
+
+Router's `/workers` response currently covers its static worker registry, not
+the MoRI ZMQ discovery registry. For dynamic MoRI discovery, srtctl therefore
+waits on a one-token `/v1/completions` probe instead. This validates that both
+roles have registered and that the complete Router-to-prefill-to-decode path is
+usable before the configured benchmark begins.
 
 ### trtllm_serve frontend
 
@@ -533,6 +566,22 @@ Each worker leader gets a globally unique port starting at 5550:
 | prefill_1 | 5551 |
 | decode_0  | 5552 |
 | decode_1  | 5553 |
+
+### vLLM device binding
+
+Recent vLLM builds accept `--device-ids`. For builds that do not, set
+`backend.set_visible_devices: true` and srtslurm will bind each worker with the
+accelerator vendor's native environment variable: `CUDA_VISIBLE_DEVICES` for
+NVIDIA and `ROCR_VISIBLE_DEVICES` for AMD.
+
+```yaml
+backend:
+  type: vllm
+  set_visible_devices: true
+```
+
+The legacy `set_cuda_visible_devices` field remains supported for existing
+recipes, but new cross-platform recipes should use `set_visible_devices`.
 
 ### vLLM DP launch mode
 

@@ -692,14 +692,19 @@ logical worker leader:
 | `SRT_DECODE_ENDPOINTS`          | comma-separated `IP:port`      | Decode worker endpoints |
 | `SRT_AGG_IPS`                   | comma-separated IPs            | Aggregated worker leader IPs |
 | `SRT_AGG_ENDPOINTS`             | comma-separated `IP:port`      | Aggregated worker endpoints |
-| `AIPERF_SERVER_METRICS_URLS`    | comma-separated HTTP URLs      | AIPerf-compatible `/metrics` URLs for all logical workers |
+| `AIPERF_SERVER_METRICS_URLS`    | comma-separated HTTP URLs      | Backend-aware AIPerf-compatible `/metrics` URLs |
 
 Only variables for modes present in the recipe are emitted. Entries follow logical topology order
-(prefill index, decode index, or aggregated index). Multi-node follower ranks are excluded because
-they do not own separate engines; co-located logical workers retain repeated IPs and distinct ports
+(prefill index, decode index, or aggregated index). Control endpoints exclude multi-node followers;
+co-located logical workers retain repeated IPs and distinct ports
 so list positions remain aligned. With a Dynamo frontend, endpoint and metrics URLs use each
 leader's `DYN_SYSTEM_PORT`; other frontends use the worker HTTP port. If KVBM metrics are configured,
 their URLs are appended to `AIPERF_SERVER_METRICS_URLS` after the logical worker URLs.
+
+In-process Dynamo-vLLM is the metrics exception: every process's positive `DYN_SYSTEM_PORT`
+is collected, including non-leader nodes, because each exposes its local DP ranks. For DEP8
+across two four-GPU nodes, both node endpoints are required. This does not expand the
+`SRT_*_ENDPOINTS` control lists or change request routing.
 
 Two caveats for `AIPERF_SERVER_METRICS_URLS`:
 

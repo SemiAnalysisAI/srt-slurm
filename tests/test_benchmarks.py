@@ -313,7 +313,24 @@ class TestCustomBenchmarkRunner:
         assert runner.get_container_image(config, runtime) == "nvcr.io/nvidia/python:3.11"
         assert runner.get_environment(config, runtime) == {"FOO": "bar"}
 
-    def test_disaggregated_worker_endpoints_use_logical_leaders(self):
+    @pytest.mark.parametrize(
+        ("backend_type", "metrics_urls"),
+        [
+            (
+                "sglang",
+                "http://ip-node-a:7500/metrics,http://ip-node-c:7502/metrics,http://ip-node-e:7504/metrics",
+            ),
+            (
+                "vllm",
+                (
+                    "http://ip-node-a:7500/metrics,http://ip-node-b:7501/metrics,"
+                    "http://ip-node-c:7502/metrics,http://ip-node-d:7503/metrics,"
+                    "http://ip-node-e:7504/metrics,http://ip-node-f:7505/metrics"
+                ),
+            ),
+        ],
+    )
+    def test_disaggregated_worker_endpoints_use_logical_leaders(self, backend_type, metrics_urls):
         from unittest.mock import patch
 
         from srtctl.benchmarks.custom import CustomBenchmarkRunner
@@ -327,22 +344,22 @@ class TestCustomBenchmarkRunner:
             Process("node-e", frozenset(range(4)), 7504, 6100, "decode", 0, node_rank=0),
             Process("node-f", frozenset(range(4)), 7505, 0, "decode", 0, node_rank=1),
         ]
-        stage = self._benchmark_stage("dynamo", processes)
+        stage = self._benchmark_stage("dynamo", processes, backend_type=backend_type)
 
         with patch(
             "srtctl.cli.mixins.benchmark_stage.get_hostname_ip",
             side_effect=lambda node, interface: f"ip-{node}",
         ):
             env = stage._get_benchmark_env(CustomBenchmarkRunner())
+            polled_urls = stage._client_polled_metric_urls()
 
         assert env["SRT_PREFILL_IPS"] == "ip-node-a,ip-node-c"
         assert env["SRT_PREFILL_ENDPOINTS"] == "ip-node-a:7500,ip-node-c:7502"
         assert env["SRT_DECODE_IPS"] == "ip-node-e"
         assert env["SRT_DECODE_ENDPOINTS"] == "ip-node-e:7504"
         assert "SRT_AGG_IPS" not in env
-        assert env["AIPERF_SERVER_METRICS_URLS"] == (
-            "http://ip-node-a:7500/metrics,http://ip-node-c:7502/metrics,http://ip-node-e:7504/metrics"
-        )
+        assert env["AIPERF_SERVER_METRICS_URLS"] == metrics_urls
+        assert polled_urls == frozenset(metrics_urls.split(","))
 
     def test_sidecar_worker_endpoints_use_native_sglang_http_ports(self):
         from unittest.mock import patch

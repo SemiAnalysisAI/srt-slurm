@@ -611,11 +611,16 @@ class BenchmarkStageMixin:
     ) -> dict[str, str]:
         """Build server metrics URLs for AIPerf benchmarks.
 
-        Built-in AIPerf runners retain their existing physical-process metrics
-        behavior, which is required by vLLM data-parallel layouts. Custom
-        benchmarks use logical worker leaders so distributed SGLang follower
-        ranks are not advertised as separate engines.
+        Dynamo-vLLM publishes node-local engine metrics, so custom benchmarks
+        need the same physical-process endpoints as built-in AIPerf runners.
+        Other custom backends retain logical-worker discovery.
         """
+        if (
+            self.config.frontend.type == "dynamo"
+            and self.config.backend_type == "vllm"
+            and not self.config.dynamo.sidecar
+        ):
+            logical_workers_only = False
         urls: list[str] = []
         if logical_workers_only:
             if logical_endpoints is None:
@@ -729,9 +734,8 @@ class BenchmarkStageMixin:
         if runner.name == "SA-Bench":
             env.update(self._get_sa_bench_slow_down_env())
 
-        # Built-in AIPerf runners retain physical-process metrics for vLLM DP.
-        # Custom commands commonly wrap AIPerf but do not inherit from its base
-        # class, so give them the logical-worker view needed by SGLang TP.
+        # Custom commands use backend-aware discovery, including node-local
+        # Dynamo-vLLM metrics without expanding their control endpoints.
         # An explicit AIPERF_SERVER_METRICS_URLS in the recipe environment wins:
         # the operator may be pointing the client at a curated endpoint list,
         # and injection used to clobber it here silently.

@@ -475,7 +475,8 @@ class VLLMProtocol:
         if process.kv_events_port is not None:
             env["DYN_VLLM_KV_EVENT_PORT"] = str(process.kv_events_port)
         connector = self.get_connector_for_mode(process.endpoint_mode)
-        if process.nixl_port is not None and not (isinstance(connector, str) and connector.lower() == "moriio"):
+        uses_moriio = isinstance(connector, str) and connector.lower() == "moriio"
+        if process.nixl_port is not None and not uses_moriio:
             env["VLLM_NIXL_SIDE_CHANNEL_PORT"] = str(process.nixl_port)
             env["VLLM_NIXL_SIDE_CHANNEL_HOST"] = get_hostname_ip(process.node)
         # Unique per-process VLLM_PORT base to avoid EADDRINUSE rendezvous races
@@ -483,8 +484,13 @@ class VLLMProtocol:
         # 4xGB200 nodes: each prefill endpoint is DEP2 (uses 2 of the 4 GPUs), so
         # two endpoints share one physical node and would otherwise scan
         # overlapping get_open_port() ranges.
-        proc_index = max(process.sys_port - DYN_SYSTEM_PORT_BASE, 0)
-        env["VLLM_PORT"] = str(VLLM_PORT_BASE + proc_index * VLLM_PORT_STRIDE)
+        # MoRI allocates listeners inside TP child processes, which inherit the
+        # same environment. A fixed scan base makes get_open_port() return the
+        # same unbound port to multiple ranks. Let upstream request ephemeral
+        # ports from the kernel instead; keep existing non-MoRI rendezvous bases.
+        if not uses_moriio:
+            proc_index = max(process.sys_port - DYN_SYSTEM_PORT_BASE, 0)
+            env["VLLM_PORT"] = str(VLLM_PORT_BASE + proc_index * VLLM_PORT_STRIDE)
         return env
 
     def get_mooncake_worker_env(self, infra_node_ip: str, local_hostname: str) -> dict[str, str]:

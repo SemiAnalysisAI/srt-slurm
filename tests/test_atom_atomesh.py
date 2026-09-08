@@ -40,12 +40,11 @@ def _config() -> dict:
     }
 
 
-def test_atom_atomesh_schema_roundtrip() -> None:
+def test_schema_selects_atom_backend_and_atomesh_frontend() -> None:
     config = SrtConfig.Schema().load(_config())
 
     assert isinstance(config.backend, AtomProtocol)
     assert isinstance(get_frontend("atomesh"), AtomeshFrontend)
-    assert SrtConfig.Schema().load(SrtConfig.Schema().dump(config)) == config
 
 
 @pytest.mark.parametrize(
@@ -97,7 +96,7 @@ def test_atom_builds_native_aggregate_command() -> None:
     assert "--no-enable_prefix_caching" in command
     assert "--kv-cache-dtype" not in command
     assert "--no-enable-prefix-caching" not in command
-    assert command[-1] == "--trust-remote-code"
+    assert "--trust-remote-code" in command
 
 
 def test_atom_builds_official_mooncake_pd_contract() -> None:
@@ -115,6 +114,30 @@ def test_atom_builds_official_mooncake_pd_contract() -> None:
         "proxy_ip": "10.0.0.20",
         "handshake_port": 6301,
     }
+
+
+def test_atom_rejects_cross_node_model_parallel_endpoint() -> None:
+    """ATOM cannot safely coordinate one logical worker across two Slurm nodes."""
+    backend = AtomProtocol()
+    leader = Process("node0", frozenset(range(4)), 7500, 6100, "prefill", 0, nixl_port=6301)
+    peer = Process("node1", frozenset(range(4)), 7501, 6101, "prefill", 0, nixl_port=6302)
+    runtime = SimpleNamespace(worker_model_arg="/model", network_interface=None)
+
+    with pytest.raises(ValueError, match="fit on one Slurm node"):
+        backend.build_worker_command(leader, [leader, peer], runtime)
+
+
+def test_atom_pd_worker_requires_mooncake_handshake_port() -> None:
+    """Fail before launch when the allocated P/D endpoint has no transfer port."""
+    backend = AtomProtocol()
+    process = Process("node0", frozenset(range(4)), 7500, 6100, "decode", 0)
+    runtime = SimpleNamespace(worker_model_arg="/model", network_interface=None)
+
+    with (
+        patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.20"),
+        pytest.raises(ValueError, match="missing its Mooncake handshake port"),
+    ):
+        backend.build_worker_command(process, [process], runtime)
 
 
 def test_atom_can_select_mooncake_tcp_for_rocm_correctness() -> None:

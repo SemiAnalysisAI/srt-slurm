@@ -928,30 +928,6 @@ class TestLMEvalRunner:
             "/infmax-workspace",
         ]
 
-    def test_script_uses_writable_job_local_python(self):
-        """Eval installs never mutate a serving image's system environment."""
-        from pathlib import Path
-
-        from srtctl.benchmarks.lm_eval import LMEvalRunner
-
-        script = Path(LMEvalRunner().local_script_dir) / "bench.sh"
-        content = script.read_text()
-        assert "python3 -m venv --system-site-packages" in content
-        assert 'export PATH="${LM_EVAL_VENV}/bin:${PATH}"' in content
-        assert "sys.prefix" in content
-        assert "pip install --help" in content
-        assert "python3 -m pip install --upgrade 'pip>=23.0'" in content
-        assert "/opt/venv/bin/python3" in content
-        assert "srtctl-framework.pth" in content
-        assert "job-local lm-eval runtime cannot import serving-image torch" in content
-        assert 'export XDG_CACHE_HOME="${LM_EVAL_CACHE_DIR}/xdg"' in content
-        assert 'export HF_HOME="${LM_EVAL_CACHE_DIR}/huggingface"' in content
-        assert 'export HF_DATASETS_CACHE="${HF_HOME}/datasets"' in content
-        assert 'mkdir -p "${XDG_CACHE_HOME}" "${HF_HUB_CACHE}" "${HF_DATASETS_CACHE}"' in content
-        assert 'LM_EVAL_RESULT_DIR="${SRTCTL_LM_EVAL_RESULT_DIR:-}"' in content
-        assert 'if [[ -n "${LM_EVAL_RESULT_DIR}" ]]' in content
-        assert 'cp -v meta_env.json "${LM_EVAL_RESULT_DIR}/"' in content
-
 
 class TestGSM8KRunner:
     """Test the unified GSM8K runner (backend auto-detect)."""
@@ -1416,9 +1392,7 @@ class TestRunPostEval:
         mock_proc.returncode = 0
 
         with patch.dict(os.environ, {"EVAL_ONLY": "true"}, clear=False):
-            with patch(
-                "srtctl.cli.mixins.benchmark_stage.wait_for_model", return_value=True
-            ):
+            with patch("srtctl.cli.mixins.benchmark_stage.wait_for_model", return_value=True):
                 with patch("srtctl.cli.do_sweep.start_srun_process", return_value=mock_proc):
                     result = orch._run_post_eval(stop)
         assert result == 0

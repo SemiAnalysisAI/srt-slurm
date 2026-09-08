@@ -3,9 +3,12 @@
 import base64
 import re
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from srtctl.backends import VLLMProtocol
+from srtctl.cli.mixins.worker_stage import WorkerStageMixin
 from srtctl.core.accelerator import visible_device_environment
 from srtctl.core.schema import ClusterConfig
 from srtctl.core.topology import Process
@@ -52,37 +55,38 @@ def test_cluster_config_rejects_unknown_gpu_directive() -> None:
         ClusterConfig.Schema().load({"gpu_sbatch_directive": "rocm"})
 
 
-def test_vllm_vendor_neutral_visible_device_setting() -> None:
-    from srtctl.backends import VLLMProtocol
-
+@pytest.mark.parametrize(
+    ("set_visible_devices", "legacy_setting", "expected"),
+    [
+        (True, False, {"ROCR_VISIBLE_DEVICES": "2,3"}),
+        (False, True, {}),
+        (None, True, {"ROCR_VISIBLE_DEVICES": "2,3"}),
+    ],
+)
+def test_amd_worker_device_mask_honors_new_setting_and_legacy_alias(
+    set_visible_devices: bool | None,
+    legacy_setting: bool,
+    expected: dict[str, str],
+) -> None:
+    """The backend setting must control the environment passed to an AMD worker."""
     process = Process(
         node="node0",
-        gpu_indices=frozenset({0}),
+        gpu_indices=frozenset({2, 3}),
         sys_port=7500,
         http_port=8000,
         endpoint_mode="agg",
         endpoint_index=0,
     )
-    assert VLLMProtocol(set_visible_devices=True).should_set_visible_devices(process)
-    assert not VLLMProtocol(set_visible_devices=False).should_set_visible_devices(process)
-
-
-def test_vllm_legacy_cuda_named_setting_remains_compatible() -> None:
-    from srtctl.backends import VLLMProtocol
-
-    process = Process(
-        node="node0",
-        gpu_indices=frozenset({0}),
-        sys_port=7500,
-        http_port=8000,
-        endpoint_mode="agg",
-        endpoint_index=0,
+    mixin = WorkerStageMixin()
+    mixin.config = SimpleNamespace(
+        backend=VLLMProtocol(
+            set_visible_devices=set_visible_devices,
+            set_cuda_visible_devices=legacy_setting,
+        )
     )
-    assert VLLMProtocol(set_cuda_visible_devices=True).should_set_visible_devices(process)
-    assert not VLLMProtocol(
-        set_visible_devices=False,
-        set_cuda_visible_devices=True,
-    ).should_set_visible_devices(process)
+    mixin.runtime = SimpleNamespace(accelerator_vendor="amd", gpus_per_node=8)
+
+    assert mixin._visible_device_environment(process) == expected
 
 
 @pytest.mark.parametrize(
@@ -191,7 +195,7 @@ def test_embedded_transport_preserves_resolved_yaml_as_inert_data(monkeypatch, t
     assert "/.srtctl-sweep-%j.log" in script
     assert 'mv "${BOOTSTRAP_LOG}" "${LOG_DIR}/sweep_${SLURM_JOB_ID}.log"' in script
     assert '--ntasks-per-node=1 mkdir -p "${LOG_DIR}"' in script
-    assert '#SBATCH --chdir=' in script
+    assert "#SBATCH --chdir=" in script
     assert 'export SRTSLURM_CONFIG="${OUTPUT_DIR}/srtslurm.yaml"' in script
     assert "touch /tmp/must-not-run" not in script
 

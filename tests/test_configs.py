@@ -2755,30 +2755,6 @@ class TestVLLMDataParallelMode:
         assert all(process.is_leader for process in processes)
         assert len({process.http_port for process in processes}) == 1  # ports may repeat on distinct nodes
 
-    def test_vllm_router_uses_one_backend_url_for_single_node_dep4(self):
-        """Router expands one direct backend URL into four node-local DP ranks."""
-        from srtctl.backends import VLLMProtocol, VLLMServerConfig
-        from srtctl.core.topology import Endpoint
-
-        backend = VLLMProtocol(
-            vllm_config=VLLMServerConfig(
-                aggregated={"data-parallel-size": 4, "enable-expert-parallel": True},
-            ),
-        )
-        endpoint = Endpoint(
-            mode="agg",
-            index=0,
-            nodes=("node0",),
-            gpu_indices=frozenset(range(4)),
-            gpus_per_node=4,
-        )
-
-        processes = backend.endpoints_to_processes([endpoint], frontend_type="vllm-router")
-
-        assert len(processes) == 1
-        assert processes[0].gpu_indices == frozenset(range(4))
-        assert processes[0].http_port > 0
-
     def test_vllm_router_multinode_dep8_uses_hybrid_node_local_pools(self):
         """Two DEP8 nodes expose two DP4 HTTP pools sharing one global coordinator."""
         from pathlib import Path

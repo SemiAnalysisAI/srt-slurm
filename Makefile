@@ -1,4 +1,4 @@
-.PHONY: lint test test-cov ci check setup cleanup gb200-fp8 gb200-fp4 tachometer-scraper tachometer-scraper-download
+.PHONY: lint test test-cov ci check setup setup-compute cleanup gb200-fp8 gb200-fp4 tachometer-scraper tachometer-scraper-download
 
 NATS_VERSION ?= v2.10.28
 ETCD_VERSION ?= v3.5.21
@@ -70,6 +70,23 @@ gb200-fp4:
 	srtctl apply -f recipes/gb200-fp4/8k1k/max-tpt.yaml
 	srtctl apply -f recipes/gb200-fp4/8k1k/mid-curve.yaml
 
+setup-compute:
+	@case "$(ARCH)" in \
+		x86_64)  ARCH_FILE_PATTERN="x86-64" ;; \
+		aarch64) ARCH_FILE_PATTERN="aarch64" ;; \
+		*) echo "❌ Unsupported architecture: $(ARCH)"; exit 1 ;; \
+	esac; \
+	echo "--- uv (compute node arch: $(ARCH)) ---"; \
+	if [ -f bin/uv ] && file bin/uv | grep -q "$$ARCH_FILE_PATTERN"; then \
+		echo "✅ uv already installed at bin/uv ($(ARCH))"; \
+	else \
+		echo "⬇️  Downloading uv for $(ARCH)..."; \
+		mkdir -p bin; \
+		UV_URL="https://github.com/astral-sh/uv/releases/latest/download/uv-$(ARCH)-unknown-linux-gnu.tar.gz"; \
+		curl -LsSf "$$UV_URL" | tar -xz --strip-components=1 -C bin; \
+		chmod +x bin/uv bin/uvx 2>/dev/null; \
+		echo "✅ uv installed to bin/uv ($$(file bin/uv | grep -o 'ARM aarch64\|x86-64'))"; \
+	fi
 setup: tachometer-scraper-download
 	@echo "📦 Setting up configs and logs directories..."
 	@mkdir -p logs
@@ -128,17 +145,7 @@ setup: tachometer-scraper-download
 		echo "✅ ETCD installed to configs/etcd"; \
 	fi; \
 	echo ""; \
-	echo "--- uv (compute node arch: $(ARCH)) ---"; \
-	if [ -f bin/uv ] && file bin/uv | grep -q "$$ARCH_FILE_PATTERN"; then \
-		echo "✅ uv already installed at bin/uv ($(ARCH))"; \
-	else \
-		echo "⬇️  Downloading uv for $(ARCH)..."; \
-		mkdir -p bin; \
-		UV_URL="https://github.com/astral-sh/uv/releases/latest/download/uv-$(ARCH)-unknown-linux-gnu.tar.gz"; \
-		curl -LsSf "$$UV_URL" | tar -xz --strip-components=1 -C bin; \
-		chmod +x bin/uv bin/uvx 2>/dev/null; \
-		echo "✅ uv installed to bin/uv ($$(file bin/uv | grep -o 'ARM aarch64\|x86-64'))"; \
-	fi; \
+	$(MAKE) --no-print-directory setup-compute ARCH=$(ARCH); \
 	echo ""; \
 	echo "--- srtslurm.yaml ---"; \
 	if [ -f srtslurm.yaml ]; then \

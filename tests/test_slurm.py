@@ -35,6 +35,8 @@ def test_wait_streams_late_logs_and_requires_allocation_accounting(monkeypatch, 
     )
 
     def query(command, **kwargs):
+        if command[0] == "scontrol":
+            return subprocess.CompletedProcess(command, 1, "", "job purged")
         expected_command, code, stdout = next(replies)
         assert command[0] == expected_command
         assert command[command.index("--jobs") + 1] == "42"
@@ -79,6 +81,8 @@ def test_wait_retries_observation_timeout_without_resubmission(monkeypatch) -> N
     replies = iter([subprocess.TimeoutExpired("squeue", 15), "", "42|COMPLETED|0:0\n"])
 
     def query(command, **kwargs):
+        if command[0] == "scontrol":
+            return subprocess.CompletedProcess(command, 1, "", "job purged")
         assert command[0] in {"squeue", "sacct"}
         reply = next(replies)
         if isinstance(reply, Exception):
@@ -88,6 +92,35 @@ def test_wait_retries_observation_timeout_without_resubmission(monkeypatch) -> N
     monkeypatch.setattr("srtctl.core.slurm.subprocess.run", query)
     monkeypatch.setattr("srtctl.core.slurm.time.sleep", lambda _seconds: None)
     assert wait_for_job("42").returncode == 0
+
+
+@pytest.mark.parametrize(
+    ("record", "expected", "uses_accounting"),
+    [
+        ("JobId=42 JobState=COMPLETED ExitCode=0:0", 0, False),
+        ("JobId=42 JobState=FAILED ExitCode=7:0", 7, False),
+        ("JobId=42 JobState=CANCELLED ExitCode=0:15", 143, False),
+        ("JobId=42 JobState=FAILED ExitCode=0:0", 1, False),
+        ("JobId=142 JobState=COMPLETED ExitCode=0:0", 9, True),
+        ("JobId=42.batch JobState=COMPLETED ExitCode=0:0", 9, True),
+        ("JobId=42 JobState=COMPLETED ExitCode=unknown", 9, True),
+        ("JobId=42 JobState=RUNNING ExitCode=0:0", 9, True),
+        ("JobId=42 JobState=COMPLETING ExitCode=0:0", 9, True),
+        ("JobId=42 JobState=COMPLETED", 9, True),
+        ("", 9, True),
+    ],
+)
+def test_wait_uses_exact_terminal_controller_record(monkeypatch, record, expected, uses_accounting):
+    commands = []
+
+    def query(command, **kwargs):
+        commands.append(command[0])
+        replies = {"squeue": "", "scontrol": record, "sacct": "42|FAILED|9:0\n"}
+        return subprocess.CompletedProcess(command, 0, replies[command[0]], "")
+
+    monkeypatch.setattr("srtctl.core.slurm.subprocess.run", query)
+    assert wait_for_job("42").returncode == expected
+    assert ("sacct" in commands) is uses_accounting
 
 
 def _built_bash_command(mock_popen: MagicMock) -> str:

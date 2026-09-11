@@ -430,11 +430,18 @@ def show_config_details(config: SrtConfig) -> None:
         console.print(Panel(details, border_style="blue"))
 
 
-def validate_setup(srtctl_source: Path, *, requires_head_infrastructure: bool = True) -> None:
+def validate_setup(
+    srtctl_source: Path,
+    *,
+    requires_head_infrastructure: bool = True,
+    requires_tachometer: bool = False,
+) -> None:
     """Validate that make setup has been run and required binaries exist.
 
-    Checks for NATS, etcd, Tachometer, and compute-arch uv binaries. Raises SystemExit
-    with a clear error message if anything is missing.
+    Checks for the binaries required by the resolved recipe. NATS and etcd are
+    needed only by frontends that launch head-node infrastructure, while the
+    Tachometer scraper is needed only when native Tachometer collection is
+    enabled. Compute-architecture uv is always required.
     """
     missing = []
 
@@ -446,7 +453,7 @@ def validate_setup(srtctl_source: Path, *, requires_head_infrastructure: bool = 
             missing.append("configs/etcd")
     if not (srtctl_source / "bin" / "uv").exists():
         missing.append("bin/uv (compute-arch uv)")
-    if not (srtctl_source / "bin" / "tachometer-scraper").exists():
+    if requires_tachometer and not (srtctl_source / "bin" / "tachometer-scraper").exists():
         missing.append("bin/tachometer-scraper (compute-arch Tachometer scraper)")
 
     if missing:
@@ -459,6 +466,17 @@ def validate_setup(srtctl_source: Path, *, requires_head_infrastructure: bool = 
         console.print(f"  make {target} ARCH=aarch64  [dim]# for ARM compute nodes[/]")
         console.print(f"  make {target} ARCH=x86_64   [dim]# for x86_64 compute nodes[/]\n")
         raise SystemExit(1)
+
+
+def _requires_head_infrastructure(frontend_type: str) -> bool:
+    """Return whether a frontend needs the managed NATS/etcd head services."""
+    return frontend_type not in {
+        "atomesh",
+        "sglang",
+        "trtllm_serve",
+        "vllm",
+        "vllm-router",
+    }
 
 
 def generate_minimal_sbatch_script(
@@ -777,13 +795,12 @@ def submit_with_orchestrator(
     # Validate setup before submitting (not during dry-run)
     srtctl_root = get_srtslurm_setting("srtctl_root")
     srtctl_source = Path(srtctl_root) if srtctl_root else Path(__file__).parent.parent.parent.parent
-    requires_head_infrastructure = config.frontend.type not in {
-        "sglang",
-        "trtllm_serve",
-        "vllm",
-        "vllm-router",
-    }
-    validate_setup(srtctl_source, requires_head_infrastructure=requires_head_infrastructure)
+    requires_head_infrastructure = _requires_head_infrastructure(config.frontend.type)
+    validate_setup(
+        srtctl_source,
+        requires_head_infrastructure=requires_head_infrastructure,
+        requires_tachometer=config.observability.tachometer.enabled,
+    )
 
     # Write script to temp file
     fd, script_path = tempfile.mkstemp(suffix=".slurm", prefix="srtctl_", text=True)

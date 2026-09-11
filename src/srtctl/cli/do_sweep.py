@@ -605,7 +605,11 @@ class SweepOrchestrator(
 
         # Pass through eval-related env vars. InferenceX writes multi-node
         # metadata from these variables in append_lm_eval_summary().
-        env_to_set = {}
+        # Post-eval replaces the configured benchmark runner with lm-eval, but
+        # it is still a benchmark process. Preserve the recipe's benchmark
+        # environment so integrations can pass runner-specific settings such
+        # as an additional artifact sink through this substituted path.
+        env_to_set = {key: self.runtime.format_string(value) for key, value in self.config.benchmark.env.items()}
         for var in [
             "RUN_EVAL",
             "EVAL_ONLY",
@@ -713,12 +717,12 @@ class SweepOrchestrator(
         try:
             # Stage 1: Head infrastructure (NATS, etcd). Only the dynamo request
             # plane uses it; static/direct frontends skip it.
-            if self.config.frontend.type in {"sglang", "trtllm_serve", "vllm", "vllm-router"}:
-                logger.info("Skipping NATS/etcd infrastructure (frontend.type=%s)", self.config.frontend.type)
-            else:
+            if self.config.frontend.type == "dynamo":
                 reporter.report(JobStatus.STARTING, JobStage.HEAD_INFRASTRUCTURE, "Starting head infrastructure")
                 head_proc = self.start_head_infrastructure(registry)
                 registry.add_process(head_proc)
+            else:
+                logger.info("Skipping NATS/etcd infrastructure (frontend.type=%s)", self.config.frontend.type)
 
             # Stage 1b: Mooncake master (optional, co-located with infra node).
             mooncake_proc = self.start_mooncake_master(registry)

@@ -597,8 +597,10 @@ class TestSGLangProtocol:
         assert config.is_grpc_mode("decode") is True
         assert config.is_grpc_mode("agg") is False
 
-    def test_worker_command_assigns_deterministic_nccl_port(self):
-        """Each SGLang server gets a unique rendezvous port from its sys port."""
+    @pytest.mark.parametrize("node_count", [1, 2])
+    def test_worker_command_assigns_network_endpoints(self, node_count):
+        """Use a unique NCCL port and the configured interface for distributed init."""
+        from dataclasses import replace
         from unittest.mock import MagicMock, patch
 
         from srtctl.core.topology import Process
@@ -615,11 +617,19 @@ class TestSGLangProtocol:
         runtime = MagicMock()
         runtime.model_path = Path("/model")
         runtime.is_hf_model = False
+        runtime.network_interface = "management0"
+        processes = [replace(process, node=f"node{rank}", node_rank=rank) for rank in range(node_count)]
 
-        with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):
-            command = SGLangProtocol().build_worker_command(process, [process], runtime)
+        with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1") as resolve_ip:
+            command = SGLangProtocol().build_worker_command(processes[-1], processes, runtime)
 
+        resolve_ip.assert_called_once_with("node0", "management0")
         assert command[command.index("--nccl-port") + 1] == str(SGLANG_NCCL_PORT_BASE + 5)
+        if node_count == 2:
+            assert command[command.index("--dist-init-addr") + 1] == "10.0.0.1:8300"
+            assert command[command.index("--node-rank") + 1] == "1"
+        else:
+            assert "--dist-init-addr" not in command
 
 
 class TestServedModelName:

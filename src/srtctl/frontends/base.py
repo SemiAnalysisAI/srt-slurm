@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from srtctl.core.topology import Process
 
 # Supported frontend types - extensible by adding new literals
-FrontendType = Literal["dynamo", "sglang", "sglang-router", "trtllm_serve", "vllm", "vllm-router"]
+FrontendType = Literal["atomesh", "dynamo", "sglang", "sglang-router", "trtllm_serve", "vllm", "vllm-router"]
 
 
 class FrontendProtocol(Protocol):
@@ -103,6 +103,7 @@ def get_frontend(frontend_type: str) -> FrontendProtocol:
         ValueError: If frontend type is unknown
     """
     # Import here to avoid circular imports
+    from srtctl.frontends.atomesh import AtomeshFrontend
     from srtctl.frontends.dynamo import DynamoFrontend
     from srtctl.frontends.sglang import SGLangRouterFrontend
     from srtctl.frontends.sglang_direct import SGLangFrontend
@@ -110,7 +111,9 @@ def get_frontend(frontend_type: str) -> FrontendProtocol:
     from srtctl.frontends.vllm import VLLMFrontend
     from srtctl.frontends.vllm_router import VLLMRouterFrontend
 
-    if frontend_type == "dynamo":
+    if frontend_type == "atomesh":
+        return AtomeshFrontend()
+    elif frontend_type == "dynamo":
         return DynamoFrontend()
     elif frontend_type == "sglang":
         return SGLangFrontend()
@@ -124,5 +127,6 @@ def get_frontend(frontend_type: str) -> FrontendProtocol:
         return VLLMRouterFrontend()
     else:
         raise ValueError(
-            f"Unknown frontend type: {frontend_type!r}. Supported: dynamo, sglang, sglang-router, trtllm_serve, vllm, vllm-router"
+            f"Unknown frontend type: {frontend_type!r}. "
+            "Supported: atomesh, dynamo, sglang, sglang-router, trtllm_serve, vllm, vllm-router"
         )

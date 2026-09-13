@@ -1,6 +1,6 @@
 # srtctl
 
-Command-line tool for distributed LLM inference benchmarks on SLURM clusters and direct GPU hosts using TensorRT LLM, SGLang and vLLM. Replace complex shell scripts and 50+ CLI flags with declarative YAML configuration.
+Command-line tool for distributed LLM inference benchmarks on SLURM clusters using TensorRT LLM, SGLang and vLLM. Replace complex shell scripts and 50+ CLI flags with a declarative `schema: 2` YAML recipe: `engine:` names the engine, `roles:` describes each worker role, and `services:` covers everything launched next to the workers.
 
 ## Quick Start
 
@@ -19,12 +19,14 @@ make setup ARCH=aarch64  # or ARCH=x86_64
 **Full documentation:** https://srtctl.gitbook.io/srtctl-docs/
 
 - [Installation](docs/installation.md) - Setup and configuration
+- [Examples](examples/README.md) - Runnable 2.0 recipes, one per frontend and topology
+- [Configuration Reference](docs/config-reference.md) - Every recipe section
+- [Legacy (v1) layout](docs/legacy-v1.md) - The old `backend:` recipe layout; `srtctl migrate` rewrites it
 - [Monitoring](docs/monitoring.md) - Job logs and debugging
 - [Parameter Sweeps](docs/sweeps.md) - Grid searches
 - [Profiling](docs/profiling.md) - Torch/nsys profiling
-- [Analyzing Results](docs/analyzing.md) - Dashboard and visualization
+- [Component Performance Dashboard](docs/component-dashboard.md) - the per-run HTML dashboard built from the tachometer parquet
 - [ruter](docs/ruter.md) - Dynamo router post-processing
-- [Direct Host Lifecycle](docs/direct-host.md) - Run the same recipe directly through Docker
 
 ## Commands
 
@@ -44,11 +46,6 @@ srtctl apply -f config.yaml --tags experiment,baseline
 # Dry-run (validate without submitting)
 srtctl dry-run -f config.yaml
 
-# Render and run one single-node recipe through Docker
-srtctl apply -f config.yaml -o /absolute/path/to/runs --bash > job.sh
-chmod +x job.sh
-./job.sh
-
-# Launch analysis dashboard
-uv run streamlit run analysis/dashboard/app.py
+# Rewrite a v1 recipe into the 2.0 layout
+srtctl migrate -f config.yaml
 ```

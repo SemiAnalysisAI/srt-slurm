@@ -5,14 +5,20 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, TypeGuard
+from typing import Any, TypeGuard, cast
 
 SCHEMA_VERSION = 1
+# The samples CSV is versioned independently: SCHEMA_VERSION is shared with
+# manifest.json and with measurement-window files whose writer keeps its own copy.
+SAMPLES_SCHEMA_VERSION_V1 = 1
+SAMPLES_SCHEMA_VERSION = 2
 
 PRODUCER = "srt-slurm.dcgm-power"
 POWER_METRIC = "DCGM_FI_DEV_POWER_USAGE"
@@ -20,11 +26,34 @@ POWER_UNIT = "W"
 POWER_SCOPE = "gpu_device_board_as_reported_by_dcgm"
 CLOCK_SOURCE = "head_node_unix_clock"
 
+GPU_UTIL_METRIC = "DCGM_FI_DEV_GPU_UTIL"
+SM_ACTIVE_METRIC = "DCGM_FI_PROF_SM_ACTIVE"
+
+
+@dataclass(frozen=True)
+class UtilizationMetric:
+    """An optional per-GPU utilization column and the DCGM field that feeds it."""
+
+    column: str
+    metric: str
+    unit: str
+    max_value: float
+
+
+# Load-bearing in two ways: each ``column`` must equal a field name on both
+# ``parser.PowerReading`` and ``samples.SampleRow`` (they are splatted in as
+# keyword arguments), and tuple order defines the trailing SAMPLES_HEADER columns.
+# ``test_utilization_metrics_are_pinned`` fails if either coupling is broken.
+UTILIZATION_METRICS: tuple[UtilizationMetric, ...] = (
+    UtilizationMetric(column="gpu_util_pct", metric=GPU_UTIL_METRIC, unit="percent", max_value=100.0),
+    UtilizationMetric(column="sm_active", metric=SM_ACTIVE_METRIC, unit="fraction", max_value=1.0),
+)
+
 MANIFEST_FILENAME = "manifest.json"
 SAMPLES_FILENAME = "samples.csv"
 WINDOWS_DIRNAME = "windows"
 
-SAMPLES_HEADER = (
+SAMPLES_HEADER_V1 = (
     "schema_version",
     "timestamp_unix",
     "scrape_seq",
@@ -33,6 +62,31 @@ SAMPLES_HEADER = (
     "gpu_uuid",
     "power_w",
 )
+SAMPLES_HEADER = (*SAMPLES_HEADER_V1, *(metric.column for metric in UTILIZATION_METRICS))
+
+CPU_SCHEMA_VERSION = 1
+CPU_SAMPLES_FILENAME = "samples.csv"  # written under <power_dir>/cpu/
+CPU_MANIFEST_FILENAME = "cpu_manifest.json"  # written under <power_dir>/cpu/, non-authoritative
+
+CPU_SAMPLES_HEADER = (
+    "schema_version",
+    "timestamp_unix",
+    "hostname",
+    "source",
+    "sensor",
+    "socket_id",
+    "power_w",
+    "total_power_w",
+)
+# NOTE: in ACPI mode, total_power_w sums only "total"-kind channels (e.g.
+# "Grace Power Socket N" or a platform's generic "Total Power socket N"
+# rail). Real hardware traces show the total rail ~93-104W vs cpu_rail+soc
+# ~53-58W for the same socket -- total is a separate, larger measurement of
+# the whole Grace SoC power boundary, not literally cpu_rail + soc. This has
+# not been verified against NVIDIA hardware/DCGM documentation; if it turns
+# out to be wrong, only total_power_w in ACPI mode is affected, since
+# per-row power_w values and DCGM mode (one already-aggregate value per
+# socket) are unaffected.
 
 MAX_SAMPLE_GAP_SECONDS = 3.0
 COLLECT_CYCLE_TIMEOUT_GRACE_SECONDS = 1.0
@@ -58,6 +112,7 @@ class Reason:
     SAMPLES_CSV_MISSING = "samples_csv_missing"
     SAMPLES_CSV_HEADER_MISMATCH = "samples_csv_header_mismatch"
     SAMPLES_CSV_MALFORMED = "samples_csv_malformed"
+    SAMPLES_DIGEST_UNAVAILABLE = "samples_digest_unavailable"
     DUPLICATE_SAMPLE_ROW = "duplicate_sample_row"
     GPU_INDEX_MISSING = "gpu_index_missing"
     GPU_UUID_MISSING = "gpu_uuid_missing"
@@ -85,6 +140,11 @@ class Reason:
     MEASUREMENT_WINDOW_CLOCK_MISMATCH = "measurement_window_clock_mismatch"
     MEASUREMENT_WINDOW_NOT_BRACKETED = "measurement_window_not_bracketed"
     SAMPLE_GAP_EXCEEDED = "sample_gap_exceeded"
+
+
+ALL_REASON_CODES: frozenset[str] = frozenset(
+    cast(str, value) for name, value in vars(Reason).items() if name.isupper() and isinstance(value, str)
+)
 
 
 FATAL_LIFECYCLE_REASONS = (
@@ -124,6 +184,15 @@ def is_finite_number(value: Any) -> TypeGuard[int | float]:
 def dedupe(values: list[str]) -> tuple[str, ...]:
     """First-seen-order deduplication for reason-code accumulation."""
     return tuple(dict.fromkeys(values))
+
+
+def sha256_file(path: Path) -> str:
+    """Return the lowercase SHA-256 digest of the exact bytes at ``path``."""
+    hasher = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
 
 
 def atomic_write_json(path: Path, payload: Any) -> None:

@@ -76,7 +76,7 @@ def test_cluster_bash_preamble_applied_when_only_cluster_set() -> None:
         start_srun_process(["python3", "-m", "server"])
 
     bash_cmd = _built_bash_command(mock_popen)
-    assert bash_cmd.startswith("ulimit -n 1048576 && python3 -m server")
+    assert bash_cmd.startswith("ulimit -n 1048576 && exec python3 -m server")
 
 
 def test_cluster_bash_preamble_warns_when_bash_wrapper_disabled(caplog) -> None:
@@ -223,11 +223,14 @@ def test_worker_stage_wraps_nonfatal_fingerprint_hook(tmp_path: Path) -> None:
     assert "/configs/patches/${setup_script}" in bash_preamble
     assert bash_preamble.endswith("&& ( fingerprint || true )")
     assert mock_srun.call_args.kwargs["env_to_unset"] is None
+    # Named step, so cleanup can SIGTERM the engine through scancel instead of killing srun.
+    assert mock_srun.call_args.kwargs["step_name"] == "prefill_0_node-a"
 
 
 def _remap_worker_mixin(tmp_path: Path, *, frontend_type: str, dynamo_install: bool):
     """Build a WorkerStageMixin with a minimal config for remap-root injection tests."""
     backend = MagicMock()
+    backend.type = "sglang"
     backend.build_worker_command.return_value = ["python3", "-m", "worker"]
     backend.get_environment_for_mode.return_value = {}
     backend.get_process_environment.return_value = {}
@@ -294,6 +297,34 @@ def test_worker_stage_no_remap_root_for_sglang_frontend(tmp_path: Path) -> None:
     assert mock_srun.call_args.kwargs["srun_export_env"] is None
 
 
+def test_sglang_workers_skip_the_post_sigterm_crash_diagnostics_by_default(tmp_path: Path) -> None:
+    """SGLang waits 60s for CUDA coredumps after a SIGTERM drain; nothing is collected without opting in."""
+    mixin, process = _remap_worker_mixin(tmp_path, frontend_type="sglang", dynamo_install=False)
+    with (
+        patch("srtctl.cli.mixins.worker_stage.generate_capture_script", return_value="fingerprint || true"),
+        patch("srtctl.cli.mixins.worker_stage.start_srun_process") as mock_srun,
+    ):
+        mock_srun.return_value = MagicMock()
+        mixin.start_worker(process, [process])
+    env = mock_srun.call_args.kwargs["env_to_set"]
+    assert env["SGLANG_CUDA_COREDUMP_BEFORE_CRASH"] == "0"
+    assert env["SGLANG_PYSPY_DUMP_BEFORE_CRASH"] == "0"
+
+
+def test_sglang_workers_keep_the_coredump_wait_when_the_recipe_opts_in(tmp_path: Path) -> None:
+    mixin, process = _remap_worker_mixin(tmp_path, frontend_type="sglang", dynamo_install=False)
+    mixin.runtime.environment = {"SGLANG_CUDA_COREDUMP": "1"}
+    with (
+        patch("srtctl.cli.mixins.worker_stage.generate_capture_script", return_value="fingerprint || true"),
+        patch("srtctl.cli.mixins.worker_stage.start_srun_process") as mock_srun,
+    ):
+        mock_srun.return_value = MagicMock()
+        mixin.start_worker(process, [process])
+    env = mock_srun.call_args.kwargs["env_to_set"]
+    assert "SGLANG_CUDA_COREDUMP_BEFORE_CRASH" not in env
+    assert env["SGLANG_CUDA_COREDUMP"] == "1"
+
+
 def test_worker_stage_no_remap_root_when_dynamo_install_false(tmp_path: Path) -> None:
     # Dynamo frontend but container already has dynamo (install=False) → no install, no remap.
     mixin, process = _remap_worker_mixin(tmp_path, frontend_type="dynamo", dynamo_install=False)
@@ -348,6 +379,80 @@ def test_start_worker_event_plane_injected(tmp_path: Path, event_plane: str) -> 
 def test_start_endpoint_worker_event_plane_default_not_injected(tmp_path: Path) -> None:
     env = _start_endpoint_worker_env(tmp_path, event_plane=None)
     assert "DYN_EVENT_PLANE" not in env
+
+
+def test_start_endpoint_worker_request_plane_injected(tmp_path: Path) -> None:
+    env = _start_endpoint_worker_env(tmp_path, event_plane=None)
+    assert env["DYN_REQUEST_PLANE"] == "nats"
+
+
+def test_trtllm_native_kv_events_receive_endpoint_hosts(tmp_path: Path) -> None:
+    mixin, process = _remap_worker_mixin(tmp_path, frontend_type="dynamo", dynamo_install=False)
+    mixin.config.backend.type = "trtllm"
+    mixin.runtime.environment = {"DYN_TRTLLM_PUBLISH_KV_EVENTS": "true"}
+    second_process = SimpleNamespace(**{**process.__dict__, "node": "node-b"})
+
+    with (
+        patch("srtctl.cli.mixins.worker_stage.generate_capture_script", return_value="fingerprint || true"),
+        patch("srtctl.cli.mixins.worker_stage.start_srun_process") as mock_srun,
+    ):
+        mock_srun.return_value = MagicMock()
+        mixin.start_endpoint_worker([process, second_process])
+
+    assert mock_srun.call_args.kwargs["env_to_set"]["DYN_TRTLLM_KV_EVENT_HOSTS"] == "node-a,node-b"
+
+
+def test_trtllm_native_kv_event_host_override_is_preserved(tmp_path: Path) -> None:
+    mixin, process = _remap_worker_mixin(tmp_path, frontend_type="dynamo", dynamo_install=False)
+    mixin.config.backend.type = "trtllm"
+    mixin.runtime.environment = {
+        "DYN_TRTLLM_PUBLISH_KV_EVENTS": "true",
+        "DYN_TRTLLM_KV_EVENT_HOSTS": "override-a,override-b",
+    }
+    second_process = SimpleNamespace(**{**process.__dict__, "node": "node-b"})
+
+    with (
+        patch("srtctl.cli.mixins.worker_stage.generate_capture_script", return_value="fingerprint || true"),
+        patch("srtctl.cli.mixins.worker_stage.start_srun_process") as mock_srun,
+    ):
+        mock_srun.return_value = MagicMock()
+        mixin.start_endpoint_worker([process, second_process])
+
+    assert mock_srun.call_args.kwargs["env_to_set"]["DYN_TRTLLM_KV_EVENT_HOSTS"] == "override-a,override-b"
+
+
+def test_trtllm_sidecar_endpoint_kills_step_on_rank_failure(tmp_path: Path) -> None:
+    mixin, process = _remap_worker_mixin(tmp_path, frontend_type="dynamo", dynamo_install=False)
+    mixin.config.backend.type = "trtllm"
+    mixin.config.dynamo.sidecar = True
+    mixin.runtime.srun_options = {"exclusive": "", "kill-on-bad-exit": "0"}
+
+    with (
+        patch("srtctl.cli.mixins.worker_stage.generate_capture_script", return_value="fingerprint || true"),
+        patch("srtctl.cli.mixins.worker_stage.start_srun_process") as mock_srun,
+    ):
+        mock_srun.return_value = MagicMock()
+        mixin.start_endpoint_worker([process])
+
+    assert mock_srun.call_args.kwargs["srun_options"] == {
+        "exclusive": "",
+        "kill-on-bad-exit": "1",
+    }
+
+
+def test_vllm_sidecar_disables_plugins_by_default(tmp_path: Path) -> None:
+    mixin, process = _remap_worker_mixin(tmp_path, frontend_type="dynamo", dynamo_install=False)
+    mixin.config.backend.type = "vllm"
+    mixin.config.dynamo.sidecar = True
+
+    with (
+        patch("srtctl.cli.mixins.worker_stage.generate_capture_script", return_value="fingerprint || true"),
+        patch("srtctl.cli.mixins.worker_stage.start_srun_process") as mock_srun,
+    ):
+        mock_srun.return_value = MagicMock()
+        mixin.start_worker(process, [process])
+
+    assert mock_srun.call_args.kwargs["env_to_set"]["VLLM_PLUGINS"] == ""
 
 
 @pytest.mark.parametrize("event_plane", ["zmq", "nats"])

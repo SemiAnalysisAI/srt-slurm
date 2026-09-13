@@ -3,6 +3,7 @@
 
 """Head-node power collector lifecycle against fake DCGM endpoints."""
 
+import hashlib
 import json
 import subprocess
 import threading
@@ -21,6 +22,7 @@ from srtctl.core.power.manifest import ExpectedWindow
 from srtctl.core.power.samples import read_samples
 from srtctl.core.power.session import PowerEndpoint, PowerSessionSettings, PowerTelemetrySession, _run_daemon_workers
 from srtctl.core.power.topology import build_expected_devices
+from srtctl.core.power.validate_artifacts import validate_power_artifacts
 from srtctl.core.processes import ManagedProcess, ProcessRegistry
 from srtctl.core.schema import TelemetryExporterConfig
 from srtctl.core.topology import Process
@@ -51,13 +53,19 @@ def _processes():
     ]
 
 
-def _body(prefix, count=GPUS_PER_NODE, watts=400.0):
+def _body(prefix, count=GPUS_PER_NODE, watts=400.0, utilization=False):
     lines = ["# TYPE DCGM_FI_DEV_POWER_USAGE gauge"]
     for index in range(count):
         lines.append(
             f'DCGM_FI_DEV_POWER_USAGE{{gpu="{index}",UUID="GPU-{prefix}{index}",'
             f'device="nvidia{index}",Hostname="exporter-lies"}} {watts + index}'
         )
+    if utilization:
+        lines.append("# TYPE DCGM_FI_DEV_GPU_UTIL gauge")
+        lines.append("# TYPE DCGM_FI_PROF_SM_ACTIVE gauge")
+        for index in range(count):
+            lines.append(f'DCGM_FI_DEV_GPU_UTIL{{gpu="{index}",UUID="GPU-{prefix}{index}"}} {10 * index}')
+            lines.append(f'DCGM_FI_PROF_SM_ACTIVE{{gpu="{index}",UUID="GPU-{prefix}{index}"}} {0.1 * index}')
     return "\n".join(lines) + "\n"
 
 
@@ -254,6 +262,43 @@ class TestCollection:
         assert len({row.gpu_uuid for row in rows}) == 2 * GPUS_PER_NODE
         assert {row.hostname for row in rows} == {"node-a", "node-b"}
         assert {row.scrape_seq for row in rows} == {0}
+
+    def test_terminal_manifest_records_the_samples_digest(self, tmp_path, exporters):
+        endpoint = exporters(_body("a"))
+        session = _session(
+            tmp_path,
+            _endpoints(("node-a", endpoint.url)),
+            processes=_processes()[:1],
+        )
+        session.initialize()
+        session.collect_once()
+
+        session.stop_and_finalize()
+
+        samples = session.power_dir / SAMPLES_FILENAME
+        assert _manifest(session)["samples_sha256"] == hashlib.sha256(samples.read_bytes()).hexdigest()
+
+    def test_utilization_is_persisted_when_the_exporter_reports_it(self, tmp_path, exporters):
+        a = exporters(_body("a", utilization=True))
+        b = exporters(_body("b"))
+        session = _session(tmp_path, _endpoints(("node-a", a.url), ("node-b", b.url)), windows=[])
+        session.initialize()
+
+        session.collect_once()
+        outcome = session.stop_and_finalize()
+
+        rows, reasons = read_samples(session.power_dir / SAMPLES_FILENAME)
+        assert reasons == ()
+        by_host = {}
+        for row in rows:
+            by_host.setdefault(row.hostname, []).append(row)
+        node_a = sorted(by_host["node-a"], key=lambda row: row.gpu_index)
+        assert [(row.gpu_util_pct, row.sm_active) for row in node_a] == [
+            (float(10 * index), 0.1 * index) for index in range(GPUS_PER_NODE)
+        ]
+        assert all(row.gpu_util_pct is None and row.sm_active is None for row in by_host["node-b"])
+        assert outcome.status == "complete"
+        assert outcome.reason_codes == ()
 
     def test_hostname_comes_from_the_endpoint_map(self, tmp_path, exporters):
         a = exporters(_body("a"))
@@ -588,6 +633,36 @@ class TestPublication:
         assert len(manifest["window_validations"][0]["per_device_max_sample_gap_seconds"]) == 2 * GPUS_PER_NODE
         assert manifest["artifact_errors"] == []
 
+        # Round-trip the producer's package through the offline validator so the
+        # two publication_valid formulas can never drift apart silently.
+        report = validate_power_artifacts(
+            power_dir=session.power_dir,
+            result_root=session.power_dir.parent,
+        )
+        assert report.ok is True, report.failures
+
+    def test_digest_io_failure_is_not_reclassified_as_malformed(self, tmp_path, exporters):
+        a = exporters(_body("a"))
+        b = exporters(_body("b"))
+        session = _session(tmp_path, _endpoints(("node-a", a.url), ("node-b", b.url)), sample_interval_seconds=0.2)
+        session.initialize()
+        assert session.start_and_wait_for_readiness() is True
+
+        start = time.time()
+        time.sleep(0.6)
+        end = time.time()
+        self._write_window_and_result(session, start, end)
+
+        with patch("srtctl.core.power.session.sha256_file", side_effect=PermissionError("digest denied")):
+            outcome = session.stop_and_finalize(allow_window_mutation=True)
+        report = validate_power_artifacts(power_dir=session.power_dir, result_root=session.power_dir.parent)
+
+        assert outcome.publication_valid is False
+        assert Reason.SAMPLES_DIGEST_UNAVAILABLE in outcome.reason_codes
+        assert Reason.SAMPLES_CSV_MALFORMED not in outcome.reason_codes
+        assert not any("disk-derived reason_codes mismatch" in failure for failure in report.failures)
+        assert not any("publication_valid is False, recomputed True" in failure for failure in report.failures)
+
     def test_a_stray_artifact_file_blocks_publication(self, tmp_path, exporters):
         """A valid expected window must not publish beside an unusable file."""
         a = exporters(_body("a"))
@@ -645,7 +720,7 @@ class TestSessionOwnership:
                 self.config = MagicMock()
                 self.config.telemetry.enabled = True
                 self.config.telemetry.storage_subdir = "power"
-                self.config.telemetry.default_frequency = 0.05
+                self.config.telemetry.collect_interval_ms = 50
                 self.config.telemetry.startup_timeout_seconds = 0.2
                 self.config.telemetry.request_timeout_seconds = 0.1
                 self.config.telemetry.collector_join_timeout_seconds = 1.0
@@ -693,6 +768,16 @@ class TestSessionOwnership:
         assert manifest["stopped_at_unix"] is not None
         assert exit_code == 1
 
+    def test_missing_samples_are_not_reclassified_as_malformed(self, tmp_path):
+        session = _session(tmp_path, [])
+
+        outcome = session.stop_and_finalize()
+        report = validate_power_artifacts(power_dir=session.power_dir, result_root=session.power_dir.parent)
+
+        assert Reason.SAMPLES_CSV_MISSING in outcome.reason_codes
+        assert Reason.SAMPLES_CSV_MALFORMED not in outcome.reason_codes
+        assert not any("disk-derived reason_codes mismatch" in failure for failure in report.failures)
+
     def test_exporter_launch_failure_blocks_the_benchmark(self, tmp_path):
         """Sibling of the readiness gate: a failed launch must not run the workload."""
         harness = self._harness(tmp_path, None)
@@ -716,6 +801,7 @@ class TestRequiredReadinessGate:
         config = MagicMock()
         config.telemetry.enabled = True
         config.telemetry.required = required
+        config.telemetry.cpu_power_exporter = None
         config.frontend.type = "dynamo"
         config.profiling.enabled = False
         runtime = MagicMock()
@@ -751,8 +837,8 @@ class TestRequiredReadinessGate:
             patch.object(SweepOrchestrator, "run_benchmark") as run_benchmark,
             patch.object(SweepOrchestrator, "start_all_workers", return_value={}),
             patch.object(SweepOrchestrator, "start_frontend", return_value=[]),
-            patch.object(SweepOrchestrator, "start_head_infrastructure", return_value=MagicMock()),
-            patch.object(SweepOrchestrator, "start_mooncake_master", return_value=None),
+            patch.object(SweepOrchestrator, "start_head_infrastructure"),
+            patch.object(SweepOrchestrator, "start_services", return_value=[]),
             patch.object(SweepOrchestrator, "_print_connection_info"),
             patch.object(SweepOrchestrator, "run_postprocess"),
             patch.object(SweepOrchestrator, "finalize_power_telemetry", side_effect=lambda code, **_: code),
@@ -768,7 +854,10 @@ class TestRequiredReadinessGate:
             exit_code = orchestrator.run()
 
         run_benchmark.assert_not_called()
-        start_tachometer.assert_called_once()
+        # Tachometer aligns with the load window (started inside
+        # run_benchmark); a run whose benchmark was skipped has no window,
+        # so nothing starts the capture.
+        start_tachometer.assert_not_called()
         assert exit_code == 1
 
     def test_eval_only_run_never_starts_power_telemetry(self, tmp_path):
@@ -783,8 +872,8 @@ class TestRequiredReadinessGate:
             patch.object(SweepOrchestrator, "_run_post_eval", return_value=0),
             patch.object(SweepOrchestrator, "start_all_workers", return_value={}),
             patch.object(SweepOrchestrator, "start_frontend", return_value=[]),
-            patch.object(SweepOrchestrator, "start_head_infrastructure", return_value=MagicMock()),
-            patch.object(SweepOrchestrator, "start_mooncake_master", return_value=None),
+            patch.object(SweepOrchestrator, "start_head_infrastructure"),
+            patch.object(SweepOrchestrator, "start_services", return_value=[]),
             patch.object(SweepOrchestrator, "_print_connection_info"),
             patch.object(SweepOrchestrator, "run_postprocess"),
             patch("srtctl.cli.do_sweep.record_resource_snapshot"),
@@ -923,7 +1012,6 @@ class TestBenchmarkChildReaping:
 
         with (
             patch("srtctl.cli.mixins.benchmark_stage.start_srun_process", return_value=proc),
-            patch("srtctl.analysis.live_metrics.try_start_snapshotter", return_value=None),
             patch("srtctl.cli.mixins.benchmark_stage.time.sleep", side_effect=SystemExit(1)),
             pytest.raises(SystemExit),
         ):
@@ -943,7 +1031,6 @@ class TestBenchmarkChildReaping:
 
         with (
             patch("srtctl.cli.mixins.benchmark_stage.start_srun_process", return_value=proc),
-            patch("srtctl.analysis.live_metrics.try_start_snapshotter", return_value=None),
         ):
             exit_code = harness._run_benchmark_script(runner, tmp_path / "benchmark.out", stop_event)
 
@@ -960,7 +1047,6 @@ class TestBenchmarkChildReaping:
 
         with (
             patch("srtctl.cli.mixins.benchmark_stage.start_srun_process", return_value=proc),
-            patch("srtctl.analysis.live_metrics.try_start_snapshotter", return_value=None),
             patch("srtctl.cli.mixins.benchmark_stage.time.sleep", side_effect=SystemExit(1)),
             pytest.raises(SystemExit),
         ):
@@ -976,7 +1062,6 @@ class TestBenchmarkChildReaping:
 
         with (
             patch("srtctl.cli.mixins.benchmark_stage.start_srun_process", return_value=proc),
-            patch("srtctl.analysis.live_metrics.try_start_snapshotter", return_value=None),
             patch("srtctl.cli.mixins.benchmark_stage.time.sleep", side_effect=SystemExit(1)),
             pytest.raises(SystemExit),
         ):

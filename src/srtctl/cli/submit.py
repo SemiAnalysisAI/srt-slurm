@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -59,10 +60,7 @@ from srtctl.core.schema import SrtConfig, installs_dynamo
 from srtctl.core.status import create_job_record
 from srtctl.core.validation import preflight_config_variants
 from srtctl.ports import MOONCAKE_MASTER_PORT
-from srtctl.render.direct_plan import (
-    build_direct_plan_context,
-    render_direct_container_shim,
-)
+from srtctl.runtime_scripts.dynamo_wheels import arch_from_binary, detect_target_arch
 
 console = Console()
 logger = logging.getLogger(__name__)
@@ -71,8 +69,19 @@ logger = logging.getLogger(__name__)
 # main() when --json is set so callers get one JSON line per submitted job.
 _submissions: list[dict] = []
 
+# Rendered --set/--unset overrides for the current invocation; echoed into every
+# submission record so a caller can see exactly what was applied.
+_active_overrides: list[str] = []
+# "dynamo.source: refs/pull/14000/head -> <sha>" notes from pinning source revs at
+# submit time; echoed the same way so a caller can see exactly what will build.
+_pinned_sources: list[str] = []
+
 
 def _record_submission(data: dict) -> None:
+    if _active_overrides:
+        data["applied_overrides"] = list(_active_overrides)
+    if _pinned_sources:
+        data["pinned_sources"] = list(_pinned_sources)
     _submissions.append(data)
 
 
@@ -193,6 +202,23 @@ def setup_logging(level: int = logging.INFO) -> None:
     )
 
 
+def _host_setup_source(config: SrtConfig) -> str:
+    """Where the effective host_setup came from: the recipe or srtslurm.yaml.
+
+    resolve_config_with_defaults only injects default_host_setup when the recipe
+    omits the block entirely, so an exact match against the cluster default
+    identifies it. Worth showing: an unexpected `sudo` in the dry-run output is
+    much easier to chase when you know which file to open.
+    """
+    default = get_srtslurm_setting("default_host_setup")
+    if isinstance(default, dict):
+        commands = list(default.get("commands") or [])
+        teardown = list(default.get("teardown") or [])
+        if commands == config.host_setup.commands and teardown == config.host_setup.teardown:
+            return "srtslurm.yaml (default_host_setup)"
+    return "recipe"
+
+
 def show_config_details(config: SrtConfig) -> None:
     """Display container mounts and environment variables for dry-run verification.
 
@@ -200,6 +226,28 @@ def show_config_details(config: SrtConfig) -> None:
     environment variables (global and backend per-mode) so users can verify their
     config is correct before submitting.
     """
+    if config.frontend.type == "dynamo" and not config.dynamo.sidecar:
+        from srtctl.backends.trtllm import TRTLLMProtocol
+
+        if isinstance(config.backend, TRTLLMProtocol):
+            descriptions = {
+                "--publish-metrics": "metrics only",
+                "--publish-events-and-metrics": "metrics and KV events",
+            }
+            publication = [f"{flag} ({descriptions[flag]})" for flag in config.backend.dynamo_metrics_flags]
+            disabled_by = (
+                "publish_events_and_metrics"
+                if config.backend.publish_events_and_metrics is False
+                else "publish_metrics"
+            )
+            console.print(
+                Panel(
+                    "\n".join(publication) or f"No publication flag (backend.{disabled_by}: false)",
+                    title="Dynamo TRT-LLM Metrics",
+                    border_style="cyan",
+                )
+            )
+
     if config.frontend.type == "vllm":
         from srtctl.backends.vllm import VLLMProtocol, find_vllm_orchestration_recipe_flags
 
@@ -346,6 +394,89 @@ def show_config_details(config: SrtConfig) -> None:
     else:
         console.print("[dim]No custom environment variables configured.[/]")
 
+    # --- Host setup (runs on the bare node, outside the container) ---
+    if config.host_setup.enabled:
+        host_table = Table(title="Host Setup (outside container)", show_lines=False, pad_edge=False)
+        host_table.add_column("Phase", style="dim", width=10)
+        host_table.add_column("Command", style="white")
+        for command in config.host_setup.commands:
+            host_table.add_row("setup", command)
+        for command in config.host_setup.teardown:
+            host_table.add_row("teardown", command)
+        console.print(Panel(host_table, border_style="red"))
+
+        setup = config.host_setup
+        source = _host_setup_source(config)
+        console.print(
+            f"[dim]host_setup:[/] nodes={setup.nodes} "
+            f"ignore_failure={str(setup.ignore_failure).lower()} "
+            f"timeout_seconds={setup.timeout_seconds} [dim]source: {source}[/]"
+        )
+        if any("sudo" in command for command in [*setup.commands, *setup.teardown]):
+            console.print(
+                "[yellow]NOTE:[/] host_setup runs as you, not root. Confirm passwordless sudo on a "
+                "compute node first (`srun --jobid <job> --overlap -w <node> sudo -n true`); "
+                "a sudo that prompts will hang until timeout_seconds and fail the job."
+            )
+        if setup.commands and not setup.teardown:
+            console.print(
+                "[yellow]NOTE:[/] no host_setup.teardown configured — any node state set here "
+                "outlives this allocation and is inherited by the next job on these nodes."
+            )
+
+    # --- post_eval (RUN_EVAL / EVAL_ONLY dispatch) ---
+    if config.post_eval.passthrough_env or config.post_eval.command:
+        console.print("[bold cyan]Post-eval dispatch:[/]")
+        if config.post_eval.command:
+            console.print(f"    [yellow]command:[/] {shlex.join(config.post_eval.command)}", crop=False)
+        if config.post_eval.passthrough_env:
+            console.print(f"    [yellow]passthrough_env:[/] {', '.join(config.post_eval.passthrough_env)}", crop=False)
+
+    # --- services (see docs/services.md) ---
+    # Plain lines, not a Table: repo URLs and long argv overflow a narrow console and a
+    # Table would wrap or truncate them. crop=False keeps each value intact on one line.
+    from srtctl.services.implicit import effective_services
+    from srtctl.services.registry import get_service_kind
+
+    effective = effective_services(config)
+    if effective:
+        console.print("[bold cyan]Services:[/]")
+        for entry in effective:
+            service = entry.service
+            console.print(
+                f"  [cyan]{service.name}[/] [dim]type={service.type} placement={service.effective_placement} "
+                f"start={service.effective_start} critical={str(service.effective_critical).lower()}[/]"
+            )
+            if entry.implicit:
+                console.print(
+                    f"    [yellow]implied by:[/] {entry.reason} (declare a service named {service.name} to change it)"
+                )
+            if service.external:
+                console.print(f"    [yellow]external:[/] {service.external} (not launched)", crop=False)
+                continue
+            console.print(f"    [yellow]command:[/] {shlex.join(service.preview_command())}", crop=False)
+            container = service.container or get_service_kind(service.type).container_fallback(config)
+            console.print(f"    [yellow]container:[/] {container or '<job container>'}")
+            if service.source is not None:
+                console.print(f"    [yellow]source:[/] {service.source.git} @ {service.source.rev}", crop=False)
+                if service.source.path:
+                    console.print(f"    [yellow]source.path:[/] {service.source.path}")
+            if service.build_command:
+                console.print(f"    [yellow]build_command:[/] {shlex.join(service.build_command)}", crop=False)
+            if service.readiness is not None:
+                console.print(f"    [yellow]readiness:[/] {service.readiness.describe()}")
+            elif get_service_kind(service.type).default_readiness_ports:
+                ports = ", ".join(f"tcp/{p}" for p in get_service_kind(service.type).default_readiness_ports)
+                console.print(f"    [yellow]readiness:[/] {ports} (kind default)")
+            if service.options:
+                console.print(f"    [yellow]options:[/] {service.options}", crop=False)
+            if service.preamble:
+                console.print(f"    [yellow]preamble:[/] {service.preamble.strip()}", crop=False)
+            if service.type not in ("etcd", "nats"):  # the discovery plane never gets its own address
+                console.print(f"    [yellow]inherit_discovery_env:[/] {str(service.inherit_discovery_env).lower()}")
+            for var, val in sorted(service.env.items()):
+                console.print(f"    [yellow]env.{var}:[/] {val}", crop=False)
+
     # --- srun options ---
     if config.srun_options:
         opts = " ".join(f"--{k}={v}" if v else f"--{k}" for k, v in config.srun_options.items())
@@ -357,6 +488,17 @@ def show_config_details(config: SrtConfig) -> None:
         console.print(
             "[dim]srun --export (dynamo install):[/] ALL,ENROOT_REMAP_ROOT=yes [dim](workers + dynamo frontend)[/]"
         )
+        source = config.dynamo.source
+        if source is not None and source.git:
+            console.print(f"[dim]dynamo source:[/] {source.git} @ {source.rev}", crop=False)
+            if source.sha:
+                console.print(f"[dim]dynamo source sha:[/] {source.sha}", crop=False)
+            else:
+                console.print("[dim]dynamo source sha:[/] resolved from rev at submit (srtctl apply)")
+        elif source is not None and source.pypi:
+            console.print(f"[dim]dynamo source:[/] PyPI ai-dynamo=={source.pypi}")
+        elif source is not None and source.wheel:
+            console.print(f"[dim]dynamo source:[/] staged wheel ai-dynamo=={source.wheel}")
 
     show_extensions = (
         config.benchmark.type == "custom"
@@ -384,14 +526,24 @@ def show_config_details(config: SrtConfig) -> None:
         if config.benchmark.container_image:
             details.add_row("benchmark", "container_image", config.benchmark.container_image)
 
-        if config.observability.enabled:
-            details.add_row("observability", "raw_metrics", str(config.observability.scraper_enabled))
         tachometer = config.observability.tachometer
-        if tachometer.enabled:
+        if config.observability.tachometer_enabled:
             details.add_row("observability", "tachometer", "enabled")
             details.add_row("observability", "storage_subdir", tachometer.storage_subdir)
-            details.add_row("observability", "frequency", str(tachometer.default_frequency))
+            details.add_row("observability", "collect_interval_ms", str(tachometer.collect_interval_ms))
             details.add_row("observability", "binary_path", tachometer.binary_path)
+            if config.telemetry.enabled:
+                details.add_row("observability", "dcgm_exporter", "shared with power telemetry")
+            elif tachometer.resolved_dcgm_exporter is not None:
+                dcgm = tachometer.resolved_dcgm_exporter
+                details.add_row("observability", "dcgm_exporter", f"{dcgm.container_image} :{dcgm.port}")
+            if tachometer.resolved_node_exporter is not None:
+                node = tachometer.resolved_node_exporter
+                details.add_row("observability", "node_exporter", f"{node.container_image} :{node.port}")
+            if tachometer.resolved_process_exporter is not None:
+                proc = tachometer.resolved_process_exporter
+                launch = f"host binary {proc.binary}" if proc.binary else proc.container_image
+                details.add_row("observability", "process_exporter", f"{launch} :{proc.port}")
 
         if config.telemetry.enabled:
             exporter = config.telemetry.dcgm_exporter
@@ -400,6 +552,21 @@ def show_config_details(config: SrtConfig) -> None:
             details.add_row("telemetry", "artifacts", f"<log_dir>/{config.telemetry.storage_subdir}")
             if exporter is not None:
                 details.add_row("telemetry", "dcgm_exporter", f"{exporter.container_image} (port {exporter.port})")
+
+            cpu_exporter = config.telemetry.cpu_power_exporter
+            if cpu_exporter is not None:
+                details.add_row(
+                    "telemetry", "cpu_power_exporter", f"{cpu_exporter.port} (source {cpu_exporter.source})"
+                )
+
+            cpu_power = config.telemetry.cpu_power
+            if cpu_power.enabled:
+                details.add_row(
+                    "telemetry",
+                    "cpu_power",
+                    f"host collector (source {cpu_power.source}, <log_dir>/{cpu_power.storage_subdir}"
+                    f"{', required' if cpu_power.required else ''})",
+                )
 
         if mooncake_cfg is not None:
             details.add_row("mooncake", "container", mooncake_cfg.container or "<job container>")
@@ -427,11 +594,37 @@ def show_config_details(config: SrtConfig) -> None:
         console.print(Panel(details, border_style="blue"))
 
 
-def validate_setup(srtctl_source: Path) -> None:
+def _cpu_power_exporter_problem(srtctl_source: Path) -> str | None:
+    """Why the installed exporter could not run on the compute nodes, if it could not.
+
+    Existence alone is not enough: a partial download leaves a file srun cannot
+    execute, and a checkout carried between architectures leaves one built for
+    the wrong machine. Either way the failure surfaces only once the allocation
+    is already running. The intended architecture is the compute architecture
+    make setup ARCH= installed, not this submit host, which is routinely a
+    different machine; when neither can be read, nothing is claimed.
+    """
+    label = "bin/cpu-power-exporter (compute-arch ACPI CPU power exporter)"
+    exporter = srtctl_source / "bin" / "cpu-power-exporter"
+    if not exporter.is_file():
+        return label
+    if not os.access(exporter, os.X_OK):
+        return f"{label} — present but not executable"
+    installed = arch_from_binary(exporter)
+    target = detect_target_arch(srtctl_source)
+    if installed is not None and installed != target:
+        return f"{label} — built for {installed}, but the compute nodes are {target}"
+    return None
+
+
+def validate_setup(srtctl_source: Path, config: SrtConfig | None = None) -> None:
     """Validate that make setup has been run and required binaries exist.
 
     Checks for NATS, etcd, Tachometer, and compute-arch uv binaries. Raises SystemExit
     with a clear error message if anything is missing.
+
+    cpu-power-exporter is only required by recipes that configure
+    telemetry.cpu_power_exporter; every other recipe submits without it.
     """
     missing = []
 
@@ -444,6 +637,13 @@ def validate_setup(srtctl_source: Path) -> None:
         missing.append("bin/uv (compute-arch uv)")
     if not (srtctl_source / "bin" / "tachometer-scraper").exists():
         missing.append("bin/tachometer-scraper (compute-arch Tachometer scraper)")
+    cpu_power_enabled = (
+        config is not None and config.telemetry.enabled and config.telemetry.cpu_power_exporter is not None
+    )
+    if cpu_power_enabled:
+        problem = _cpu_power_exporter_problem(srtctl_source)
+        if problem is not None:
+            missing.append(problem)
 
     if missing:
         console.print(f"\n[red bold]ERROR:[/] Required binaries not found in {srtctl_source}:")
@@ -454,6 +654,15 @@ def validate_setup(srtctl_source: Path) -> None:
         console.print("  make setup ARCH=aarch64  [dim]# for GB200/Grace compute nodes[/]")
         console.print("  make setup ARCH=x86_64   [dim]# for x86_64 compute nodes[/]\n")
         raise SystemExit(1)
+
+    # Optional: the default process exporter is host-native and skipped at launch
+    # (with a warning in the sweep log) when its binary is absent. Surface that at
+    # submit time so the gap is not discovered after the run.
+    if not (configs_dir / "process-exporter").exists():
+        console.print(
+            "[yellow]WARNING:[/] configs/process-exporter not found; Tachometer will run without per-process/"
+            "per-thread CPU telemetry. Re-run [bold]make setup ARCH=<compute_arch>[/] to install it."
+        )
 
 
 def generate_minimal_sbatch_script(
@@ -1214,19 +1423,60 @@ def is_override_config(config_path: Path) -> bool:
 
 
 @contextlib.contextmanager
-def materialize_config_path(config_path: Path):
-    """Stage stdin-backed configs to a temporary YAML file for repeated reads."""
-    if str(config_path) not in {"-", "/dev/stdin"}:
+def materialize_config_path(config_path: Path, overrides: Sequence[Any] = (), *, pin_sources: bool = False):
+    """Stage stdin-backed, --set/--unset-modified, or source-pinned configs to a temporary YAML file.
+
+    Overrides are applied to the raw document (comments preserved) before any
+    reader sees it, so they take effect identically for plain, sweep, and
+    override-format files and end up in the config.yaml copied into the job
+    output directory. With ``pin_sources`` (submit only), every ``source.rev``
+    that is not already a commit is resolved with ``git ls-remote`` and recorded
+    as ``source.sha`` in that same document, so the job builds exactly the
+    commit the lockfile names. The source file is never modified.
+    """
+    from_stdin = str(config_path) in {"-", "/dev/stdin"}
+    if not from_stdin and not overrides and not pin_sources:
+        yield config_path
+        return
+    if not from_stdin and (not config_path.exists() or config_path.is_dir()):
+        if config_path.is_dir() and overrides:
+            raise ValueError("--set/--unset apply to a single config file, not a directory")
+        yield config_path  # let the caller report the missing file, or handle the directory
+        return
+
+    payload = sys.stdin.read() if from_stdin else config_path.read_text()
+    if not payload.strip():
+        raise ValueError("No YAML received on stdin" if from_stdin else f"{config_path} is empty")
+
+    changed = from_stdin
+    if overrides or pin_sources:
+        from srtctl.core.yaml_utils import dump_yaml_with_comments, load_yaml_text_with_comments
+
+        document = load_yaml_text_with_comments(payload)
+        if overrides:
+            from srtctl.core.overrides import apply_overrides_to_recipe
+
+            for entry in apply_overrides_to_recipe(document, overrides):
+                logger.info("Applied override: %s", entry)
+            changed = True
+        if pin_sources and "source" in payload:
+            from srtctl.core.source import pin_source_revs
+
+            pinned = pin_source_revs(document)
+            for entry in pinned:
+                logger.info("Pinned source: %s", entry)
+            _pinned_sources.extend(pinned)
+            changed = changed or bool(pinned)
+        if changed:
+            payload = dump_yaml_with_comments(document) or ""
+
+    if not changed:
         yield config_path
         return
 
-    payload = sys.stdin.read()
-    if not payload.strip():
-        raise ValueError("No YAML received on stdin")
-
     fd, temp_path = tempfile.mkstemp(
         suffix=".yaml",
-        prefix="srtctl_stdin_",
+        prefix="srtctl_stdin_" if from_stdin else "srtctl_override_",
         text=True,
     )
     try:
@@ -1236,69 +1486,6 @@ def materialize_config_path(config_path: Path):
     finally:
         with contextlib.suppress(OSError):
             os.remove(temp_path)
-
-
-def render_bash_script(
-    config_path: Path,
-    selector: str | None = None,
-    setup_script: str | None = None,
-    output_dir: Path | None = None,
-) -> str:
-    """Render a directly executable, single-node lifecycle script.
-
-    ``--bash`` deliberately bypasses the SLURM orchestration path. The emitted
-    file starts only processes it owns on the current host, writes separate
-    logs, gates load on readiness, and cleans up those process groups on exit.
-    """
-    if config_path.is_dir():
-        raise ValueError("--bash expects a single config file, not a directory")
-
-    srtctl_root = get_srtslurm_setting("srtctl_root")
-    source_dir = Path(srtctl_root) if srtctl_root else Path(__file__).parent.parent.parent.parent
-    if output_dir:
-        output_base = output_dir.resolve()
-    else:
-        configured_output_dir = get_srtslurm_setting("output_dir")
-        output_base = (
-            Path(os.path.expandvars(configured_output_dir)).resolve()
-            if configured_output_dir
-            else (source_dir / "outputs").resolve()
-        )
-
-    def render(config: SrtConfig) -> str:
-        context = build_direct_plan_context(
-            config,
-            source_dir=source_dir,
-            output_base=output_base,
-        )
-        return render_direct_container_shim(context)
-
-    if is_override_config(config_path):
-        from srtctl.core.config import resolve_override_yaml
-
-        resolved_variants = resolve_override_yaml(config_path, selector=selector)
-        if len(resolved_variants) != 1:
-            raise ValueError(
-                "--bash for override configs requires a selector that resolves to exactly one variant "
-                "(for example: -f config.yaml:base or -f config.yaml:override_name)"
-            )
-
-        _suffix, config_cm = resolved_variants[0]
-        if "sweep" in config_cm:
-            raise ValueError("--bash does not support override variants that contain a sweep")
-
-        resolved_config = resolve_config_with_defaults(config_cm, load_cluster_config())
-        config = SrtConfig.Schema().load(resolved_config)
-        return render(config)
-
-    if selector:
-        logger.warning(f"Selector ':{selector}' ignored — config is not an override file")
-
-    if is_sweep_config(config_path):
-        raise ValueError("--bash currently supports single-job configs only; sweeps expand to multiple direct runs")
-
-    config = load_config(config_path)
-    return render(config)
 
 
 def submit_override(
@@ -1459,7 +1646,6 @@ def main():
   srtctl                                         # Interactive mode
   srtctl apply -f config.yaml                    # Submit job
   srtctl apply -f config.yaml --serve-only       # Serve until cancelled; do not benchmark
-  srtctl apply -f config.yaml --bash             # Print a direct single-node Bash lifecycle script
   srtctl apply -f ./configs/                     # Submit all YAMLs in directory
   srtctl apply -f config.yaml --sweep            # Submit sweep
   srtctl preflight -f config.yaml                # Check model/container availability
@@ -1469,11 +1655,38 @@ def main():
   srtctl monitor                                 # Live job dashboard
   srtctl monitor --outputs /path/to/outputs      # Dashboard with custom outputs dir
   srtctl view /path/to/run-output                # Local ruter route-decision viewer
+  srtctl schema-docs [--check]                   # Regenerate (or verify) docs/schema-reference.md + docs/legacy-v1.md
+  srtctl migrate -f config.yaml --in-place       # Upgrade a recipe to the current schema version
+  srtctl migrate -f recipes/ --verify            # Prove v1 and migrated v2 recipes resolve identically
+  srtctl skill --target claude                   # Install the srtctl agent skill into this project
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    def add_override_args(p):
+        p.add_argument(
+            "--set",
+            action="append",
+            default=[],
+            metavar="KEY=VALUE",
+            dest="set_overrides",
+            help=(
+                "Override a recipe value by dotted path before validation (repeatable), e.g. "
+                "--set health_check.max_attempts=720 or --set 'backend.sglang_config.prefill.dist-timeout=1800'. "
+                "Values parse as YAML scalars or lists; mappings stay literal strings. "
+                "On override files the value is written into base and every variant."
+            ),
+        )
+        p.add_argument(
+            "--unset",
+            action="append",
+            default=[],
+            metavar="KEY",
+            dest="unset_overrides",
+            help="Remove a recipe key by dotted path before validation (repeatable), e.g. --unset health_check",
+        )
 
     def add_common_args(p):
         p.add_argument(
@@ -1487,6 +1700,7 @@ def main():
         p.add_argument("-o", "--output", type=Path, dest="output_dir", help="Custom output directory for job logs")
         p.add_argument("--sweep", action="store_true", help="Force sweep mode")
         p.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompts")
+        add_override_args(p)
 
     apply_parser = subparsers.add_parser("apply", help="Submit job(s) to SLURM")
     add_common_args(apply_parser)
@@ -1496,12 +1710,6 @@ def main():
         "--serve-only",
         action="store_true",
         help="Deploy the inference endpoint without running a benchmark; keep serving until the job is cancelled.",
-    )
-    apply_parser.add_argument(
-        "--bash",
-        action="store_true",
-        dest="bash_output",
-        help="Print a direct single-node Bash lifecycle script to stdout and exit without submitting.",
     )
     apply_parser.add_argument(
         "--json",
@@ -1554,6 +1762,7 @@ def main():
         dest="config",
         help="YAML config file, or file:selector for overrides",
     )
+    add_override_args(preflight_parser)
 
     monitor_parser = subparsers.add_parser("monitor", help="Live dashboard for srt-slurm jobs", add_help=False)
     monitor_parser.add_argument("args", nargs=argparse.REMAINDER)
@@ -1582,6 +1791,7 @@ def main():
         action="store_true",
         help="Print resolved YAML to stdout instead of writing files",
     )
+    add_override_args(resolve_parser)
 
     # Fingerprint comparison: srtctl diff <path_a> <path_b>
     diff_parser = subparsers.add_parser("diff", help="Compare fingerprints from two runs")
@@ -1594,20 +1804,75 @@ def main():
     check_parser.add_argument("path", type=Path, help="Lockfile or output dir to check against")
     check_parser.add_argument("--json", action="store_true", dest="json_output", help="Output as JSON")
 
+    # Generated schema reference: srtctl schema-docs [--check] [--output PATH]
+    schema_docs_parser = subparsers.add_parser(
+        "schema-docs",
+        help="Regenerate docs/schema-reference.md (2.0 layout) and docs/legacy-v1.md (v1 layout) from the code",
+    )
+    schema_docs_parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Exit 1 if either checked-in document is stale instead of rewriting them (used by CI)",
+    )
+    schema_docs_parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Write the schema reference to this path instead of docs/schema-reference.md (legacy-v1.md lands beside it)",
+    )
+
+    # Recipe migration: srtctl migrate -f recipe.yaml [--in-place | --output PATH]
+    skill_parser = subparsers.add_parser(
+        "skill",
+        help="Install the in-package agent skill (how to drive srtctl) for Claude Code, Codex, or Cursor",
+    )
+    skill_parser.add_argument(
+        "--target",
+        choices=["claude", "codex", "cursor"],
+        required=True,
+        help="Which agent's project skill layout to write",
+    )
+    skill_parser.add_argument(
+        "--root",
+        type=Path,
+        default=Path.cwd(),
+        help="Project root to install under (default: the current directory)",
+    )
+    skill_parser.add_argument(
+        "--print", action="store_true", dest="print_only", help="Print the skill instead of writing it"
+    )
+
+    migrate_parser = subparsers.add_parser(
+        "migrate",
+        help="Upgrade a recipe (plain, override, or lock file) to the current schema version",
+    )
+    migrate_parser.add_argument(
+        "-f",
+        "--file",
+        type=Path,
+        required=True,
+        action="append",
+        dest="migrate_files",
+        help="Recipe YAML to migrate; a directory is walked recursively (repeatable)",
+    )
+    migrate_parser.add_argument("--in-place", action="store_true", help="Rewrite the file(s) instead of printing")
+    migrate_parser.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Write the migrated recipe to this path (single file only; default: print to stdout)",
+    )
+    migrate_parser.add_argument(
+        "--verify",
+        action="store_true",
+        help="Do not write: migrate in memory and prove the v1 and v2 recipes resolve identically (golden equality)",
+    )
+
     args = parser.parse_args()
 
     json_mode = bool(getattr(args, "json_output", False))
     mock_mode = bool(getattr(args, "mock_mode", False))
-    bash_mode = bool(getattr(args, "bash_output", False))
     serve_only = bool(getattr(args, "serve_only", False))
-    if bash_mode and json_mode:
-        parser.error("--bash cannot be combined with --json")
-    if bash_mode and mock_mode:
-        parser.error("--bash cannot be combined with --mock")
-    if bash_mode and getattr(args, "sweep", False):
-        parser.error("--bash currently supports single-job configs only; sweeps expand to multiple sbatch jobs")
-    if serve_only and bash_mode:
-        parser.error("--serve-only cannot be combined with --bash")
     if serve_only and mock_mode:
         parser.error("--serve-only cannot be combined with --mock")
     if serve_only and getattr(args, "sweep", False):
@@ -1619,7 +1884,7 @@ def main():
     # submit_override (tests, etc.) must not see a leaked stderr binding.
     global console
     _original_console = console
-    console = Console(file=sys.stderr) if json_mode or bash_mode else Console()
+    console = Console(file=sys.stderr) if json_mode else Console()
 
     def restore_console() -> None:
         global console
@@ -1627,6 +1892,15 @@ def main():
 
     if json_mode:
         _submissions.clear()
+
+    from srtctl.core.overrides import parse_overrides
+
+    try:
+        overrides = parse_overrides(getattr(args, "set_overrides", None), getattr(args, "unset_overrides", None))
+    except ValueError as exc:
+        parser.error(str(exc))
+    global _active_overrides
+    _active_overrides = [override.render() for override in overrides]
 
     _mock_patch_teardowns: list = []
     if mock_mode:
@@ -1690,6 +1964,98 @@ def main():
         restore_console()
         sys.exit(1 if all_results else 0)
 
+    if args.command == "schema-docs":
+        from srtctl.core.schema_docs import (
+            DEFAULT_OUTPUT,
+            legacy_output_for,
+            schema_reference_is_current,
+            write_schema_reference,
+        )
+
+        output = args.output or DEFAULT_OUTPUT
+        if args.check:
+            if schema_reference_is_current(output):
+                console.print(f"[green]✓[/] {output} and {legacy_output_for(output)} are up to date")
+                restore_console()
+                return
+            console.print(
+                f"[bold red]✗[/] {output} or {legacy_output_for(output)} is stale; "
+                "run `srtctl schema-docs` and commit the result"
+            )
+            restore_console()
+            sys.exit(1)
+        written = write_schema_reference(output)
+        console.print(f"[green]✓[/] Wrote {written} and {legacy_output_for(written)}")
+        restore_console()
+        return
+
+    if args.command == "skill":
+        from srtctl.skills import install_skill, render_skill
+
+        if args.print_only:
+            print(render_skill(args.target))
+            restore_console()
+            return
+        written = install_skill(args.target, args.root)
+        console.print(f"[green]✓[/] Wrote {written}")
+        restore_console()
+        return
+
+    if args.command == "migrate":
+        from srtctl.core.migrate import migrate_recipe_file, recipe_files, verify_migration_file
+
+        files = recipe_files(args.migrate_files)
+        if not files:
+            console.print("[bold red]No recipe files found[/]")
+            sys.exit(1)
+        if args.verify:
+            counts: dict[str, int] = {"ok": 0, "mismatch": 0, "skipped": 0, "error": 0}
+            for path in files:
+                outcome = verify_migration_file(path)
+                counts[outcome.status] += 1
+                if outcome.status == "ok":
+                    console.print(f"[green]✓[/] {path} ({outcome.variants} variant(s) resolve identically)")
+                elif outcome.status == "skipped":
+                    console.print(f"[yellow]-[/] {path}: skipped, {outcome.detail}")
+                else:
+                    console.print(f"[bold red]✗[/] {path}: {outcome.detail}")
+            console.print(
+                f"\n{counts['ok']} identical, {counts['mismatch']} mismatched, "
+                f"{counts['skipped']} skipped (v1 does not load), {counts['error']} unreadable"
+            )
+            restore_console()
+            sys.exit(1 if counts["mismatch"] or counts["error"] else 0)
+        if not args.in_place and args.output is None and len(files) > 1:
+            console.print("[bold red]Error:[/] printing to stdout needs a single file; use --in-place for many")
+            sys.exit(1)
+        if args.output is not None and len(files) > 1:
+            console.print("[bold red]Error:[/] --output takes a single file")
+            sys.exit(1)
+        failed = 0
+        for path in files:
+            try:
+                result = migrate_recipe_file(path, in_place=args.in_place, output=args.output)
+            except Exception as exc:  # noqa: BLE001 - one unreadable recipe must not stop a directory run
+                failed += 1
+                detail = next(
+                    (line for line in str(exc).splitlines() if "duplicate key" in line), str(exc).splitlines()[0]
+                )
+                console.print(f"[bold red]✗[/] {path}: not migrated: {detail} (fix the recipe, then re-run)")
+                continue
+            if not args.in_place and args.output is None:
+                sys.stdout.write(result.text)
+                sys.stdout.flush()
+            else:
+                target = path if args.in_place else args.output
+                detail = ", ".join(result.notes) if result.notes else "already current"
+                console.print(f"[green]✓[/] {target}: schema {result.from_version} -> {result.to_version} ({detail})")
+        if failed:
+            console.print(f"\n{len(files) - failed} migrated, {failed} not migrated")
+            restore_console()
+            sys.exit(1)
+        restore_console()
+        return
+
     if args.command == "monitor":
         from srtctl.cli.monitor import main as _monitor_main
 
@@ -1713,7 +2079,9 @@ def main():
     tags = [t.strip() for t in (getattr(args, "tags", "") or "").split(",") if t.strip()] or None
 
     try:
-        with materialize_config_path(config_path) as effective_config_path:
+        with materialize_config_path(
+            config_path, overrides, pin_sources=args.command == "apply"
+        ) as effective_config_path:
             if not effective_config_path.exists():
                 console.print(f"[bold red]Config not found:[/] {config_path}")
                 sys.exit(1)
@@ -1758,20 +2126,6 @@ def main():
 
             setup_script = getattr(args, "setup_script", None)
             output_dir = getattr(args, "output_dir", None)
-
-            if bash_mode:
-                script_content = render_bash_script(
-                    effective_config_path,
-                    selector=selector,
-                    setup_script=setup_script,
-                    output_dir=output_dir,
-                )
-                sys.stdout.write(script_content)
-                if not script_content.endswith("\n"):
-                    sys.stdout.write("\n")
-                sys.stdout.flush()
-                restore_console()
-                return
 
             # --no-preflight is only registered on the apply parser, so
             # dry-run / preflight / resolve-override won't carry it. Default

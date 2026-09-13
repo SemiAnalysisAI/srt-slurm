@@ -18,7 +18,8 @@ from srtctl.core.health import wait_for_health
 from srtctl.core.processes import ManagedProcess, NamedProcesses
 from srtctl.core.schema import build_otel_env, installs_dynamo
 from srtctl.core.slurm import CONTAINER_REMAP_ROOT_EXPORT, get_hostname_ip, start_srun_process
-from srtctl.ports import ETCD_CLIENT_PORT, KV_EVENTS_PORT_BASE, KVBM_ZMQ_PORT_BASE, NATS_PORT
+from srtctl.ports import KV_EVENTS_PORT_BASE, KVBM_ZMQ_PORT_BASE
+from srtctl.services.implicit import discovery_env
 
 if TYPE_CHECKING:
     from srtctl.core.runtime import RuntimeContext
@@ -26,6 +27,9 @@ if TYPE_CHECKING:
     from srtctl.core.topology import Endpoint, Process
 
 logger = logging.getLogger(__name__)
+
+# Engines shut down on SIGTERM (deregister, free GPUs, flush); give them longer than the default 10s.
+WORKER_TERMINATE_TIMEOUT_SECONDS = 30.0
 
 # Dynamo runtime (Rust) log filter for worker containers; YAML prefill_environment /
 # decode_environment / aggregated_environment override via the merge below.
@@ -123,6 +127,25 @@ class WorkerStageMixin:
             env_to_set.setdefault("DYN_KVBM_LEADER_ZMQ_PUB_PORT", str(pub_port))
             env_to_set.setdefault("DYN_KVBM_LEADER_ZMQ_ACK_PORT", str(ack_port))
 
+    def _get_worker_environment_for_mode(self, mode: str) -> dict[str, str]:
+        """Return mode environment with engine-specific defaults the recipe can override."""
+        environment = self.backend.get_environment_for_mode(mode)
+        if getattr(self.config.dynamo, "sidecar", False) is True and self.backend.type == "vllm":
+            # Installed plugins may replace native engine output types and
+            # break the fixed Rust/Python MessagePack contract used by vllm-rs.
+            environment.setdefault("VLLM_PLUGINS", "")
+        if self.backend.type == "sglang":
+            # SGLang treats its own exit after SIGTERM as a crash: it drains in a few
+            # seconds, then tries py-spy (needs root) and waits 60s for CUDA
+            # coredumps that are never produced unless SGLANG_CUDA_COREDUMP=1. That
+            # wait is what cleanup would otherwise kill through. Skip it unless the
+            # recipe opted into coredumps (mode env or the global environment).
+            recipe_env = {**self.runtime.environment, **environment}
+            if recipe_env.get("SGLANG_CUDA_COREDUMP", "0").lower() not in ("1", "true"):
+                environment.setdefault("SGLANG_CUDA_COREDUMP_BEFORE_CRASH", "0")
+            environment.setdefault("SGLANG_PYSPY_DUMP_BEFORE_CRASH", "0")
+        return environment
+
     def start_worker(self, process: "Process", endpoint_processes: list["Process"]) -> ManagedProcess:
         """Start a single worker process (one srun per node, used by SGLang)."""
         mode = process.endpoint_mode
@@ -160,8 +183,7 @@ class WorkerStageMixin:
         # Environment variables
         env_to_set = {
             "HEAD_NODE_IP": self.runtime.head_node_ip,
-            "ETCD_ENDPOINTS": f"http://{self.runtime.nodes.infra}:{ETCD_CLIENT_PORT}",
-            "NATS_SERVER": f"nats://{self.runtime.nodes.infra}:{NATS_PORT}",
+            **discovery_env(self.config, self.runtime),
             "DYN_SYSTEM_PORT": str(process.sys_port),
             "DYN_REQUEST_PLANE": self.config.dynamo.request_plane,
             "DYN_SKIP_SGLANG_LOG_FORMATTING": "1",
@@ -184,7 +206,7 @@ class WorkerStageMixin:
             def __missing__(self, key: str) -> str:
                 return "{" + key + "}"  # Leave unknown placeholders unchanged
 
-        for key, value in self.backend.get_environment_for_mode(mode).items():
+        for key, value in self._get_worker_environment_for_mode(mode).items():
             formatted_value = value.format_map(SafeDict(template_vars))
             env_to_set[key] = formatted_value
 
@@ -199,7 +221,8 @@ class WorkerStageMixin:
             env_to_set.update(profiling.get_env_vars(mode, profile_dir))
 
         should_set_cvd = getattr(self.backend, "should_set_cuda_visible_devices", lambda _process: True)
-        if should_set_cvd(process) and len(process.gpu_indices) < self.runtime.gpus_per_node:
+        force_cvd = getattr(self.config.dynamo, "sidecar", False) is True and self.backend.type == "vllm"
+        if (force_cvd or should_set_cvd(process)) and len(process.gpu_indices) < self.runtime.gpus_per_node:
             env_to_set["CUDA_VISIBLE_DEVICES"] = process.cuda_visible_devices
 
         # Add backend-specific process environment variables (e.g., unique ports)
@@ -209,7 +232,10 @@ class WorkerStageMixin:
         # worker's own IP so MOONCAKE_LOCAL_HOSTNAME is correct for multi-node
         # peer-to-peer transfers (defaulting to "localhost" silently breaks them).
         if hasattr(self.backend, "get_mooncake_worker_env"):
-            local_hostname = get_hostname_ip(process.node, self.runtime.network_interface)
+            # A MOONCAKE_LOCAL_HOSTNAME already in the worker env (roles.*.env) pins a NIC; otherwise the node IP.
+            local_hostname = env_to_set.get("MOONCAKE_LOCAL_HOSTNAME") or get_hostname_ip(
+                process.node, self.runtime.network_interface
+            )
             env_to_set.update(self.backend.get_mooncake_worker_env(self.runtime.infra_node_ip, local_hostname))
 
         self._apply_kvbm_endpoint_env(env_to_set, endpoint_processes)
@@ -237,6 +263,7 @@ class WorkerStageMixin:
         endpoint_nodes = {endpoint_process.node for endpoint_process in endpoint_processes}
         env_to_unset = ["VLLM_PORT"] if self.backend.type == "vllm" and len(endpoint_nodes) > 1 else None
 
+        step_name = f"{mode}_{index}_{process.node}"
         proc = start_srun_process(
             command=cmd,
             nodelist=[process.node],
@@ -249,14 +276,19 @@ class WorkerStageMixin:
             srun_options=self.runtime.srun_options,
             srun_export_env=CONTAINER_REMAP_ROOT_EXPORT if installs_dynamo(self.config) else None,
             het_group=process.het_group,
+            step_name=step_name,
         )
 
         return ManagedProcess(
-            name=f"{mode}_{index}_{process.node}",
+            name=step_name,
             popen=proc,
             log_file=worker_log,
             node=process.node,
             critical=True,
+            # SIGTERM reaches the engine through the step so it deregisters and
+            # frees the GPUs cleanly; a signalled srun would SIGKILL it instead.
+            terminate_timeout=WORKER_TERMINATE_TIMEOUT_SECONDS,
+            step_name=step_name,
         )
 
     def start_endpoint_worker(self, endpoint_processes: list["Process"]) -> ManagedProcess:
@@ -313,9 +345,9 @@ class WorkerStageMixin:
         # Environment variables
         env_to_set = {
             "HEAD_NODE_IP": self.runtime.head_node_ip,
-            "ETCD_ENDPOINTS": f"http://{self.runtime.nodes.infra}:{ETCD_CLIENT_PORT}",
-            "NATS_SERVER": f"nats://{self.runtime.nodes.infra}:{NATS_PORT}",
+            **discovery_env(self.config, self.runtime),
             "DYN_SYSTEM_PORT": str(leader.sys_port),
+            "DYN_REQUEST_PLANE": self.config.dynamo.request_plane,
             "DYN_SKIP_SGLANG_LOG_FORMATTING": "1",
         }
         if self.config.dynamo.event_plane:
@@ -327,10 +359,22 @@ class WorkerStageMixin:
         env_to_set.setdefault("DYN_LOG", _DEFAULT_WORKER_DYN_LOG)
 
         # Add mode-specific environment variables from backend
-        env_to_set.update(self.backend.get_environment_for_mode(mode))
+        env_to_set.update(self._get_worker_environment_for_mode(mode))
 
         # Add config environment variables
         env_to_set.update(self.runtime.environment)
+
+        # Native TRT-LLM KV-event subscribers need routable publisher hosts for
+        # multi-node endpoints.  Dynamo can otherwise fall back to
+        # SLURM_STEP_NODELIST, but that step-scoped variable is not guaranteed to
+        # be available inside every container-launch path.  Set the endpoint's
+        # nodes explicitly, while preserving a recipe-provided override.
+        if (
+            self.backend.type == "trtllm"
+            and len(endpoint_nodes) > 1
+            and env_to_set.get("DYN_TRTLLM_PUBLISH_KV_EVENTS", "").lower() == "true"
+        ):
+            env_to_set.setdefault("DYN_TRTLLM_KV_EVENT_HOSTS", ",".join(endpoint_nodes))
 
         # Add profiling environment variables
         if profiling.enabled:
@@ -338,7 +382,8 @@ class WorkerStageMixin:
             env_to_set.update(profiling.get_env_vars(mode, profile_dir))
 
         should_set_cvd = getattr(self.backend, "should_set_cuda_visible_devices", lambda _process: True)
-        if should_set_cvd(leader) and len(leader.gpu_indices) < self.runtime.gpus_per_node:
+        force_cvd = getattr(self.config.dynamo, "sidecar", False) is True and self.backend.type == "vllm"
+        if (force_cvd or should_set_cvd(leader)) and len(leader.gpu_indices) < self.runtime.gpus_per_node:
             env_to_set["CUDA_VISIBLE_DEVICES"] = leader.cuda_visible_devices
 
         # Add mooncake worker env vars if configured (SGLang only). For MPI-style
@@ -346,7 +391,9 @@ class WorkerStageMixin:
         # hostname is fundamentally per-process, but TRTLLM-style launching uses
         # one srun for the whole endpoint, so leader IP is the best we can do.
         if hasattr(self.backend, "get_mooncake_worker_env"):
-            local_hostname = get_hostname_ip(leader.node, self.runtime.network_interface)
+            local_hostname = env_to_set.get("MOONCAKE_LOCAL_HOSTNAME") or get_hostname_ip(
+                leader.node, self.runtime.network_interface
+            )
             env_to_set.update(self.backend.get_mooncake_worker_env(self.runtime.infra_node_ip, local_hostname))
 
         self._apply_kvbm_endpoint_env(env_to_set, endpoint_processes)
@@ -369,7 +416,13 @@ class WorkerStageMixin:
 
         # Get srun config from backend
         srun_config = self.backend.get_srun_config()
+        srun_options = dict(self.runtime.srun_options)
+        if self.backend.type == "trtllm" and getattr(self.config.dynamo, "sidecar", False) is True:
+            # The sidecar runs only on rank zero. Make any follower-rank exit
+            # terminate the full endpoint step instead of leaving rank zero up.
+            srun_options["kill-on-bad-exit"] = "1"
 
+        step_name = f"{mode}_{index}_{leader.node}"
         proc = start_srun_process(
             command=cmd,
             nodes=num_nodes,
@@ -384,15 +437,24 @@ class WorkerStageMixin:
             mpi=srun_config.mpi,
             oversubscribe=srun_config.oversubscribe,
             cpu_bind=srun_config.cpu_bind,
+            # Endpoint (MPI) workers were the only srun path that dropped the
+            # recipe-level srun_options; the per-process worker, benchmark and
+            # telemetry paths all forward it. Needed so a cluster can express
+            # per-rank CPU/NUMA binding, which srun_config.cpu_bind cannot.
+            srun_options=srun_options,
             het_group=leader.het_group,
+            step_name=step_name,
         )
 
         return ManagedProcess(
-            name=f"{mode}_{index}_{leader.node}",
+            name=step_name,
             popen=proc,
             log_file=worker_log,
             node=leader.node,
             critical=True,
+            # scancel --signal --full reaches every MPI rank of the step at once.
+            terminate_timeout=WORKER_TERMINATE_TIMEOUT_SECONDS,
+            step_name=step_name,
         )
 
     def _wait_for_worker_ready(self, leader: "Process") -> None:

@@ -163,12 +163,13 @@ nodes_per_router = ceil((total_nodes - 1) / num_additional_frontends)
 The sglang router needs the **disaggregation bootstrap port** to connect to prefill workers. This must match the `disaggregation-bootstrap-port` in your sglang config:
 
 ```yaml
-backend:
-  sglang_config:
-    prefill:
+roles:
+  prefill:
+    args:
       disaggregation-bootstrap-port: 30001 # Must match
       # ... other config
-    decode:
+  decode:
+    args:
       disaggregation-bootstrap-port: 30001 # Must match
       # ... other config
 ```
@@ -179,11 +180,28 @@ The default bootstrap port is `30001` (matching most recipes). If you use a diff
 
 Workers listen on port `30000` by default. This is standard sglang behavior and doesn't need configuration.
 
+### Metrics
+
+Tachometer (on by default) scrapes this frontend like any other, but the Model Gateway and native
+`sglang.launch_server` workers need two flags that srtctl now passes for you:
+
+- The gateway only starts its Prometheus listener when `--prometheus-port` is given. srtctl adds
+  `--prometheus-port 29000 --prometheus-host 0.0.0.0` (the router's own default port) unless your
+  `frontend.args` set `prometheus-port` / `prometheus-host`, and points tachometer's `frontend*`
+  target at that port, not at the routing port.
+- Workers serve Prometheus `/metrics` on their HTTP port only with `--enable-metrics`. srtctl adds it
+  to every `sglang.launch_server` launch under `frontend.type: sglang` unless the role's `args`
+  already set `enable-metrics`. Only the leader rank of a multi-node worker binds the HTTP server, so
+  followers are not targeted.
+
+Dynamo workers are unaffected: they expose metrics on their system port without either flag.
+
 ## Complete Example
 
 Here's a full recipe using sglang router:
 
 ```yaml
+schema: 2
 name: "deepseek-r1-sglang-router"
 
 model:
@@ -194,27 +212,28 @@ model:
 resources:
   gpu_type: "gb300"
   gpus_per_node: 4
-  prefill_nodes: 2
-  prefill_workers: 2
-  decode_nodes: 2
-  decode_workers: 2
 
 frontend:
   type: sglang
   enable_multiple_frontends: true
   num_additional_frontends: 3 # 4 total routers
 
-backend:
-  sglang_config:
-    prefill:
+engine: sglang
+roles:
+  prefill:
+    nodes: 2
+    workers: 2
+    args:
       model-path: /model/
       tensor-parallel-size: 4
       disaggregation-mode: prefill
       disaggregation-bootstrap-port: 30001
       disaggregation-transfer-backend: nixl
       # ... other prefill settings
-
-    decode:
+  decode:
+    nodes: 2
+    workers: 2
+    args:
       model-path: /model/
       tensor-parallel-size: 4
       disaggregation-mode: decode

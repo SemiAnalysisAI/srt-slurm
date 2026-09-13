@@ -5,11 +5,12 @@
 - [Introduction](README.md)
 - [Installation](installation.md)
 - [CLI Reference](cli.md)
-- [Direct Host Lifecycle](direct-host.md)
 
 ## Configuration
 
 - [Configuration Reference](config-reference.md)
+- [Schema Reference (generated)](schema-reference.md)
+- [Deferred DCGM 4.7 runtime support](dcgm-4.7-runtime-support.md)
 - [Parameter Sweeps](sweeps.md)
 - [Config Overrides](config-reference.md#config-overrides)
 
@@ -19,6 +20,7 @@
 - [SGLang Router](sglang-router.md)
 - [vLLM Router](vllm-router.md)
 - [Mooncake KV Store](mooncake-kv-store.md)
+- [Services](services.md)
 
 ## Benchmarking
 
@@ -28,10 +30,12 @@
 ## Operations
 
 - [Monitoring](monitoring.md)
-- [Analyzing Results](analyzing.md)
+- [GPU Power Telemetry](power-telemetry.md)
+- [CPU Power Telemetry](cpu-power-telemetry.md)
 - [Component Performance Dashboard](component-dashboard.md)
 - [SLURM FAQ](slurm-faq.md)
 
 ## Reference
 
 - [Status API Spec](status-api-spec.md)
+- [Legacy (v1) layout](legacy-v1.md)

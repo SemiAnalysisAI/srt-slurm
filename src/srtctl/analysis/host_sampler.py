@@ -24,7 +24,7 @@ processes. It deliberately does NOT try to reach the worker nodes: that would ne
 srun round-trip per sample, which is exactly the cost the scraper's opt-in exists to
 avoid.
 
-Best-effort by construction, matching ``metrics_scraper``: every failure is logged and
+Best-effort by construction: every failure is logged and
 swallowed. Host telemetry is observability, never a dependency of the benchmark path.
 """
 
@@ -81,6 +81,33 @@ def _meminfo() -> dict:
         if k in ("MemTotal", "MemAvailable"):
             with contextlib.suppress(IndexError, ValueError):
                 out[k] = int(rest.split()[0])  # kB
+    return out
+
+
+def _pressure() -> dict:
+    """PSI stall totals from ``/proc/pressure/{cpu,memory,io}``.
+
+    The optional sampler reads the local sweep/orchestrator host only; it does
+    not collect PSI from a separately placed frontend. Worker-node PSI is
+    collected independently by node_exporter's pressure collector.
+
+    Values are cumulative ``total=`` microseconds. Consumers can difference
+    consecutive samples over their analysis window. Missing or unreadable
+    PSI files leave the corresponding resource absent, rather than zero.
+    """
+    out: dict = {}
+    for resource in ("cpu", "memory", "io"):
+        txt = _read(f"/proc/pressure/{resource}")
+        if not txt:
+            continue
+        for line in txt.splitlines():
+            kind = line.split(" ", 1)[0]  # "some" or "full"
+            if kind not in ("some", "full"):
+                continue
+            for field in line.split():
+                if field.startswith("total="):
+                    with contextlib.suppress(ValueError):
+                        out[f"{resource}_{kind}_total_us"] = int(field.split("=", 1)[1])
     return out
 
 
@@ -223,6 +250,7 @@ class HostSampler:
                             "cpu_total_jiffies": cpu[1] if cpu else None,
                             "loadavg": (_read("/proc/loadavg") or "").split()[:3],
                             "mem": _meminfo(),
+                            "psi": _pressure(),
                             "fd_limit": fd_limit,
                             "established_conns": _established_connections(),
                             "procs": [s for s in (_proc_sample(p) for p in _interesting_pids()) if s],
@@ -240,18 +268,21 @@ class HostSampler:
 def try_start_host_sampler(log_dir: Path, observability, stop_event: threading.Event) -> HostSampler | None:
     """Start the sampler if ``observability`` opts in, else return ``None``.
 
-    Single entry point for :class:`BenchmarkStageMixin`, matching
-    :func:`srtctl.analysis.metrics_scraper.try_start_raw_scraper`. All failures are
+    Single entry point for :class:`BenchmarkStageMixin`. All failures are
     logged and swallowed -- host telemetry never blocks a benchmark.
 
-    Gated on the same ``scraper_enabled`` knob rather than a new one: it answers the
+    Gated on ``observability.enabled`` rather than a new knob: it answers the
     same question (is this run capturing observability?) and a second switch would let a
     run be half-instrumented in a way nobody intends.
     """
-    if getattr(observability, "scraper_enabled", False) is not True:
+    if getattr(observability, "enabled", False) is not True:
         return None
     try:
-        s = HostSampler(log_dir)
+        # One cadence knob for the whole capture stack: follow the tachometer
+        # scrape interval (HostSampler floors it at 1.0s internally).
+        tachometer = getattr(observability, "tachometer", None)
+        interval_ms = getattr(tachometer, "collect_interval_ms", 1000) if tachometer else 1000
+        s = HostSampler(log_dir, interval_seconds=interval_ms / 1000.0)
         s.start(stop_event)
         return s
     except Exception as exc:  # noqa: BLE001 - best effort

@@ -38,6 +38,7 @@ from srtctl.backends import (
     BackendConfig,
     MockerProtocol,
     SGLangProtocol,
+    TileRTProtocol,
     TRTLLMProtocol,
     VLLMProtocol,
 )
@@ -394,7 +395,7 @@ class BackendConfigField(fields.Field):
             # Default to SGLang
             return SGLangProtocol()
 
-        if isinstance(value, SGLangProtocol | TRTLLMProtocol | VLLMProtocol | MockerProtocol):
+        if isinstance(value, SGLangProtocol | TRTLLMProtocol | VLLMProtocol | MockerProtocol | TileRTProtocol):
             return value
 
         if not isinstance(value, dict):
@@ -412,12 +413,14 @@ class BackendConfigField(fields.Field):
         elif backend_type == "vllm":
             schema = VLLMProtocol.Schema()
             return schema.load(value)
+        elif backend_type == "tilert":
+            return TileRTProtocol.Schema().load(value)
         elif backend_type == "mocker":
             schema = MockerProtocol.Schema()
             return schema.load(value)
         else:
             raise ValidationError(
-                f"Unknown backend type: {backend_type!r}. Supported types: sglang, trtllm, vllm, mocker"
+                f"Unknown backend type: {backend_type!r}. Supported types: sglang, trtllm, vllm, mocker, tilert"
             )
 
     def _serialize(self, value: Any | None, attr: str | None, obj: Any, **kwargs) -> Any:
@@ -426,6 +429,8 @@ class BackendConfigField(fields.Field):
             return None
         if isinstance(value, SGLangProtocol):
             return SGLangProtocol.Schema().dump(value)
+        if isinstance(value, TileRTProtocol):
+            return TileRTProtocol.Schema().dump(value)
         if isinstance(value, TRTLLMProtocol):
             return TRTLLMProtocol.Schema().dump(value)
         if isinstance(value, VLLMProtocol):
@@ -1931,7 +1936,7 @@ class FrontendConfig:
 
     Attributes:
         type: Frontend type - "dynamo" (default); "sglang-router" (SGLang Model
-            Gateway) and "vllm-router" (static routers); "sglang", "vllm", and
+            Gateway), "vllm-router", and "tilert-router" (static routers); "sglang", "vllm", and
             "trtllm_serve" (direct: the single aggregate worker binds the public
             port, no router process). In schema 1 recipes "sglang" still means
             the router and loads as "sglang-router".
@@ -2133,6 +2138,8 @@ class SrtConfig:
         self._validate_vllm_frontend()
         self._validate_sglang_direct_frontend()
         self._validate_static_router_frontend()
+        if isinstance(self.backend, TileRTProtocol):
+            self.backend.validate_recipe(self)
         self._validate_dynamo_sidecar()
         self._validate_host_setup()
         self._validate_benchmark_type()
@@ -2331,7 +2338,9 @@ class SrtConfig:
 
     def _validate_static_router_frontend(self):
         """Validate static-router/backend pairings and vLLM DP ownership."""
-        required_backend = {"sglang-router": "sglang", "vllm-router": "vllm"}.get(self.frontend.type)
+        required_backend = {"sglang-router": "sglang", "vllm-router": "vllm", "tilert-router": "tilert"}.get(
+            self.frontend.type
+        )
         if required_backend is None:
             return
         if self.backend_type != required_backend:
@@ -2340,6 +2349,13 @@ class SrtConfig:
                 f"got {self.backend_type!r}"
             )
 
+        if self.frontend.type == "tilert-router":
+            from srtctl.frontends.tilert_router import TileRTRouterFrontend
+
+            try:
+                TileRTRouterFrontend().get_managed_frontend_args(self, self.backend, [])
+            except ValueError as error:
+                raise ValidationError(str(error)) from error
         if self.frontend.type != "vllm-router":
             return
         if not isinstance(self.backend, VLLMProtocol):

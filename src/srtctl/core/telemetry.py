@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -48,6 +49,8 @@ def generate_tachometer_config(
     dcgm_exporter: TelemetryExporterConfig | None = None,
     frontend_type: str = "dynamo",
     frontend_metrics_port: int | None = None,
+    worker_metrics_port: Callable[[Process], int | None] | None = None,
+    frontend_metrics_enabled: bool = True,
 ) -> str:
     """Generate Tachometer TOML from backend and frontend topology.
 
@@ -138,7 +141,12 @@ def generate_tachometer_config(
             # the HTTP server that carries /metrics.
             continue
         node_ip = get_hostname_ip(process.node, runtime.network_interface)
-        if frontend_type in ("vllm", "sglang") and process.endpoint_mode == "agg":
+        if worker_metrics_port is not None:
+            selected_port = worker_metrics_port(process)
+            if selected_port is None:
+                continue
+            port = selected_port
+        elif frontend_type in ("vllm", "sglang") and process.endpoint_mode == "agg":
             # Direct modes: the aggregate leader binds the public port itself.
             port = FRONTEND_PUBLIC_PORT
         elif frontend_type in ("vllm-router", "trtllm_serve", "sglang-router"):
@@ -163,7 +171,7 @@ def generate_tachometer_config(
             )
         )
 
-    frontend_nodes = frontend_topology.frontend_nodes
+    frontend_nodes = frontend_topology.frontend_nodes if frontend_metrics_enabled else []
     if frontend_type in ("vllm", "sglang"):
         # Direct vLLM / SGLang have no separate frontend process. The public endpoint is
         # the aggregate leader, which may differ from the Slurm/orchestrator

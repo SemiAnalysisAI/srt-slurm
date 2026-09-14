@@ -13,7 +13,7 @@ Top-level keys of a recipe YAML.
 | `name` | str | required |  |
 | `model` | [ModelConfig](#modelconfig) | required |  |
 | `resources` | [ResourceConfig](#resourceconfig) | required |  |
-| `engine` | str \| mapping | required | The engine type (`sglang`, `trtllm`, `vllm`, `mocker`) as a string, or a mapping with `type` plus the engine-wide knobs listed under [Engine types](#engine-types). |
+| `engine` | str \| mapping | required | The engine type (`sglang`, `trtllm`, `vllm`, `mocker`, `tilert`) as a string, or a mapping with `type` plus the engine-wide knobs listed under [Engine types](#engine-types). |
 | `roles` | mapping of role -> [Role](#roles) | required | One block per worker role (`prefill`, `decode`, `agg`): topology, env, and engine args. |
 | `schema` | int | `2` | Recipe schema version. Write `schema: 2` for this layout. |
 | `slurm` | [SlurmConfig](#slurmconfig) | `SlurmConfig()` |  |
@@ -44,7 +44,7 @@ Three vocabularies are specific to the 2.0 layout. They are normalized into the 
 
 ### engine
 
-`engine: <type>` or `engine: {type: <type>, ...}`. `type` is one of `sglang`, `trtllm`, `vllm`, `mocker`; the remaining keys are that engine's knobs, listed under [Engine types](#engine-types).
+`engine: <type>` or `engine: {type: <type>, ...}`. `type` is one of `sglang`, `trtllm`, `vllm`, `mocker`, `tilert`; the remaining keys are that engine's knobs, listed under [Engine types](#engine-types).
 
 ### roles
 
@@ -112,7 +112,7 @@ Frontend/router configuration.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `type` | str | `'dynamo'` | Frontend type - "dynamo" (default); "sglang-router" (SGLang Model Gateway) and "vllm-router" (static routers); "sglang", "vllm", and "trtllm_serve" (direct: the single aggregate worker binds the public port, no router process). In schema 1 recipes "sglang" still means the router and loads as "sglang-router". |
+| `type` | str | `'dynamo'` | Frontend type - "dynamo" (default); "sglang-router" (SGLang Model Gateway), "vllm-router", and "tilert-router" (static routers); "sglang", "vllm", and "trtllm_serve" (direct: the single aggregate worker binds the public port, no router process). In schema 1 recipes "sglang" still means the router and loads as "sglang-router". |
 | `enable_multiple_frontends` | bool | `True` | Scale with nginx + multiple routers. When ``True`` (default), srtctl stands up nginx and fans out to ``num_additional_frontends + 1`` router replicas. When ``False``, there is NO nginx proxy — the benchmark must target the single master router (or a worker) directly at ``http://localhost:<port>``. ``benchmark.command`` has no placeholder substitution, so write the URL out literally. |
 | `num_additional_frontends` | int | `9` | Additional routers beyond master (default: 9) |
 | `nginx_container` | str | `'nginx:1.27.4'` | Custom nginx container image (default: nginx:1.27.4) |
@@ -594,6 +594,27 @@ Dynamo Mocker protocol - implements BackendProtocol.
 | `enable_prefix_caching` | bool | `True` |  |
 | `enable_chunked_prefill` | bool | `True` |  |
 | `preemption_mode` | str \| None | `None` |  |
+
+### TileRTProtocol
+
+`engine.type: tilert`
+
+Run vLLM prefill workers and TileRT decode workers without Dynamo.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `type` | one of `'tilert'` | `'tilert'` |  |
+| `served_model_name` | str \| None | `None` | OpenAI model name; defaults to the final component of model.path. |
+| `prefill_container` | str \| None | `None` | vLLM image or cluster container alias for prefill workers only. |
+| `model_profile` | str | `'glm5'` | TileRT P/D model profile (for example glm5). |
+| `weight_model_type` | str | `'glm-5'` | Model type passed to the TileRT weight converter. |
+| `weights_dir` | str | `'/tilert_weights/converted'` | Dedicated shared converted-weight directory, mounted at this path in all decode containers. |
+| `max_seq_len` | int | `202752` | Maximum sequence length shared by prefill and decode. |
+| `kv_cache_dtype` | str | `'fp8'` | TileRT decode KV cache dtype. |
+| `prefill_kv_cache_dtype` | str | `'fp8_ds_mla'` | vLLM KV cache dtype; must be wire-compatible with the decode dtype. |
+| `transport` | one of `'nixl'` | `'nixl'` | KV transfer transport (the adapter supports NIXL). |
+| `with_mtp` | bool | `True` | Enable MTP on both sides of the P/D transfer. |
+| `speculative_tokens` | int | `1` | Number of speculative tokens advertised by vLLM prefill. |
 
 ## Cluster config
 

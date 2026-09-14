@@ -40,6 +40,7 @@ Recipes without `schema: 2` (or with `schema: 1`) use the pre-2.0 layout: worker
 | `backend.trtllm_config` | `roles.<role>.args` (one mapping per role; the `prefill` / `decode` / `aggregated` keys) |
 | `backend.vllm_config` | `roles.<role>.args` (one mapping per role; the `prefill` / `decode` / `aggregated` keys) |
 | `backend.mocker_config` | `roles.<role>.args` (one mapping per role; the `prefill` / `decode` / `aggregated` keys) |
+| `backend.tilert_config` | `roles.<role>.args` (one mapping per role; the `prefill` / `decode` / `aggregated` keys) |
 
 ## v1 values that changed meaning
 
@@ -144,6 +145,16 @@ These keys exist in both layouts, but the value means something else in 2.0. A s
 | `aggregated_environment` | dict[str, str] | `{}` |  |
 | `mocker_config` | [MockerServerConfig](#mockerserverconfig) \| None | `None` | Per-mode CLI overrides |
 
+### TileRTProtocol
+
+`backend.type: tilert`
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `prefill_environment` | dict[str, str] | `{}` |  |
+| `decode_environment` | dict[str, str] | `{}` |  |
+| `tilert_config` | [TileRTServerConfig](#tilertserverconfig) \| None | `None` |  |
+
 ### SGLangServerConfig
 
 SGLang server CLI configuration per mode (prefill/decode/aggregated).
@@ -204,6 +215,15 @@ Mocker CLI configuration per mode (prefill/decode/aggregated).
 | `prefill` | dict[str, Any] \| None | `None` |  |
 | `decode` | dict[str, Any] \| None | `None` |  |
 | `aggregated` | dict[str, Any] \| None | `None` |  |
+
+### TileRTServerConfig
+
+Role-specific CLI arguments not owned by the topology adapter.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `prefill` | dict[str, Any] \| None | `None` |  |
+| `decode` | dict[str, Any] \| None | `None` |  |
 
 ## infra
 

@@ -17,6 +17,7 @@ import pytest
 from srtctl.cli.do_sweep import SweepOrchestrator
 from srtctl.cli.mixins.benchmark_stage import BenchmarkStageMixin
 from srtctl.cli.mixins.telemetry_stage import TelemetryStageMixin
+from srtctl.backends import SGLangProtocol
 from srtctl.core.power.contract import MANIFEST_FILENAME, SAMPLES_FILENAME, WINDOWS_DIRNAME, Reason
 from srtctl.core.power.manifest import ExpectedWindow
 from srtctl.core.power.samples import read_samples
@@ -799,6 +800,7 @@ class TestRequiredReadinessGate:
 
     def _orchestrator(self, tmp_path, *, required, ready):
         config = MagicMock()
+        config.backend = SGLangProtocol()
         config.telemetry.enabled = True
         config.telemetry.required = required
         config.telemetry.cpu_power_exporter = None

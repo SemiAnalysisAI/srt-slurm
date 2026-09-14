@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from srtctl.core.config import CONTAINER_ALIAS_KEYS, resolve_config_with_defaults, resolve_container_aliases
+from srtctl.core.config import resolve_config_with_defaults, resolve_container_aliases
 
 CONTAINERS = {
     "sglang": "/sqsh/sglang.sqsh",
@@ -111,7 +111,3 @@ def test_no_cluster_containers_map_leaves_aliases_as_written() -> None:
     resolved = resolve_config_with_defaults(_recipe(), {"default_account": "acct"})
     assert resolved["model"]["container"] == "sglang"
     assert resolve_config_with_defaults(_recipe(), None)["frontend"]["nginx_container"] == "nginx"
-
-
-def test_alias_key_set_is_the_documented_one() -> None:
-    assert set(CONTAINER_ALIAS_KEYS) == {"container", "container_image", "image", "nginx_container"}

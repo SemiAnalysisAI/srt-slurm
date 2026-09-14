@@ -32,6 +32,12 @@ Every example is written in the 2.0 layout: `engine:` names the engine (a string
 | `features/infra-services.yaml` | etcd and NATS as declared services on a dedicated node with a NATS payload limit; the implied exporters overridden or switched off |
 | `features/dynamo-source.yaml` | `dynamo.source:` building Dynamo from a git tag (or a PR head via `--set dynamo.source.rev=refs/pull/<n>/head`), pinned to a commit at submit |
 
+## TileRT
+
+`tilert/glm5-disagg.yaml` runs vLLM prefill and TileRT decode with a native
+TileRT router on two B200 nodes. See [the TileRT guide](../docs/tilert.md) for
+image and shared converted-weight mount requirements.
+
 ## Cluster aliases
 
 The examples reference two kinds of aliases that `srtslurm.yaml` resolves:

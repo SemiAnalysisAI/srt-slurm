@@ -289,10 +289,27 @@ with patch.dict(os.environ, H100Rack.slurm_env()):
    - `build_worker_command(process, runtime)` - Command construction
 3. Export from `backends/__init__.py`
 4. Add polymorphic deserialization in `BackendConfigField` in `schema.py`
+5. Register the per-role argument key in `core/roles.py` and backend class in
+   `core/schema_docs.py`, then regenerate schema docs. Recipes use `engine:` and
+   `roles.<role>.args` / `.env`.
+
+Optional role-image and finite preparation hooks are described in
+[TileRT's extension-point reference](docs/tilert.md#backend-extension-points).
+Keep engine-specific commands in the backend; use the shared worker launcher
+and process registry for lifecycle handling.
 
 **Current backends:**
 - **SGLang**: Per-process srun launching, supports prefill/decode/aggregated modes
 - **TRTLLM**: MPI-style launching (one srun per endpoint with all nodes), prefill/decode only
+
+### Adding a New Frontend
+
+Implement `FrontendProtocol` (or extend `StaticRouterFrontend` for a router with
+explicit worker URLs), export it from `frontends/__init__.py`, and add its factory
+entry in `frontends/base.py`. Validate backend pairing in `SrtConfig`. Supply the
+frontend health parser and direct backend health URLs when router health alone
+is insufficient. Use `start_srun_process` and `ManagedProcess` with matching
+`step_name` values so normal signal cleanup reaches the router.
 
 ### Adding a New Benchmark
 

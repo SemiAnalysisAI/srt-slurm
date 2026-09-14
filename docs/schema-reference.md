@@ -112,7 +112,7 @@ Frontend/router configuration.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `type` | str | `'dynamo'` | Frontend type - "dynamo" (default), "sglang", "vllm-router", "trtllm_serve", or direct "vllm" |
+| `type` | str | `'dynamo'` | Frontend type - "dynamo" (default); "sglang-router" (SGLang Model Gateway) and "vllm-router" (static routers); "sglang", "vllm", and "trtllm_serve" (direct: the single aggregate worker binds the public port, no router process). In schema 1 recipes "sglang" still means the router and loads as "sglang-router". |
 | `enable_multiple_frontends` | bool | `True` | Scale with nginx + multiple routers. When ``True`` (default), srtctl stands up nginx and fans out to ``num_additional_frontends + 1`` router replicas. When ``False``, there is NO nginx proxy — the benchmark must target the single master router (or a worker) directly at ``http://localhost:<port>``. ``benchmark.command`` has no placeholder substitution, so write the URL out literally. |
 | `num_additional_frontends` | int | `9` | Additional routers beyond master (default: 9) |
 | `nginx_container` | str | `'nginx:1.27.4'` | Custom nginx container image (default: nginx:1.27.4) |
@@ -627,3 +627,4 @@ Top-level keys of `srtslurm.yaml`. Recipes inherit these defaults and resolve al
 | `telemetry` | dict \| None | `None` | opaque dict, parsed by try_start_snapshotter |
 | `nginx_raise_ulimit` | bool \| None | `None` | When set, applied to job configs that omit ``frontend.nginx_raise_ulimit``. Clusters that disallow raising nofile for nginx containers should use false. |
 | `git_http_version` | str \| None | `None` | Works around intermittent git smart-HTTP/HTTP2 failures cloning github.com (stalls, or truncated responses git misreports as "could not read Username" auth-prompt failures). See git_clone_command_prefix() in core/config.py -- applied to every git clone/fetch srtctl performs. |
+| `preflight` | bool | `True` | Run the pre-submit model.path / model.container / telemetry filesystem checks on ``srtctl apply``. Set false on clusters whose model or image paths exist only on compute nodes (node-local NVMe such as /raid), where the login node cannot stat them; every apply then behaves as if --no-preflight had been passed. The framework still fails loudly at runtime if a path is genuinely missing on the compute node. |

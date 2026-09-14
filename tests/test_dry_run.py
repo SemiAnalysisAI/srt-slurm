@@ -643,17 +643,18 @@ class TestDryRunServices:
 
     def test_no_services_omits_the_panel(self, capsys):
         # No discovery plane (static frontend), no tachometer: nothing declared, nothing implied.
-        config = _make_config({"frontend": {"type": "sglang"}, "observability": {"tachometer": {"enabled": False}}})
+        config = _make_config({"frontend": {"type": "sglang-router"}, "observability": {"tachometer": {"enabled": False}}})
         show_config_details(config)
         assert "Services:" not in capsys.readouterr().out
 
     def test_implicit_services_are_listed_and_marked(self, capsys):
-        config = _make_config({"frontend": {"type": "dynamo"}})
+        config = _make_config({"frontend": {"type": "dynamo"}, "dynamo": {"request_plane": "nats"}})
         show_config_details(config)
         output = capsys.readouterr().out
         assert "Services:" in output
         assert "etcd" in output and "nats" in output
         assert "implied by: frontend.type dynamo" in output
+        assert "implied by: dynamo.request_plane nats" in output
         assert "/configs/etcd" in output
         assert "dcgm-exporter" in output and "node-exporter" in output
         assert "implied by: observability.tachometer default exporters" in output
@@ -770,7 +771,7 @@ class TestDryRunRemapRoot:
         assert "ENROOT_REMAP_ROOT" in output
 
     def test_remap_root_absent_for_sglang_frontend(self, capsys):
-        config = _make_config({"frontend": {"type": "sglang"}})
+        config = _make_config({"frontend": {"type": "sglang-router"}})
         show_config_details(config)
         output = capsys.readouterr().out
         assert "ENROOT_REMAP_ROOT" not in output

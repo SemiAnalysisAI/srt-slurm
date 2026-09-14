@@ -56,8 +56,7 @@ use_exclusive_sbatch_directive: false # Default: false
 # this with output.record_launch_plan: true.
 record_launch_plan: false
 
-# Container registry
-default_container: "/shared/containers/sglang-latest.sqsh"
+# Container aliases (optional; a recipe may also name the image directly in model.container)
 containers:
   sglang-latest: "/shared/containers/sglang-v0.4.sqsh"
   sglang-dev: "/shared/containers/sglang-dev.sqsh"

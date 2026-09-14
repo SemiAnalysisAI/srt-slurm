@@ -46,6 +46,8 @@ UNAVAILABLE = "unavailable"
 # Used in both native Python probes and the bash capture script.
 FRAMEWORK_PACKAGES: dict[str, str] = {
     "vllm": "vllm",
+    "tilert": "tilert",
+    "nixl": "nixl",
     "sglang": "sglang",
     "tensorrt_llm": "tensorrt-llm",
     "dynamo": "ai-dynamo",

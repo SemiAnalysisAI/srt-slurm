@@ -25,6 +25,7 @@ from srtctl.core.processes import ManagedProcess, ProcessRegistry
 from srtctl.core.schema import TelemetryExporterConfig
 from srtctl.core.slurm import start_srun_process
 from srtctl.core.telemetry import TACHOMETER_STORAGE_PARENT, generate_tachometer_config
+from srtctl.frontends import get_frontend
 
 if TYPE_CHECKING:
     from srtctl.core.runtime import RuntimeContext
@@ -560,6 +561,8 @@ class TelemetryStageMixin:
                 dcgm_exporter=dcgm_exporter,
                 frontend_type=self.config.frontend.type,
                 frontend_metrics_port=self._frontend_metrics_port(),
+                worker_metrics_port=getattr(self.config.backend, "get_metrics_port", None),
+                frontend_metrics_enabled=getattr(get_frontend(self.config.frontend.type), "has_metrics", True),
             )
         )
 

@@ -262,6 +262,16 @@ def show_config_details(config: SrtConfig) -> None:
                         "to avoid confusion (the configured value is ignored)."
                     )
 
+    select_container = getattr(config.backend, "get_container_image_for_mode", None)
+    if select_container is not None:
+        images = Table(title="Worker Containers")
+        images.add_column("Role")
+        images.add_column("Image")
+        for mode in ("prefill", "decode", "agg"):
+            if getattr(config.resources, f"num_{mode}"):
+                images.add_row(mode, select_container(mode, str(config.model.container)))
+        console.print(images)
+
     # --- Container Mounts ---
     mounts_table = Table(title="Container Mounts", show_lines=False, pad_edge=False)
     mounts_table.add_column("Source", style="dim", width=14)

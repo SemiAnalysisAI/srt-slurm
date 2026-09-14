@@ -20,6 +20,7 @@ from srtctl.frontends.base import (
 from srtctl.frontends.dynamo import DynamoFrontend
 from srtctl.frontends.sglang import SGLangRouterFrontend
 from srtctl.frontends.sglang_direct import SGLangFrontend
+from srtctl.frontends.tilert_router import TileRTRouterFrontend
 from srtctl.frontends.trtllm_serve import TRTLLMServeFrontend
 from srtctl.frontends.vllm import VLLMFrontend
 from srtctl.frontends.vllm_router import VLLMRouterFrontend
@@ -31,6 +32,7 @@ __all__ = [
     "SGLangFrontend",
     "SGLangRouterFrontend",
     "TRTLLMServeFrontend",
+    "TileRTRouterFrontend",
     "VLLMFrontend",
     "VLLMRouterFrontend",
     "get_frontend",

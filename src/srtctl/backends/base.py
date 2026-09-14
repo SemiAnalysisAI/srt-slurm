@@ -27,6 +27,7 @@ class BackendType(str, Enum):
     TRTLLM = "trtllm"
     VLLM = "vllm"
     MOCKER = "mocker"
+    TILERT = "tilert"
 
 
 @dataclass
@@ -47,6 +48,18 @@ class SrunConfig:
     cpu_bind: str | None = None
 
 
+@dataclass(frozen=True)
+class BackendPreparation:
+    """One synchronous backend-owned preparation step before worker launch."""
+
+    command: list[str]
+    node: str
+    mode: str
+    log_name: str
+    timeout_seconds: int = 21600
+    gpus_per_task: int | None = None
+
+
 class BackendProtocol(Protocol):
     """Protocol that all backend configurations must implement.
 
@@ -55,6 +68,11 @@ class BackendProtocol(Protocol):
     1. Allocating logical endpoints (serving units)
     2. Converting endpoints to physical processes
     3. Building commands to start those processes
+
+    Optional hooks supported by the worker/telemetry stages (backends without
+    them retain the defaults): get_container_image_for_mode(mode, default),
+    get_preparation(runtime, processes) -> BackendPreparation | None, and
+    get_metrics_port(process) -> int | None. See docs/tilert.md.
     """
 
     @property

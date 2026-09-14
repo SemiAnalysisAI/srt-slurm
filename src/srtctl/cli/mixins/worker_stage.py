@@ -9,6 +9,7 @@ Handles starting backend worker processes (prefill/decode/agg).
 
 import logging
 import shlex
+import subprocess
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, Any
@@ -22,6 +23,7 @@ from srtctl.ports import KV_EVENTS_PORT_BASE, KVBM_ZMQ_PORT_BASE
 from srtctl.services.implicit import discovery_env
 
 if TYPE_CHECKING:
+    from srtctl.core.processes import ProcessRegistry
     from srtctl.core.runtime import RuntimeContext
     from srtctl.core.schema import SrtConfig
     from srtctl.core.topology import Endpoint, Process
@@ -155,6 +157,60 @@ class WorkerStageMixin:
             environment.setdefault("SGLANG_PYSPY_DUMP_BEFORE_CRASH", "0")
         return environment
 
+    def _worker_container(self, mode: str) -> str:
+        """Resolve an optional backend-owned role image; default to model.container."""
+        select = getattr(self.backend, "get_container_image_for_mode", None)
+        default = str(self.runtime.container_image)
+        return select(mode, default) if select is not None else default
+
+    def prepare_backend(self, registry: "ProcessRegistry") -> None:
+        """Run an optional backend preparation step through the normal Slurm lifecycle."""
+        prepare = getattr(self.backend, "get_preparation", None)
+        preparation = prepare(self.runtime, self.backend_processes) if prepare is not None else None
+        if preparation is None:
+            return
+        process = next(
+            item
+            for item in self.backend_processes
+            if item.node == preparation.node and item.endpoint_mode == preparation.mode
+        )
+        environment = self._get_worker_environment_for_mode(preparation.mode)
+        environment.update(self.runtime.environment)
+        environment.update(self.backend.get_process_environment(process))
+        options = dict(self.runtime.srun_options)
+        if preparation.gpus_per_task is not None:
+            options["gpus-per-task"] = str(preparation.gpus_per_task)
+        log_path = self.runtime.log_dir / preparation.log_name
+        step_name = "backend_preparation"
+        proc = start_srun_process(
+            command=preparation.command,
+            nodelist=[preparation.node],
+            output=str(log_path),
+            container_image=self._worker_container(preparation.mode),
+            container_mounts=self.runtime.container_mounts,
+            env_to_set=environment,
+            bash_preamble=self._build_worker_preamble(),
+            srun_options=options,
+            het_group=process.het_group,
+            step_name=step_name,
+        )
+        managed = ManagedProcess(
+            name=step_name,
+            popen=proc,
+            log_file=log_path,
+            node=preparation.node,
+            critical=True,
+            step_name=step_name,
+        )
+        registry.add_process(managed)
+        try:
+            return_code = proc.wait(timeout=preparation.timeout_seconds)
+        except subprocess.TimeoutExpired as error:
+            managed.terminate()
+            raise RuntimeError(f"Backend preparation timed out; see {log_path}") from error
+        if return_code != 0:
+            raise RuntimeError(f"Backend preparation failed with exit code {return_code}; see {log_path}")
+
     def start_worker(self, process: "Process", endpoint_processes: list["Process"]) -> ManagedProcess:
         """Start a single worker process (one srun per node, used by SGLang)."""
         mode = process.endpoint_mode
@@ -277,7 +333,7 @@ class WorkerStageMixin:
             command=cmd,
             nodelist=[process.node],
             output=str(worker_log),
-            container_image=str(self.runtime.container_image),
+            container_image=self._worker_container(mode),
             container_mounts=self.runtime.container_mounts,
             env_to_set=env_to_set,
             env_to_unset=env_to_unset,
@@ -438,7 +494,7 @@ class WorkerStageMixin:
             ntasks=total_gpus,
             nodelist=endpoint_nodes,
             output=str(worker_log),
-            container_image=str(self.runtime.container_image),
+            container_image=self._worker_container(mode),
             container_mounts=self.runtime.container_mounts,
             env_to_set=env_to_set,
             bash_preamble=bash_preamble,

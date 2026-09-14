@@ -669,6 +669,8 @@ class SweepOrchestrator(
             if self.runtime.staged_model_path is not None:
                 self._stage_model()
 
+            self.prepare_backend(registry)
+
             # Stage 2: Workers
             reporter.report(JobStatus.WORKERS, JobStage.WORKERS, "Starting workers")
             worker_procs = self.start_all_workers()

@@ -57,6 +57,7 @@ ENGINE_CONFIG_KEY: dict[str, str] = {
     "vllm": "vllm_config",
     "trtllm": "trtllm_config",
     "mocker": "mocker_config",
+    "tilert": "tilert_config",
 }
 _ALL_ENGINE_CONFIG_KEYS = frozenset(ENGINE_CONFIG_KEY.values())
 

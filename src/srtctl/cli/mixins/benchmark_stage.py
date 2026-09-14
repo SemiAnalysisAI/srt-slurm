@@ -643,7 +643,14 @@ class BenchmarkStageMixin:
         # OpenAI port (GET /metrics there is JSON iteration stats, not
         # exposition text); every other frontend serves it at /metrics.
         metrics_path = "/prometheus/metrics" if self.config.frontend.type == "trtllm_serve" else "/metrics"
-        if logical_workers_only:
+        metrics_port = getattr(self.config.backend, "get_metrics_port", None)
+        if metrics_port is not None:
+            for process in self.backend_processes:
+                port = metrics_port(process)
+                if port is not None and port > 0:
+                    host = get_hostname_ip(process.node, self.runtime.network_interface)
+                    urls.append(f"http://{host}:{port}{metrics_path}")
+        elif logical_workers_only:
             if logical_endpoints is None:
                 logical_endpoints = self._logical_worker_endpoints()
             # Sidecars use native worker commands, so publish_metrics does not

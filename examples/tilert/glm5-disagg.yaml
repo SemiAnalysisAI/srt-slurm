@@ -1,0 +1,65 @@
+# Native vLLM prefill + TileRT decode, one 8-GPU B200 node per role.
+# Mount a shared writable directory at /tilert_weights on every node.
+# See docs/tilert.md for images, setup, and cache requirements.
+schema: 2
+name: glm5-tilert-disagg
+
+model:
+  path: hf:zai-org/GLM-5.1-FP8
+  container: ghcr.io/tile-ai/tilert:0.1.5
+  precision: fp8
+
+identity:
+  model:
+    repo: zai-org/GLM-5.1-FP8
+    revision: f396cf805182f4ca10fa675e1a99815b3ca384db
+  container:
+    image: ghcr.io/tile-ai/tilert:0.1.5
+  frameworks:
+    tilert: 0.1.5.post3
+    vllm: 0.26.0
+    nixl: 1.3.1
+
+resources:
+  gpu_type: b200
+  gpus_per_node: 8
+
+engine:
+  type: tilert
+  prefill_container: vllm/vllm-openai:v0.26.0
+  model_profile: glm5
+  weight_model_type: glm-5
+  weights_dir: /tilert_weights/glm5.1-fp8
+  max_seq_len: 202752
+  with_mtp: true
+
+roles:
+  prefill:
+    nodes: 1
+    workers: 1
+    gpus: 8
+    args:
+      enforce-eager: true
+      trust-remote-code: true
+      gpu-memory-utilization: 0.75
+  decode:
+    nodes: 1
+    workers: 1
+    gpus: 8
+
+frontend:
+  type: tilert-router
+  enable_multiple_frontends: false
+  args:
+    parser: none
+    queue-timeout: 1800
+
+setup_script: tilert_setup.sh
+srun_options:
+  container-writable: ""
+health_check:
+  max_attempts: 720
+  interval_seconds: 5
+
+benchmark:
+  type: manual

@@ -47,6 +47,8 @@ from srtctl.backends import (
     MockerServerConfig,
     SGLangProtocol,
     SGLangServerConfig,
+    TileRTProtocol,
+    TileRTServerConfig,
     TRTLLMProtocol,
     TRTLLMServerConfig,
     VLLMProtocol,
@@ -83,6 +85,7 @@ BACKEND_TYPES: tuple[tuple[str, type], ...] = (
     ("trtllm", TRTLLMProtocol),
     ("vllm", VLLMProtocol),
     ("mocker", MockerProtocol),
+    ("tilert", TileRTProtocol),
 )
 _BACKEND_CLASSES: set[type] = {cls for _, cls in BACKEND_TYPES}
 
@@ -103,7 +106,7 @@ _V2_TOP_LEVEL_ROWS = (
         type_label="str \\| mapping",
         default="required",
         description=(
-            "The engine type (`sglang`, `trtllm`, `vllm`, `mocker`) as a string, or a mapping with `type` "
+            "The engine type (`sglang`, `trtllm`, `vllm`, `mocker`, `tilert`) as a string, or a mapping with `type` "
             "plus the engine-wide knobs listed under [Engine types](#engine-types)."
         ),
     ),
@@ -398,6 +401,7 @@ LEGACY_FIELDS: dict[type, dict[str, str]] = {
     SGLangProtocol: _present(SGLangProtocol, _backend_legacy_fields(ENGINE_CONFIG_KEY["sglang"])),
     TRTLLMProtocol: _present(TRTLLMProtocol, _backend_legacy_fields(ENGINE_CONFIG_KEY["trtllm"])),
     VLLMProtocol: _present(VLLMProtocol, _backend_legacy_fields(ENGINE_CONFIG_KEY["vllm"])),
+    TileRTProtocol: _present(TileRTProtocol, _backend_legacy_fields(ENGINE_CONFIG_KEY["tilert"])),
     MockerProtocol: _present(MockerProtocol, _backend_legacy_fields(ENGINE_CONFIG_KEY["mocker"])),
 }
 
@@ -415,6 +419,7 @@ LEGACY_CLASSES: frozenset[type] = frozenset(
         TRTLLMServerConfig,
         VLLMServerConfig,
         MockerServerConfig,
+        TileRTServerConfig,
         MooncakeKVStoreConfig,
         VLLMMooncakeKVStoreConfig,
     }

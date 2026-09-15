@@ -1072,6 +1072,24 @@ class TestSetupScript:
         )
         assert 'export SRTCTL_SETUP_SCRIPT="install-sglang-main.sh"' in script
 
+    def test_sbatch_template_accepts_node_local_runtime_source(self, monkeypatch):
+        """A login-node submission can target a separately staged compute checkout."""
+        from pathlib import Path
+
+        from srtctl.cli.submit import generate_minimal_sbatch_script
+        from srtctl.core.schema import ModelConfig, ResourceConfig, SrtConfig
+
+        config = SrtConfig(
+            name="test",
+            model=ModelConfig(path="/model", container="/container.sqsh", precision="fp8"),
+            resources=ResourceConfig(gpu_type="mi300x", gpus_per_node=1, agg_nodes=1),
+        )
+        monkeypatch.setenv("SRTCTL_RUNTIME_SOURCE_DIR", "/raid/runtime/srt-slurm")
+
+        script = generate_minimal_sbatch_script(config, Path("/tmp/test.yaml"))
+
+        assert 'SRTCTL_SOURCE="/raid/runtime/srt-slurm"' in script
+
     def test_sbatch_template_prefetches_dynamo_wheel(self):
         """dynamo.wheel is exported and prefetched before orchestrator launch."""
         from pathlib import Path

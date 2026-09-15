@@ -258,32 +258,52 @@ class TestDynamoConfig:
         assert "git clone" not in cmd
 
     def test_install_command_serialized_with_flock(self):
-        """Install command is wrapped in a per-environment flock + sentinel.
+        """Install command is wrapped in a writable per-job flock + sentinel.
 
         With --ntasks-per-node > 1 (e.g. TRTLLM), co-located tasks race
         concurrent pip installs into the shared container site-packages. The
-        wrapper serializes them and lets tasks after the first skip. The lock
-        is anchored in the Python env (sys.prefix), NOT /tmp, so co-located
-        containers with a bind-mounted /tmp don't collide.
+        wrapper serializes them and lets tasks after the first skip. Frontend
+        and worker steps on the same node share it, while job identity prevents
+        distinct sweeps from sharing a sentinel.
         """
         from srtctl.core.schema import DynamoConfig
 
-        for config in (
-            DynamoConfig(version="0.8.0"),
-            DynamoConfig(wheel="1.2.0.dev20260426"),
+        for cmd in (
+            DynamoConfig(version="0.8.0").get_install_commands(),
+            DynamoConfig(wheel="1.2.0.dev20260426").get_install_commands(),
         ):
-            cmd = config.get_install_commands()
-            # Lock dir resolved from the active Python env, not /tmp.
-            assert "sys.prefix" in cmd
-            assert "/tmp/srtctl_dynamo_install" not in cmd
+            assert "sys.prefix" not in cmd
             # FD 200 node-local; the hash source install nests flock -x 201 on
             # the /configs cache lock; distinct FDs keep the locks independent.
             assert "flock -x 200" in cmd
-            assert "$DYN_LOCK_DIR/.srtctl_dynamo_install.lock" in cmd
-            assert "$DYN_LOCK_DIR/.srtctl_dynamo_install.complete" in cmd
+            assert "$DYN_INSTALL_DIR/.srtctl_dynamo_install.lock" in cmd
+            assert "$DYN_INSTALL_DIR/.srtctl_dynamo_install.complete" in cmd
             # Sentinel short-circuits repeat installs; touched on success.
-            assert 'touch "$DYN_LOCK_DIR/.srtctl_dynamo_install.complete"' in cmd
-            assert '200>"$DYN_LOCK_DIR/.srtctl_dynamo_install.lock"' in cmd
+            assert 'touch "$DYN_INSTALL_DIR/.srtctl_dynamo_install.complete"' in cmd
+            assert '200>"$DYN_INSTALL_DIR/.srtctl_dynamo_install.lock"' in cmd
+
+        release_cmd = DynamoConfig(version="0.8.0").get_install_commands()
+        assert 'DYN_INSTALL_DIR="/logs/.srtctl-dynamo-${SLURM_JOB_ID:-job}"' in release_cmd
+        assert "SLURM_STEP_ID" not in release_cmd
+        assert 'mkdir -p "$DYN_SITE_PACKAGES"' in release_cmd
+        assert 'export PYTHONPATH="$DYN_SITE_PACKAGES${PYTHONPATH:+:$PYTHONPATH}"' in release_cmd
+
+        wheel_cmd = DynamoConfig(wheel="1.2.0.dev20260426").get_install_commands()
+        assert "${XDG_RUNTIME_DIR:-/tmp}" in wheel_cmd
+        assert "${SLURM_JOB_ID:-job}-${SLURM_STEP_ID:-step}" in wheel_cmd
+        assert 'mkdir -p "$DYN_INSTALL_DIR"' in wheel_cmd
+        assert "DYN_SITE_PACKAGES" not in wheel_cmd
+        assert "PYTHONPATH" not in wheel_cmd
+
+    def test_release_install_targets_job_local_site_packages(self):
+        """Stable Dynamo releases must not write the immutable container root/home."""
+        from srtctl.core.schema import DynamoConfig
+
+        cmd = DynamoConfig(version="1.3.1").get_install_commands()
+
+        assert 'python3 -m pip install --quiet --upgrade --no-deps --target "$DYN_SITE_PACKAGES"' in cmd
+        assert "--break-system-packages" not in cmd
+        assert "/root/.local" not in cmd
 
     def test_hash_install_command(self):
         """Hash config generates a cache-aware source-install command.

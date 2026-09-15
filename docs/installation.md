@@ -51,6 +51,11 @@ If you are trying to deploy onto Grace (GH200, GB200, etc.), you need to use the
 make setup ARCH=aarch64  # or ARCH=x86_64
 ```
 
+Native-router jobs without telemetry or services requiring setup binaries can
+use `make setup-compute ARCH=x86_64` to install only the compute-side `uv`.
+Provide `srtslurm.yaml` separately. Setup validation checks the services the
+recipe actually launches; use full `make setup` for the default telemetry.
+
 Observe an existing job with `srtctl wait JOB_ID --log-file PATH`. It streams
 the shared log and returns the terminal job status, without cancelling jobs.
 

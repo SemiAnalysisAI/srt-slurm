@@ -4,6 +4,7 @@ import base64
 import re
 from pathlib import Path
 
+
 def test_shared_filesystem_runtime_config_transport_is_unchanged(monkeypatch) -> None:
     from srtctl.cli import submit
     from srtctl.core.schema import ModelConfig, ResourceConfig, SrtConfig

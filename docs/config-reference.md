@@ -135,6 +135,7 @@ The `srtslurm.yaml` file can contain the following fields:
 | `default_gpu_type`              | string | Default `resources.gpu_type` for recipes that omit it |
 | `network_interface`             | string | Network interface for NCCL                            |
 | `accelerator_vendor`            | string | GPU runtime: `nvidia` (default) or `amd` |
+| `runtime_config_transport`      | string | `shared-filesystem` (default) or `embedded` for node-local output paths |
 | `srtctl_root`                   | string | Root directory for srtctl                             |
 | `output_dir`                    | string | Custom output directory (overrides srtctl_root/outputs) |
 | `model_paths`                   | dict   | Model path aliases                                    |
@@ -219,6 +220,17 @@ model:
 ---
 
 ## engine
+
+For node-local output paths, `runtime_config_transport: embedded` embeds the
+resolved recipe and cluster profile as inert data in the batch script. Slurm
+script readers can decode it; this transport is not a secrets store.
+For shared storage, leave the default transport unchanged. A separate
+compute-side checkout can be selected with `SRTCTL_RUNTIME_SOURCE_DIR`; set
+`output_dir` explicitly when using different submitter and compute roots.
+
+GPU scheduling uses upstream's existing cluster settings. For eight-GPU
+allocations on GRES-only clusters, set `use_gpus_per_node_directive: false`
+and `default_sbatch_directives: {gres: "gpu:8"}`.
 
 ### GPU visibility on AMD
 

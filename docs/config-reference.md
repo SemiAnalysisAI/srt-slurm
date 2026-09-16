@@ -225,6 +225,10 @@ model:
 
 ## engine
 
+GPU scheduling uses upstream's existing cluster settings. For eight-GPU
+allocations on GRES-only clusters, set `use_gpus_per_node_directive: false`
+and `default_sbatch_directives: {gres: "gpu:8"}`.
+
 ### GPU visibility on AMD
 
 Set `visible_devices_env: ROCR_VISIBLE_DEVICES` in the cluster profile for ROCm

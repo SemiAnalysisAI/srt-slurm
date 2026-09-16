@@ -11,6 +11,7 @@ import logging
 import shlex
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from srtctl.core.fingerprint import generate_capture_script
@@ -106,6 +107,13 @@ class WorkerStageMixin:
             return {}
         return {self.runtime.visible_devices_env: process.cuda_visible_devices}
 
+    def _container_log_path(self, filename: str) -> Path:
+        """Return a worker-visible path under the runtime log mount."""
+        container_log_dir = self.runtime.container_mounts.get(self.runtime.log_dir)
+        if container_log_dir is None:
+            raise RuntimeError(f"Runtime log directory is not mounted in the container: {self.runtime.log_dir}")
+        return container_log_dir / filename
+
     def _apply_kvbm_endpoint_env(self, env_to_set: dict[str, str], endpoint_processes: list["Process"]) -> None:
         """Fill KVBM leader ZMQ settings for an endpoint.
 
@@ -172,7 +180,7 @@ class WorkerStageMixin:
 
         # Log and config files
         worker_log = self.runtime.log_dir / f"{process.node}_{mode}_w{index}.out"
-        config_dump = self.runtime.log_dir / f"{process.node}_config.json"
+        config_dump = self._container_log_path(f"{process.node}_config.json")
 
         # Profiling setup
         profiling = self.config.profiling
@@ -334,7 +342,7 @@ class WorkerStageMixin:
 
         # Log and config files (use leader node in name)
         worker_log = self.runtime.log_dir / f"{leader.node}_{mode}_w{index}.out"
-        config_dump = self.runtime.log_dir / f"{leader.node}_config.json"
+        config_dump = self._container_log_path(f"{leader.node}_config.json")
 
         # Profiling setup
         profiling = self.config.profiling

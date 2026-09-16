@@ -98,6 +98,14 @@ class WorkerStageMixin:
 
         return " && ".join(parts)
 
+    def _visible_device_environment(self, process: "Process") -> dict[str, str]:
+        """Build a vendor-native device mask when the backend needs one."""
+        should_set_devices = getattr(self.backend, "should_set_visible_devices", lambda: True)
+        force_mask = getattr(self.config.dynamo, "sidecar", False) is True and self.backend.type == "vllm"
+        if not (force_mask or should_set_devices()) or len(process.gpu_indices) >= self.runtime.gpus_per_node:
+            return {}
+        return {self.runtime.visible_devices_env: process.cuda_visible_devices}
+
     def _apply_kvbm_endpoint_env(self, env_to_set: dict[str, str], endpoint_processes: list["Process"]) -> None:
         """Fill KVBM leader ZMQ settings for an endpoint.
 
@@ -229,10 +237,7 @@ class WorkerStageMixin:
             profile_dir = str(self.runtime.log_dir / "profiles")
             env_to_set.update(profiling.get_env_vars(mode, profile_dir))
 
-        should_set_cvd = getattr(self.backend, "should_set_cuda_visible_devices", lambda _process: True)
-        force_cvd = getattr(self.config.dynamo, "sidecar", False) is True and self.backend.type == "vllm"
-        if (force_cvd or should_set_cvd(process)) and len(process.gpu_indices) < self.runtime.gpus_per_node:
-            env_to_set["CUDA_VISIBLE_DEVICES"] = process.cuda_visible_devices
+        env_to_set.update(self._visible_device_environment(process))
 
         # Add backend-specific process environment variables (e.g., unique ports)
         env_to_set.update(self.backend.get_process_environment(process))
@@ -392,10 +397,7 @@ class WorkerStageMixin:
             profile_dir = str(self.runtime.log_dir / "profiles")
             env_to_set.update(profiling.get_env_vars(mode, profile_dir))
 
-        should_set_cvd = getattr(self.backend, "should_set_cuda_visible_devices", lambda _process: True)
-        force_cvd = getattr(self.config.dynamo, "sidecar", False) is True and self.backend.type == "vllm"
-        if (force_cvd or should_set_cvd(leader)) and len(leader.gpu_indices) < self.runtime.gpus_per_node:
-            env_to_set["CUDA_VISIBLE_DEVICES"] = leader.cuda_visible_devices
+        env_to_set.update(self._visible_device_environment(leader))
 
         # Add mooncake worker env vars if configured (SGLang only). For MPI-style
         # endpoint launching we use the leader node's IP — mooncake's per-worker

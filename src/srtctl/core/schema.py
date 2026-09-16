@@ -613,6 +613,14 @@ class ResourceConfig:
     agg_nodes: int | None = None
     agg_workers: int | None = None
 
+    # A worker exit normally fails the run (the process monitor tears the job
+    # down). A role's flag set to False keeps the run alive when one of its
+    # workers exits, for workloads that kill workers on purpose (migration or
+    # fault-tolerance probes). The per-role spelling is ``roles.<role>.critical``.
+    prefill_critical: bool = True  # A prefill worker exiting fails the run. False keeps the run alive.
+    decode_critical: bool = True  # A decode worker exiting fails the run. False keeps the run alive.
+    agg_critical: bool = True  # An aggregated worker exiting fails the run. False keeps the run alive.
+
     # If True, place each partial-node worker on its own node instead of
     # packing multiple onto the same node. Caller must reserve enough nodes
     # (e.g. give roles.decode as many nodes as workers when its gpus < gpus_per_node).
@@ -661,6 +669,10 @@ class ResourceConfig:
     @property
     def is_disaggregated(self) -> bool:
         return self.prefill_nodes is not None or self.decode_nodes is not None
+
+    def worker_critical(self, mode: str) -> bool:
+        """Whether a worker of ``mode`` (``prefill``, ``decode``, ``agg``) failing fails the run."""
+        return {"prefill": self.prefill_critical, "decode": self.decode_critical, "agg": self.agg_critical}[mode]
 
     @property
     def total_nodes(self) -> int:
@@ -1499,6 +1511,27 @@ TRTLLM_SERVE_ENGINE_DEFAULTS: dict[str, bool] = {
     "return_perf_metrics": True,
 }
 
+# Engine-config default baked in for every TRT-LLM engine section a recipe
+# uses, under both the ``dynamo`` and the ``trtllm_serve`` frontend and
+# independent of ``observability.enabled``. ``dynamo.trtllm`` derives
+# ``enable_iter_perf_stats`` from ``--publish-metrics``, which
+# ``backend.publish_metrics`` passes by default, so without this every Dynamo
+# worker would run TensorRT-LLM's per-iteration statistics (KV-cache stats and
+# CUDA-event step timing on every executor loop) for gauges no benchmark client
+# reads. The request-level ``trtllm_*`` Prometheus series (request latency,
+# TTFT, TPOT, queue / prefill / decode time, token counters) only need the
+# per-request perf metrics, which ``--publish-metrics`` (Dynamo) and
+# ``return_perf_metrics: true`` (trtllm-serve) enable on their own. The engine
+# YAML is merged over the worker's derived arguments and wins on conflicts
+# (TensorRT-LLM ``update_llm_args_with_extra_dict``), so this explicit
+# ``false`` keeps that surface and drops the statistics. ``expand_observability``
+# runs first and setdefaults ``True`` for analytics runs, which keep their
+# iteration-level ``trtllm_kv_cache_*`` gauges; an explicit recipe value
+# always wins.
+TRTLLM_ENGINE_DEFAULTS: dict[str, bool] = {
+    "enable_iter_perf_stats": False,
+}
+
 
 # /configs/dynamo-wheels is the lustre-mounted cache for hash-pinned dynamo
 # source builds. The bench/frontend container always mounts srtslurm's
@@ -1768,7 +1801,7 @@ class DynamoConfig:
     sidecar: bool = False
     sidecar_port: int = 50051
     sidecar_binary: str | None = None
-    sidecar_startup_timeout: int = 1200
+    sidecar_startup_timeout: int = 3600
     sidecar_context_length: int | None = None
     sidecar_args: list[str] = field(default_factory=list)
     # Optional dependency-declaration overrides applied to the dynamo Cargo.toml tree before a
@@ -2908,7 +2941,7 @@ class SrtConfig:
 
     @classmethod
     def from_yaml(cls, yaml_path: Path) -> "SrtConfig":
-        from srtctl.core.config import expand_observability, expand_trtllm_serve_defaults
+        from srtctl.core.config import expand_engine_config_defaults
         from srtctl.core.placement import expand_placement
         from srtctl.core.roles import expand_roles
         from srtctl.services.normalize import expand_services
@@ -2918,8 +2951,7 @@ class SrtConfig:
         expand_roles(data)
         expand_placement(data)
         expand_services(data)
-        expand_observability(data)
-        expand_trtllm_serve_defaults(data)
+        expand_engine_config_defaults(data)
         schema = cls.Schema()
         return schema.load(data)
 

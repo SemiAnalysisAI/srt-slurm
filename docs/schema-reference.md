@@ -61,6 +61,7 @@ Three vocabularies are specific to the 2.0 layout. They are normalized into the 
 | `engine` | str | top-level `engine` | Optional; must equal the top-level engine type. |
 | `kv_events` | bool \| mapping | `None` | `true` for the default ZMQ publisher, or a mapping with `publisher` / `topic`. |
 | `sidecar` | bool | `False` | Run the native engine with a Dynamo sidecar; every role must agree. |
+| `critical` | bool | `True` | A worker of this role exiting fails the run. `false` keeps the run alive for probes that kill workers. |
 
 ### placement
 
@@ -93,6 +94,9 @@ Resource allocation configuration.
 |---|---|---|---|
 | `gpu_type` | str \| None | `None` | GPU type (h100, gb200, ...). Cluster fact, not a topology choice. Optional: a recipe that omits it inherits `default_gpu_type` from srtslurm.yaml, and `gpus_per_node` inherits the cluster `gpus_per_node`. Both are still worth setting in a recipe so it is self-describing for result rollups. |
 | `gpus_per_node` | int | `4` |  |
+| `prefill_critical` | bool | `True` | A worker exit normally fails the run (the process monitor tears the job down). A role's flag set to False keeps the run alive when one of its workers exits, for workloads that kill workers on purpose (migration or fault-tolerance probes). The per-role spelling is ``roles.<role>.critical``. |
+| `decode_critical` | bool | `True` | A decode worker exiting fails the run. False keeps the run alive. |
+| `agg_critical` | bool | `True` | An aggregated worker exiting fails the run. False keeps the run alive. |
 | `spread_workers` | bool | `False` | If True, place each partial-node worker on its own node instead of packing multiple onto the same node. Caller must reserve enough nodes (e.g. give roles.decode as many nodes as workers when its gpus < gpus_per_node). |
 | `het_jobs` | bool \| None | `None` | SLURM heterogeneous-job opt-in. Tri-state: None defers to the cluster default `use_het_jobs` on ClusterConfig; True/False overrides per recipe. When effectively True (and we are in disaggregated mode), the prefill and decode sides are submitted as two het components each with their own `--segment`. See HetComponent above and docs/slurm-faq.md. |
 
@@ -140,7 +144,7 @@ Dynamo installation configuration.
 | `sidecar` | bool | `False` |  |
 | `sidecar_port` | int | `50051` |  |
 | `sidecar_binary` | str \| None | `None` |  |
-| `sidecar_startup_timeout` | int | `1200` |  |
+| `sidecar_startup_timeout` | int | `3600` |  |
 | `sidecar_context_length` | int \| None | `None` |  |
 | `sidecar_args` | list[str] | `[]` |  |
 
@@ -548,7 +552,7 @@ TRTLLM protocol - implements BackendProtocol.
 |---|---|---|---|
 | `type` | one of `'trtllm'` | `'trtllm'` |  |
 | `served_model_name` | str \| None | `None` | The name clients must use in a request's "model" field. Defaults to the checkpoint directory name. engine: type: trtllm served_model_name: "deepseek-ai/deepseek-r1" Set it when the client cannot be told which name to ask for. agentperf takes the name as a flag, so it never needs this; the MLPerf harness has it fixed in the benchmark definition, so the server must match or every request 404s. Top-level rather than a trtllm_config key because trtllm_config is dumped straight into the engine's YAML file, and this is a launcher flag the engine does not recognise. |
-| `publish_metrics` | bool | `True` | Publish TRT-LLM engine metrics without enabling KV-cache events. Requires a Dynamo build supporting --publish-metrics; set False to omit the flag for older builds. Native trtllm-serve and sidecars are unaffected. |
+| `publish_metrics` | bool | `True` | Publish TRT-LLM engine metrics without enabling KV-cache events. Requires a Dynamo build supporting --publish-metrics; set False to omit the flag for older builds. Native trtllm-serve and sidecars are unaffected. Iteration statistics stay off regardless: srtctl bakes enable_iter_perf_stats: false into every engine section unless the recipe or observability sets it (TRTLLM_ENGINE_DEFAULTS), so this flag costs the per-request perf metrics only. |
 | `publish_events_and_metrics` | bool \| None | `None` | None means unspecified: metrics default on, events off (observability promotes this to True). Explicit False is a master opt-out of BOTH publication flags, even when publish_metrics is True. Preserve None in schema round-trips so an omitted value never becomes an explicit opt-out. |
 | `sequential_node_start` | int | `0` | Controls batched startup of workers that share the same node. 0 = start all workers in parallel (no constraint). 1 = fully sequential: one worker at a time, each must be ready before the next. N > 1 = start N workers simultaneously per batch, wait for all to be ready, then next batch. For trtllm_serve: readiness is an HTTP 200 on the worker's http_port. For dynamo.trtllm: readiness is a TCP connection on the worker's sys_port. |
 | `numa_memory_bind` | bool \| None | `None` | Whether to prefix the trtllm worker command with `numactl -m 0,1`. None (default) preserves the existing auto-detected behavior (enabled only for gb200/gb300). True/False forces numactl on/off regardless of gpu_type. |

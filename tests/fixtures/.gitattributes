@@ -1,0 +1,2 @@
+# Preserve the original CSV writer's CRLF bytes in the NVIDIA golden bundle.
+nvidia-power-golden/power/samples.csv -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol

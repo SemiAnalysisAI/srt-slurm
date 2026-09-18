@@ -1,0 +1,241 @@
+{
+  "schema_version": 1,
+  "producer": "srt-slurm.dcgm-power",
+  "producer_version": "golden-test",
+  "producer_git_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "source_metric": "DCGM_FI_DEV_POWER_USAGE",
+  "unit": "W",
+  "power_scope": "gpu_device_board_as_reported_by_dcgm",
+  "samples_schema_version": 2,
+  "utilization_metrics": [
+    {
+      "column": "gpu_util_pct",
+      "source_metric": "DCGM_FI_DEV_GPU_UTIL",
+      "unit": "percent"
+    },
+    {
+      "column": "sm_active",
+      "source_metric": "DCGM_FI_PROF_SM_ACTIVE",
+      "unit": "fraction"
+    }
+  ],
+  "timestamp_source": "head_node_unix_clock",
+  "job_id": "12345",
+  "run_name": "canary_12345",
+  "sample_interval_seconds": 1.0,
+  "request_timeout_seconds": 2.0,
+  "max_scrape_duration_seconds": null,
+  "required": true,
+  "started_at_unix": 1785168070.0,
+  "stopped_at_unix": 1785168125.0,
+  "status": "complete",
+  "publication_valid": true,
+  "dcgm_exporter": {
+    "container_image_resolved": "/containers/dcgm-exporter.sqsh",
+    "container_image_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+    "port": 9401,
+    "command": "dcgm-exporter --collect-interval=100 --address :9401"
+  },
+  "expected_devices": [
+    {
+      "hostname": "node-a",
+      "gpu_index": 0,
+      "assignments": [
+        {
+          "worker_role": "prefill",
+          "worker_index": 0,
+          "worker_process": 0,
+          "het_group": 0
+        }
+      ]
+    },
+    {
+      "hostname": "node-a",
+      "gpu_index": 1,
+      "assignments": [
+        {
+          "worker_role": "prefill",
+          "worker_index": 0,
+          "worker_process": 0,
+          "het_group": 0
+        }
+      ]
+    },
+    {
+      "hostname": "node-a",
+      "gpu_index": 2,
+      "assignments": [
+        {
+          "worker_role": "prefill",
+          "worker_index": 0,
+          "worker_process": 0,
+          "het_group": 0
+        }
+      ]
+    },
+    {
+      "hostname": "node-a",
+      "gpu_index": 3,
+      "assignments": [
+        {
+          "worker_role": "prefill",
+          "worker_index": 0,
+          "worker_process": 0,
+          "het_group": 0
+        }
+      ]
+    },
+    {
+      "hostname": "node-b",
+      "gpu_index": 0,
+      "assignments": [
+        {
+          "worker_role": "decode",
+          "worker_index": 0,
+          "worker_process": 0,
+          "het_group": 1
+        }
+      ]
+    },
+    {
+      "hostname": "node-b",
+      "gpu_index": 1,
+      "assignments": [
+        {
+          "worker_role": "decode",
+          "worker_index": 0,
+          "worker_process": 0,
+          "het_group": 1
+        }
+      ]
+    },
+    {
+      "hostname": "node-b",
+      "gpu_index": 2,
+      "assignments": [
+        {
+          "worker_role": "decode",
+          "worker_index": 0,
+          "worker_process": 0,
+          "het_group": 1
+        }
+      ]
+    },
+    {
+      "hostname": "node-b",
+      "gpu_index": 3,
+      "assignments": [
+        {
+          "worker_role": "decode",
+          "worker_index": 0,
+          "worker_process": 0,
+          "het_group": 1
+        }
+      ]
+    }
+  ],
+  "observed_devices": [
+    {
+      "hostname": "node-a",
+      "gpu_index": 0,
+      "gpu_uuids": [
+        "GPU-node-a0"
+      ],
+      "first_sample_time_unix": 1785168098.0,
+      "last_sample_time_unix": 1785168122.0
+    },
+    {
+      "hostname": "node-a",
+      "gpu_index": 1,
+      "gpu_uuids": [
+        "GPU-node-a1"
+      ],
+      "first_sample_time_unix": 1785168098.0,
+      "last_sample_time_unix": 1785168122.0
+    },
+    {
+      "hostname": "node-a",
+      "gpu_index": 2,
+      "gpu_uuids": [
+        "GPU-node-a2"
+      ],
+      "first_sample_time_unix": 1785168098.0,
+      "last_sample_time_unix": 1785168122.0
+    },
+    {
+      "hostname": "node-a",
+      "gpu_index": 3,
+      "gpu_uuids": [
+        "GPU-node-a3"
+      ],
+      "first_sample_time_unix": 1785168098.0,
+      "last_sample_time_unix": 1785168122.0
+    },
+    {
+      "hostname": "node-b",
+      "gpu_index": 0,
+      "gpu_uuids": [
+        "GPU-node-b0"
+      ],
+      "first_sample_time_unix": 1785168098.0,
+      "last_sample_time_unix": 1785168122.0
+    },
+    {
+      "hostname": "node-b",
+      "gpu_index": 1,
+      "gpu_uuids": [
+        "GPU-node-b1"
+      ],
+      "first_sample_time_unix": 1785168098.0,
+      "last_sample_time_unix": 1785168122.0
+    },
+    {
+      "hostname": "node-b",
+      "gpu_index": 2,
+      "gpu_uuids": [
+        "GPU-node-b2"
+      ],
+      "first_sample_time_unix": 1785168098.0,
+      "last_sample_time_unix": 1785168122.0
+    },
+    {
+      "hostname": "node-b",
+      "gpu_index": 3,
+      "gpu_uuids": [
+        "GPU-node-b3"
+      ],
+      "first_sample_time_unix": 1785168098.0,
+      "last_sample_time_unix": 1785168122.0
+    }
+  ],
+  "expected_windows": [
+    {
+      "benchmark_type": "sa-bench",
+      "concurrency": 4
+    }
+  ],
+  "scrape_count": 25,
+  "sample_row_count": 200,
+  "samples_sha256": "f61092c61ca1e954c26b6ccaa2b015290fcdb418a4bb5b061583b28085585c85",
+  "window_validations": [
+    {
+      "benchmark_type": "sa-bench",
+      "concurrency": 4,
+      "window_file": "windows/results_concurrency_4_gpus_8_ctx_4_gen_4.json",
+      "power_coverage_valid": true,
+      "reason_codes": [],
+      "per_device_max_sample_gap_seconds": {
+        "node-a/GPU-node-a0": 1.0,
+        "node-a/GPU-node-a1": 1.0,
+        "node-a/GPU-node-a2": 1.0,
+        "node-a/GPU-node-a3": 1.0,
+        "node-b/GPU-node-b0": 1.0,
+        "node-b/GPU-node-b1": 1.0,
+        "node-b/GPU-node-b2": 1.0,
+        "node-b/GPU-node-b3": 1.0
+      }
+    }
+  ],
+  "artifact_errors": [],
+  "reason_codes": []
+}

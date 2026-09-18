@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "benchmark_type": "sa-bench",
+  "result_path": "sa-bench_isl_8192_osl_1024/results_concurrency_4_gpus_8_ctx_4_gen_4.json",
+  "concurrency": 4,
+  "benchmark_start_time_unix": 1785168100.0,
+  "benchmark_end_time_unix": 1785168120.0,
+  "duration": 20.0,
+  "clock_source": "head_node_unix_clock",
+  "status": "completed",
+  "reason": null
+}

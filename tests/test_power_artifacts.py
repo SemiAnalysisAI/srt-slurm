@@ -34,6 +34,7 @@ from srtctl.core.power.manifest import (
     PowerManifest,
 )
 from srtctl.core.power.parser import parse_power_scrape
+from srtctl.core.power.profile import DEFAULT_POWER_PROFILE, PowerMetricProfile
 from srtctl.core.power.samples import (
     ObservedDevice,
     SampleRow,
@@ -1108,3 +1109,108 @@ class TestStorageSubdirSafety:
     @pytest.mark.parametrize("value", ["", "/power", "../power", "power/../..", "a/../../b", "~/power"])
     def test_unsafe_paths_rejected(self, value):
         assert is_safe_relative_subpath(value) is False
+
+
+class TestPowerMetricProfiles:
+    """A new Prometheus source needs configuration, not a parser branch."""
+
+    profile = PowerMetricProfile(
+        name="example-board-exporter",
+        power_metric="device_board_power_watts",
+        gpu_index_label="device_index",
+        gpu_uuid_label="serial",
+        power_scope="gpu_device_board_as_reported_by_example",
+        gpu_util_metric="device_busy_percent",
+        sm_active_metric=None,
+    )
+
+    def test_custom_names_write_the_existing_sample_columns(self, tmp_path):
+        scrape = parse_power_scrape(
+            "# TYPE device_board_power_watts gauge\n"
+            'device_board_power_watts{device_index="2",serial="board-002",Hostname="ignored"} 412.5\n'
+            'device_busy_percent{device_index="2",serial="board-002"} 73\n'
+            'unrelated_temperature{device_index="2"} 60\n',
+            self.profile,
+        )
+        assert scrape.reason_codes == ()
+        assert len(scrape.readings) == 1
+        reading = scrape.readings[0]
+        path = tmp_path / "samples.csv"
+        writer = SampleWriter(path)
+        writer.append(
+            [
+                SampleRow(
+                    timestamp_unix=100.0,
+                    scrape_seq=0,
+                    hostname="allocated-node",
+                    gpu_index=reading.gpu_index,
+                    gpu_uuid=reading.gpu_uuid,
+                    power_w=reading.power_w,
+                    gpu_util_pct=reading.gpu_util_pct,
+                    sm_active=reading.sm_active,
+                )
+            ]
+        )
+        writer.close()
+        with path.open(newline="") as stream:
+            reader = csv.DictReader(stream)
+            assert tuple(reader.fieldnames) == SAMPLES_HEADER
+            row = next(reader)
+        assert (row["hostname"], row["gpu_index"], row["gpu_uuid"]) == ("allocated-node", "2", "board-002")
+        assert float(row["power_w"]) == 412.5
+        assert float(row["gpu_util_pct"]) == 73
+        assert row["sm_active"] == ""
+
+    @pytest.mark.parametrize("profile", [DEFAULT_POWER_PROFILE, profile])
+    @pytest.mark.parametrize(
+        ("kind", "reason"),
+        [
+            ("missing_index", Reason.GPU_INDEX_MISSING),
+            ("missing_uuid", Reason.GPU_UUID_MISSING),
+            ("negative", Reason.INVALID_POWER_VALUE),
+            ("nan", Reason.INVALID_POWER_VALUE),
+            ("infinity", Reason.INVALID_POWER_VALUE),
+            ("duplicate", Reason.DUPLICATE_POWER_METRIC),
+            ("malformed", Reason.ENDPOINT_PARSE_ERROR),
+            ("mig", Reason.MIG_INSTANCE_UNSUPPORTED),
+        ],
+    )
+    def test_profiles_preserve_failure_reasons(self, profile, kind, reason):
+        labels = {profile.gpu_index_label: "0", profile.gpu_uuid_label: "board-000"}
+        if kind == "missing_index":
+            labels.pop(profile.gpu_index_label)
+        if kind == "missing_uuid":
+            labels.pop(profile.gpu_uuid_label)
+        if kind == "mig":
+            labels["GPU_I_ID"] = "1"
+        value = {"negative": "-1", "nan": "NaN", "infinity": "+Inf"}.get(kind, "400")
+        label_text = ",".join(f'{key}="{value}"' for key, value in labels.items())
+        body = f"{profile.power_metric}{{{label_text}}} {value}\n"
+        if kind == "duplicate":
+            body += body
+        if kind == "malformed":
+            body = f'{profile.power_metric}{{unclosed="label}} broken\n'
+        scrape = parse_power_scrape(body, profile)
+        assert scrape.readings == ()
+        assert scrape.reason_codes == (reason,)
+
+    def test_optional_sources_can_be_disabled(self):
+        profile = PowerMetricProfile(gpu_util_metric=None, sm_active_metric=None)
+        scrape = parse_power_scrape(_scrape(_metric(0, "GPU-a", 300), _util(0, "GPU-a", 95)), profile)
+        assert scrape.reason_codes == ()
+        assert scrape.readings[0].gpu_util_pct is None
+        assert scrape.readings[0].sm_active is None
+
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            {"power_metric": ""},
+            {"gpu_index_label": "not a label"},
+            {"gpu_uuid_label": "gpu"},
+            {"gpu_util_metric": "DCGM_FI_DEV_POWER_USAGE"},
+            {"power_scope": ""},
+        ],
+    )
+    def test_invalid_mappings_fail_before_collection(self, fields):
+        with pytest.raises(ValueError):
+            PowerMetricProfile(**fields)

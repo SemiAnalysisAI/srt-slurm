@@ -347,6 +347,10 @@ class ClusterConfig:
     # recipe move between clusters of different GPU types without an edit.
     default_gpu_type: str | None = None
     network_interface: str | None = None
+    # GPU-subset mask passed to workers; ROCm clusters use ROCR_VISIBLE_DEVICES.
+    visible_devices_env: str = "CUDA_VISIBLE_DEVICES"
+    # Recipe exporter settings win. Explicit null disables the GPU default only.
+    default_gpu_exporter: "TelemetryExporterConfig | None" = field(default_factory=lambda: DEFAULT_DCGM_EXPORTER)
     use_gpus_per_node_directive: bool = True
     use_segment_sbatch_directive: bool = True
     use_exclusive_sbatch_directive: bool = False
@@ -360,9 +364,6 @@ class ClusterConfig:
     default_health_check: dict[str, int] | None = None
     srtctl_root: str | None = None
     output_dir: str | None = None  # Custom output directory for job logs
-    # Cluster-wide default for recording exact realized srun commands. Recipes
-    # can opt in independently with output.record_launch_plan.
-    record_launch_plan: bool = False
     model_paths: dict[str, str] | None = None
     containers: dict[str, str] | None = None
     cloud: dict[str, str] | None = None
@@ -1322,6 +1323,8 @@ class TachometerConfig:
     storage_subdir: str = "tachometer"
     extra_metadata: dict[str, str] = field(default_factory=dict)
     default_exporters: bool = True
+    # Resolved from srtslurm.yaml at load time; never read global config here.
+    default_gpu_exporter: TelemetryExporterConfig | None = field(default_factory=lambda: DEFAULT_DCGM_EXPORTER)
     dcgm_exporter: TelemetryExporterConfig | None = None
     node_exporter: TelemetryExporterConfig | None = None
     process_exporter: TelemetryExporterConfig | None = None
@@ -1330,10 +1333,10 @@ class TachometerConfig:
 
     @property
     def resolved_dcgm_exporter(self) -> TelemetryExporterConfig | None:
-        """User-configured DCGM exporter, else the built-in default."""
+        """Recipe exporter, else the resolved cluster default."""
         if self.dcgm_exporter is not None:
             return self.dcgm_exporter
-        return DEFAULT_DCGM_EXPORTER if self.default_exporters else None
+        return self.default_gpu_exporter if self.default_exporters else None
 
     @property
     def resolved_node_exporter(self) -> TelemetryExporterConfig | None:
@@ -2161,12 +2164,11 @@ class FrontendConfig:
 
 @dataclass(frozen=True)
 class OutputConfig:
-    """Output paths and optional reproducibility artifacts."""
+    """Output configuration with formattable paths."""
 
     log_dir: Annotated[FormattablePath, FormattablePathField()] = field(
         default_factory=lambda: FormattablePath(template="./outputs/{job_id}/logs")
     )
-    record_launch_plan: bool = False
 
     Schema: ClassVar[type[Schema]] = Schema
 

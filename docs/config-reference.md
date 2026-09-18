@@ -92,7 +92,6 @@ profiling:                     # Optional: profiling config
 
 output:                        # Optional: output paths
   log_dir: "./outputs/{job_id}/logs"
-  record_launch_plan: false    # Save exact realized srun scripts and a manifest
 
 health_check:                  # Optional: health check settings
   max_attempts: 180
@@ -135,6 +134,8 @@ The `srtslurm.yaml` file can contain the following fields:
 | `gpus_per_node`                 | int    | Default GPUs per node (applied to recipes that omit `resources.gpus_per_node`) |
 | `default_gpu_type`              | string | Default `resources.gpu_type` for recipes that omit it |
 | `network_interface`             | string | Network interface for NCCL                            |
+| `visible_devices_env`           | string | Worker GPU-subset mask; defaults to `CUDA_VISIBLE_DEVICES` |
+| `default_gpu_exporter`          | dict/null | Cluster GPU exporter; defaults to DCGM, explicit null disables it |
 | `srtctl_root`                   | string | Root directory for srtctl                             |
 | `output_dir`                    | string | Custom output directory (overrides srtctl_root/outputs) |
 | `model_paths`                   | dict   | Model path aliases                                    |
@@ -242,6 +243,22 @@ model:
 
 ## engine
 
+GPU scheduling uses upstream's existing cluster settings. For eight-GPU
+allocations on GRES-only clusters, set `use_gpus_per_node_directive: false`
+and `default_sbatch_directives: {gres: "gpu:8"}`.
+
+### GPU visibility on AMD
+
+Set `visible_devices_env: ROCR_VISIBLE_DEVICES` in the cluster profile for ROCm
+workers. GPU subsets then use only that mask, without applying a second mask to
+already-renumbered devices. Set `default_gpu_exporter: null` to disable the
+NVIDIA GPU exporter, or configure an exporter image, port, and command once for
+the cluster. Other telemetry is unchanged; an explicit recipe exporter wins.
+
+For vLLM builds without `--device-ids`, set `engine.set_visible_devices: true`.
+This is one explicit boolean, not automatic vLLM version detection. The default
+is false: vLLM binds devices with `--device-ids`. There is no CUDA-named alias.
+
 `engine:` names the inference engine that builds every worker role's command. A bare string is the common form; a mapping carries the engine-wide knobs, the fields that are not per role:
 
 ```yaml
@@ -272,7 +289,7 @@ Valid types are `sglang`, `vllm`, `trtllm`, and `mocker`. Everything that is per
 | Engine | Engine-wide knobs |
 | --- | --- |
 | `sglang-router` | none beyond `type` |
-| `vllm` | `connector` (default `nixl`), `dp_launch_mode`, `vllm_serve_binary`, `set_cuda_visible_devices`, `allow_prefill_decode_colocation`, `allow_prefill_decode_colocation_across_nodes` |
+| `vllm` | `connector` (default `nixl`), `dp_launch_mode`, `vllm_serve_binary`, `set_visible_devices`, `allow_prefill_decode_colocation`, `allow_prefill_decode_colocation_across_nodes` |
 | `trtllm` | `served_model_name`, `publish_metrics`, `publish_events_and_metrics`, `sequential_node_start`, `numa_memory_bind`, `numa_cpu_bind` |
 | `mocker` | the simulation parameters: `engine_type`, `speedup_ratio`, `decode_speedup_ratio`, `num_gpu_blocks_override`, `max_num_seqs`, `max_num_batched_tokens`, `block_size`, `data_parallel_size`, ... |
 
@@ -1315,26 +1332,13 @@ Output configuration with formattable paths.
 ```yaml
 output:
   log_dir: "./outputs/{job_id}/logs"
-  record_launch_plan: false
 ```
 
-| Field                | Type            | Default                   | Description                                      |
-| -------------------- | --------------- | ------------------------- | ------------------------------------------------ |
-| `log_dir`            | FormattablePath | "./outputs/{job_id}/logs" | Directory for log files                          |
-| `record_launch_plan` | bool            | `false`                   | Save realized `srun` scripts and a JSON manifest |
+| Field     | Type            | Default                      | Description              |
+| --------- | --------------- | ---------------------------- | ------------------------ |
+| `log_dir` | FormattablePath | "./outputs/{job_id}/logs"    | Directory for log files  |
 
 The `log_dir` supports FormattablePath templating. See [FormattablePath Template System](#formattablepath-template-system).
-
-When `record_launch_plan` is enabled, srtctl creates `logs/launch-plan/manifest.json` and one executable shell
-script for every realized `srun` invocation. Recording happens after Slurm assigns nodes, ports, heterogeneous
-groups, mounts, and container paths, so the scripts describe what was actually launched rather than a pre-submit
-estimate. Secret-like environment values are never persisted; the scripts name the environment variables that
-must be supplied for replay. The resolved recipe, outer `sbatch_script.sh`, lockfile, and resource snapshot remain
-alongside this directory and are referenced by the manifest.
-
-Set `record_launch_plan: true` at the top level of `srtslurm.yaml` to enable this artifact for every recipe on a
-cluster. Because the launch plan lives under the normal log directory, existing S3 postprocessing and external
-collectors that archive the complete log directory include it without a separate upload path.
 
 ---
 

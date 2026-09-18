@@ -17,9 +17,11 @@
 - [Commands](#commands)
   - [srtctl apply](#srtctl-apply)
   - [srtctl dry-run](#srtctl-dry-run)
+  - [srtctl render](#srtctl-render)
   - [srtctl resolve-override](#srtctl-resolve-override)
   - [srtctl migrate](#srtctl-migrate)
   - [srtctl monitor](#srtctl-monitor)
+  - [srtctl status-server](#srtctl-status-server)
   - [srtctl skill](#srtctl-skill)
 - [Output](#output)
 - [Sweep Support](#sweep-support)
@@ -338,6 +340,57 @@ Dry-run output includes:
 - For sweeps: table of all jobs with parameters
 - Generated configs saved to `dry-runs/` folder
 
+### `srtctl render`
+
+Write the exact sbatch script `srtctl apply` would submit, without submitting it.
+
+```bash
+srtctl render -f <config.yaml> --to <dir> [--serve-only] [--setup-script NAME] [--no-preflight]
+```
+
+For launchers that must own the `sbatch` call themselves — for example a harness whose
+contract is that its launch script ends in `exec sbatch --parsable ...` and reads the job id
+from that one line. `render` gives such a launcher srtctl's orchestration without srtctl's
+submit.
+
+The script is self-contained: `apply` copies the recipe into `outputs/<job_id>/` *after*
+sbatch hands back the id, which no one does for a rendered script, so the rendered script
+copies its recipe from `--to <dir>` into its own output directory at job start. `--to <dir>`
+receives `sbatch_script.sh`, `config.yaml` (the recipe as given), `config_<variant>.yaml`
+for an override variant, the git-state snapshot of any mounted checkouts, and
+`render.json`: what the launcher needs to know about the job before it exists —
+`total_nodes`, `frontend_node_index` and `client_node_index` (positions in the
+allocation's `scontrol show hostnames` order, computed with the orchestrator's own
+node-carving rules; `null` for heterogeneous jobs), `frontend_port`, `served_model_name`,
+`benchmark_type`. The directory must stay in place until the job has started.
+
+Once every configured worker has passed the health gate, the job writes
+`<log_dir>/server_ready.json` (`ready_at_unix`). A launcher driving a `manual` job with its
+own client should wait for that file rather than for the frontend alone: a Dynamo frontend
+lists the model as soon as its first worker registers.
+
+Prose goes to stderr; the last line of stdout is the script path, so the whole thing
+composes into one submit line:
+
+```bash
+exec sbatch --parsable --output=/path/serve.log "$(srtctl render -f recipe.yaml --to /path/render)"
+```
+
+Only a single recipe (or one override variant via `file:selector`) can be rendered;
+sweeps, directories and unselected override files are refused. Cluster defaults
+(`srtslurm.yaml`: account, partition, container and model aliases, `--segment`) apply
+exactly as for `apply`, and are found the same way: `srtslurm.yaml` in the working
+directory (or its two parents), or the file `SRTSLURM_CONFIG` points at. A launcher
+that runs `render` from somewhere else should set `SRTSLURM_CONFIG`.
+
+| Flag | Description |
+|------|-------------|
+| `-f, --file` | Path to YAML config file, or `file:selector` for one override variant (required) |
+| `--to` | Directory to render into (required) |
+| `--serve-only` | Render a serve-only job (deploy, hold, no benchmark) |
+| `--setup-script` | Custom setup script in `configs/` |
+| `--no-preflight` | Skip the pre-render model/container/telemetry filesystem checks |
+
 ### `srtctl resolve-override`
 
 Expand an override config and write the specialised YAML file(s) without submitting.
@@ -397,6 +450,23 @@ srtctl monitor --interval 10            # Refresh every 10s (default: 5)
 srtctl monitor --once                   # Snapshot and exit
 srtctl monitor --resume KEY             # Resume a previous session
 ```
+
+### `srtctl status-server`
+
+Run the native status collector. Point `reporting.status.endpoint` in `srtslurm.yaml` or a recipe at it and every `srtctl apply` shows up as a job row with an ordered event feed (`submitted`, `starting`, `workers`, `frontend`, `benchmark`, then `completed` or `failed`, each with its stage and message). Jobs and events persist in one SQLite file and the process prints one line per transition. The endpoints are in [Status API](status-api-spec.md).
+
+```bash
+srtctl status-server                                        # 127.0.0.1:8080, ~/.local/state/srtctl/status.db, no token needed on loopback
+srtctl status-server --host 0.0.0.0 --allow-unauthenticated # Open on a trusted network such as a login node
+SRTCTL_STATUS_TOKEN=... SRTCTL_STATUS_READ_TOKEN=... \
+  srtctl status-server --host 0.0.0.0                       # Bearer tokens required (write token; optional read-only token)
+srtctl status-server --port 9000 --db /lustre/shared/status.db
+srtctl status-server --host 0.0.0.0 --cors-origin https://ui.example  # UI hosted elsewhere may call the API (read-only)
+curl http://login-node:8080/api/jobs                        # Newest jobs first
+curl "http://login-node:8080/api/events?after=0"            # Global event feed; pass next_cursor back as after
+```
+
+Open `http://<host>:8080/` in a browser for the built-in UI (jobs table, per-job event timeline, live event feed); paste the read token once and the page keeps it in `localStorage`. Run the server where both the submitting host (the POST at apply time) and the allocation's head node (the PUTs during the run) can reach it, typically a login node. Listening beyond loopback without a token is refused unless `--allow-unauthenticated` is passed. With a token set on the server, export the same `SRTCTL_STATUS_TOKEN` in the shell that runs `srtctl apply`; the reporter sends it as a bearer token and never puts it in a recipe. See [Status API](status-api-spec.md#authentication).
 
 ### `srtctl skill`
 

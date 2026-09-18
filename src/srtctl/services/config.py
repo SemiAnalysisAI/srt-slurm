@@ -16,7 +16,7 @@ import logging
 from dataclasses import field
 from typing import Any, ClassVar
 
-from marshmallow import Schema, ValidationError
+from marshmallow import Schema, ValidationError, pre_load
 from marshmallow_dataclass import dataclass
 
 from srtctl.core.source import SourceConfig
@@ -25,8 +25,22 @@ logger = logging.getLogger(__name__)
 
 # Where a service runs. head / infra are one node; prefill / decode / agg are the
 # distinct physical nodes the role's workers land on; workers is every worker node.
-SERVICE_PLACEMENTS: tuple[str, ...] = ("head", "infra", "dedicated", "prefill", "decode", "agg", "workers", "all")
+SERVICE_PLACEMENTS: tuple[str, ...] = (
+    "head",
+    "infra",
+    "dedicated",
+    "prefill",
+    "decode",
+    "agg",
+    "workers",
+    "compute",
+    "all",
+)
 SINGLE_NODE_PLACEMENTS: frozenset[str] = frozenset({"head", "infra", "dedicated"})
+# Placements whose nodes carry engine workers, the only ones ``placement.per: worker`` can attach to.
+PER_WORKER_PLACEMENTS: tuple[str, ...] = ("prefill", "decode", "agg", "workers")
+# How many instances a placed node gets: one, or one per engine worker on it.
+SERVICE_PERS: tuple[str, ...] = ("node", "worker")
 
 # When a service starts relative to the rest of the job. ``infra`` is the discovery
 # plane (etcd, NATS) that everything else may depend on; ``before_workers`` runs after
@@ -45,10 +59,24 @@ class ServicePlacementConfig:
         node: ``head`` or ``infra`` (one instance), ``dedicated`` (reserve the
             infra node exclusively; infra-class kinds only), ``prefill`` /
             ``decode`` / ``agg`` (one instance per distinct physical node that
-            role's workers use), or ``workers`` (one instance per worker node).
+            role's workers use), ``workers`` (one instance per engine worker
+            node; on a service that owns nodes, its own pool), ``compute``
+            (engine worker nodes plus every pool), or ``all`` (every node of
+            the allocation).
+        pool: Run on the nodes another service owns (``services[].nodes``), one
+            instance per node of that pool. Replaces ``node``.
+        per: ``node`` (default): one instance per placed node. ``worker``: one
+            instance per engine worker on each placed node, attached to that
+            worker: it runs with the worker's ``CUDA_VISIBLE_DEVICES`` and sees
+            ``{worker_role}``, ``{worker_index}``, ``{worker_node_rank}``,
+            ``{worker_gpus}``, ``{worker_gpu_count}``. A sidecar in the
+            Kubernetes sense (the GPU Memory Service next to each vLLM worker).
+            Only with ``node`` in ``prefill``, ``decode``, ``agg``, ``workers``.
     """
 
     node: str = "head"
+    pool: str | None = None
+    per: str = "node"
 
     Schema: ClassVar[type[Schema]] = Schema
 
@@ -57,6 +85,23 @@ class ServicePlacementConfig:
             raise ValidationError(
                 f"services[].placement.node must be one of {', '.join(SERVICE_PLACEMENTS)}; got {self.node!r}"
             )
+        if self.per not in SERVICE_PERS:
+            raise ValidationError(
+                f"services[].placement.per must be one of {', '.join(SERVICE_PERS)}; got {self.per!r}"
+            )
+        if self.per == "worker":
+            if self.pool is not None:
+                raise ValidationError("services[].placement.per: worker attaches to engine workers, not to a pool")
+            if self.node not in PER_WORKER_PLACEMENTS:
+                raise ValidationError(
+                    f"services[].placement.per: worker needs placement.node in {', '.join(PER_WORKER_PLACEMENTS)}; "
+                    f"got {self.node!r}"
+                )
+        if self.pool is not None:
+            if not str(self.pool).strip():
+                raise ValidationError("services[].placement.pool must name a service that declares nodes")
+            if self.node != "head":
+                raise ValidationError("services[].placement: give either node or pool, not both")
 
 
 @dataclass(frozen=True)
@@ -89,6 +134,37 @@ class HttpProbe:
             raise ValidationError("readiness.http.path must start with '/'")
         if not 100 <= self.status <= 599:
             raise ValidationError("readiness.http.status must be an HTTP status code")
+
+
+@dataclass(frozen=True)
+class ServiceMetricsConfig:
+    """One Prometheus endpoint a service serves: ``port``, ``path`` (default ``/metrics``), ``nodes``, ``name``.
+
+    The scrape annotation. Tachometer builds its target list from these: one
+    target per node the service runs on, or only its first node when ``nodes``
+    is ``first`` (a cluster whose head serves the metrics: a trainer's
+    collector on the Ray head). ``name`` is the endpoint's name in the parquet,
+    ``<name>_<node>``; it defaults to the service name and is required when a
+    service declares more than one endpoint. Kinds that always publish metrics
+    (the exporters) supply theirs; a recipe writes the block for anything else.
+    """
+
+    port: int
+    path: str = "/metrics"
+    nodes: str = "all"
+    name: str | None = None
+
+    Schema: ClassVar[type[Schema]] = Schema
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.port <= 65535:
+            raise ValidationError("metrics.port must be between 1 and 65535")
+        if not self.path.startswith("/"):
+            raise ValidationError("metrics.path must start with '/'")
+        if self.nodes not in ("all", "first"):
+            raise ValidationError(f"metrics.nodes must be all or first; got {self.nodes!r}")
+        if self.name is not None and not self.name.strip():
+            raise ValidationError("metrics.name must not be empty")
 
 
 @dataclass(frozen=True)
@@ -174,7 +250,17 @@ class ServiceReadinessConfig:
         return f"{what}, timeout={self.timeout_seconds}s"
 
 
-@dataclass(frozen=True)
+class _ServiceSchema(Schema):
+    """``metrics: {port: ..}`` is sugar for a one-endpoint list; a service may serve several."""
+
+    @pre_load
+    def _metrics_as_list(self, data, **kwargs):
+        if isinstance(data, dict) and isinstance(data.get("metrics"), dict):
+            data = {**data, "metrics": [data["metrics"]]}
+        return data
+
+
+@dataclass(frozen=True, base_schema=_ServiceSchema)
 class ServiceConfig:
     """One entry of the top-level ``services:`` list.
 
@@ -194,6 +280,12 @@ class ServiceConfig:
             ``command`` run. Single-node placements only.
         build_command: Argv run once inside the service container, from the
             clone, before ``command`` starts. Only meaningful with ``source``.
+        nodes: Whole nodes this service owns: its pool. Pools add to the
+            allocation next to the engine roles' nodes and are carved after them
+            in declaration order, so a Ray cluster, a sandbox fleet and an engine
+            role can each have their own nodes in one recipe. An owner is placed
+            on its own pool (``placement.node: workers``); other services join it
+            with ``placement.pool: <name>``.
         placement: Where the service runs. Defaults to the kind's placement
             (``head`` for generic services, ``infra`` for etcd/nats/mooncake-master,
             ``workers`` for the exporters).
@@ -207,6 +299,11 @@ class ServiceConfig:
             false for ``generic`` (a dead sidecar costs its own log, not the
             run) and true for ``mooncake-store``. Set true for anything in
             the live request path.
+        terminal: This service is the job's run: the job ends when every
+            instance of every terminal service has exited, and the worst exit
+            code becomes the job's. A recipe with a terminal service has no
+            benchmark step (``benchmark.type`` stays ``manual``); a torchrun
+            pool that trains to completion is the shape.
         preamble: Shell run inside the container before ``command``
             (``ulimit`` and friends).
         cpus_per_task: Optional ``srun --cpus-per-task``.
@@ -220,8 +317,16 @@ class ServiceConfig:
             ``mooncake-master``): use this already-running endpoint and launch
             nothing; the URL is what the job's processes are pointed at.
         options: Kind-specific settings (``nats``: ``max_payload_mb``;
-            ``mooncake-master``: ``store_config`` for vLLM). Unknown keys are
-            rejected by the kind.
+            ``mooncake-master``: ``store_config`` and ``device_names_by_gpu``
+            for vLLM). Unknown keys are rejected by the kind.
+        metrics: Prometheus endpoints this service serves: one mapping or a
+            list of ``{port, path, nodes, name}`` (``path`` defaults to
+            ``/metrics``, ``nodes`` to ``all``). Tachometer scrapes each on every
+            node the service runs on, or on its first node with ``nodes: first``,
+            as endpoint ``<name>_<node>`` where ``name`` defaults to the service
+            name. The exporter kinds declare theirs; write it for a generic
+            service that publishes metrics, or on a ``ray`` service whose head
+            serves a trainer's collector and router.
     """
 
     name: str
@@ -233,10 +338,12 @@ class ServiceConfig:
     source: ServiceSourceConfig | None = None
     build_command: list[str] | None = None
     placement: ServicePlacementConfig | None = None
+    nodes: int | None = None
     start: str | None = None
     readiness: ServiceReadinessConfig | None = None
     inherit_discovery_env: bool = True
     critical: bool | None = None
+    terminal: bool = False
     preamble: str | None = None
     cpus_per_task: int | None = None
     cpu_bind: str | None = None
@@ -247,6 +354,7 @@ class ServiceConfig:
     enabled: bool = True
     external: str | None = None
     options: dict[str, Any] = field(default_factory=dict)
+    metrics: list[ServiceMetricsConfig] = field(default_factory=list)
 
     # builtins.type: the ``type`` field above shadows the builtin inside the class body.
     Schema: ClassVar[builtins.type[Schema]] = Schema
@@ -296,6 +404,35 @@ class ServiceConfig:
                 f"{label}.placement.node: dedicated is only supported for infra-class kinds (etcd, nats, "
                 f"mooncake-master); use head, infra, or workers for type {self.type!r}"
             )
+        if self.nodes is not None:
+            if self.nodes < 1:
+                raise ValidationError(f"{label}.nodes must be at least 1; got {self.nodes}")
+            if self.placement is not None and self.placement.pool is not None:
+                raise ValidationError(f"{label}.nodes makes the service its own pool; drop placement.pool")
+            if self.effective_placement != "workers":
+                raise ValidationError(
+                    f"{label}.nodes owns a pool, so placement.node must be workers, meaning that pool "
+                    f"(got {self.effective_placement!r})"
+                )
+        if self.effective_per == "worker":
+            if self.nodes is not None:
+                raise ValidationError(f"{label}.placement.per: worker attaches to engine workers; it cannot own a pool")
+            if self.effective_placement not in PER_WORKER_PLACEMENTS:
+                raise ValidationError(
+                    f"{label}.placement.per: worker needs placement.node in {', '.join(PER_WORKER_PLACEMENTS)}; "
+                    f"got {self.effective_placement!r}"
+                )
+            if self.readiness is not None and self.readiness.log is None:
+                raise ValidationError(
+                    f"{label}.placement.per: worker instances share their node's ports, so readiness must be a log probe"
+                )
+        if len(self.metrics) > 1:
+            names = [endpoint.name for endpoint in self.metrics]
+            if any(name is None for name in names) or len(set(names)) != len(names):
+                raise ValidationError(
+                    f"{label}.metrics declares {len(self.metrics)} endpoints; give each a distinct name "
+                    "(it becomes the endpoint's name in the parquet)"
+                )
         unknown_options = set(self.options) - set(kind.option_keys)
         if unknown_options:
             raise ValidationError(
@@ -326,12 +463,33 @@ class ServiceConfig:
 
     @property
     def effective_placement(self) -> str:
-        """``placement.node`` as written, else the kind's default (``head`` for generic services)."""
+        """``placement.node`` as written, else the kind's default (``head`` for generic services).
+
+        A service that owns nodes, or rides on a pool, is placed on ``workers``: that pool.
+        """
         from srtctl.services.registry import get_service_kind
 
         if self.placement is not None:
-            return self.placement.node
+            return "workers" if self.placement.pool is not None else self.placement.node
+        if self.nodes is not None:
+            return "workers"
         return get_service_kind(self.type).default_placement
+
+    @property
+    def effective_pool(self) -> str | None:
+        """The pool this service rides on: its own when it owns nodes, else ``placement.pool``."""
+        if self.nodes is not None:
+            return self.name
+        return self.placement.pool if self.placement is not None else None
+
+    @property
+    def effective_per(self) -> str:
+        """``placement.per`` as written, else the kind's default (``node`` for every kind but ``gms``)."""
+        from srtctl.services.registry import get_service_kind
+
+        if self.placement is not None:
+            return self.placement.per
+        return get_service_kind(self.type).default_per
 
     @property
     def effective_critical(self) -> bool:

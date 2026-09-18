@@ -40,7 +40,18 @@ def routed_process_dp_size(backend: Any, process: Process) -> int:
 
 def node_local_data_parallel_size(backend: Any, backend_processes: list[Process]) -> int:
     """Return Router's single DP expansion factor for all advertised URLs."""
-    routed_sizes = {routed_process_dp_size(backend, process) for process in backend_processes if process.http_port > 0}
+    routable = [process for process in backend_processes if process.http_port > 0]
+    process_count_by_endpoint: dict[tuple[str, int], int] = {}
+    for process in routable:
+        endpoint = (process.endpoint_mode, process.endpoint_index)
+        process_count_by_endpoint[endpoint] = process_count_by_endpoint.get(endpoint, 0) + 1
+
+    # Hybrid-LB pools on later nodes have nonzero DP-rank offsets.
+    # Let vLLM route locally; Router expansion would restart ranks at zero.
+    if any(count > 1 for count in process_count_by_endpoint.values()):
+        return 1
+
+    routed_sizes = {routed_process_dp_size(backend, process) for process in routable}
     if len(routed_sizes) > 1:
         sizes = ", ".join(str(size) for size in sorted(routed_sizes))
         raise ValueError(f"vLLM Router requires one uniform node-local DP expansion factor; derived {sizes}")

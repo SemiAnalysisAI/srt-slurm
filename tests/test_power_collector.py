@@ -1318,16 +1318,16 @@ def test_amd_native_adapter_to_session_and_validator_cli(tmp_path, amd_smi_endpo
     assert outcome.publication_valid is True
     rows, reasons = read_samples(session.samples_path)
     assert reasons == ()
-    assert {(r.gpu_index, r.power_w, r.gpu_util_pct, r.sm_active) for r in rows} == {
-        (0, 440, 85, None),
-        (3, 480.5, 98, None),
+    assert {(r.gpu_index, r.gpu_uuid, r.power_w, r.gpu_util_pct, r.sm_active) for r in rows} == {
+        (0, "12345678-0000-1000-8000-000000000001", 440, 85, None),
+        (3, "12345678-0000-1000-8000-000000000004", 480.5, 98, None),
     }
     manifest = _manifest(session)
     assert manifest["power_scope"] == "gpu_socket_as_reported_by_amd_smi"
     assert manifest["power_profile"] == AMD_SMI_POWER_PROFILE.to_dict()
     calls = [json.loads(line) for line in (native_dir / "calls.jsonl").read_text().splitlines()]
-    assert ["list", "--json"] in calls
-    assert ["metric", "--power", "--usage", "--json"] in calls
+    assert calls.count(["list", "--json"]) == 1
+    assert calls.count(["metric", "--power", "--usage", "--json"]) >= 2
 
     command = [
         str(Path(sys.executable).with_name("srtctl-validate-power")),
@@ -1347,12 +1347,14 @@ def test_amd_native_adapter_to_session_and_validator_cli(tmp_path, amd_smi_endpo
     assert "measurement_window" in corrupted.stdout
 
 
-@pytest.mark.parametrize("failure", ["fail", "slow", "malformed"])
+@pytest.mark.parametrize("failure", ["fail", "slow", "malformed", "schema"])
 def test_amd_adapter_never_reuses_a_successful_scrape_after_native_failure(amd_smi_endpoint, failure):
     url, native_dir = amd_smi_endpoint
     assert requests.get(url, timeout=2).status_code == 200
     if failure == "malformed":
         (native_dir / "metric.json").write_text("not JSON")
+    elif failure == "schema":
+        (native_dir / "metric.json").write_text("{}")
     else:
         (native_dir / failure).touch()
     response = requests.get(url, timeout=2)

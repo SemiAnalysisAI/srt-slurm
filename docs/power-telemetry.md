@@ -95,13 +95,14 @@ collection explicitly supplies `telemetry.dcgm_exporter`. Enabled telemetry
 with no remaining collector is rejected. A custom profile requires an explicit
 exporter command, preventing an accidental DCGM launch.
 
-The bundled adapter uses fresh `amd-smi list --json` and
-`amd-smi metric --power --usage --json` snapshots for each HTTP request. It
+The bundled adapter reads `amd-smi list --json` once at startup; device identity
+is fixed for the exporter lifetime within an allocation. Each HTTP request runs
+`amd-smi metric --power --usage --json` for fresh watts from all local GPUs. It
 supports the ROCm 7.2 JSON shape, including the `gpu_data` envelope and explicit
 units. Native command errors, timeouts, malformed JSON, and ambiguous or
 partitioned identities fail closed; previous watts are never cached. Missing
-labels and invalid watts retain the shared parser's reason codes. Its two
-command timeouts must fit within `request_timeout_seconds` with HTTP overhead.
+labels and invalid watts retain the shared parser's reason codes. Its
+metric-command timeout must fit within `request_timeout_seconds` with HTTP overhead.
 The existing collector timestamps requests on the head node; AMD SMI owns the
 sensor's sampling cadence. The adapter does not reproduce the native
 InferenceX watch loop or its energy-accumulator sidecars.

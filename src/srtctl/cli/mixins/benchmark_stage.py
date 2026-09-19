@@ -623,6 +623,8 @@ class BenchmarkStageMixin:
         self.benchmark_child_allows_window_mutation = False
         output_stream = LogOutputStreamer(log_file) if self.config.benchmark.stream_output is True else None
         try:
+            if output_stream is not None:
+                logger.info("Starting benchmark output streaming to stdout")
             while proc.poll() is None:
                 if stop_event.is_set():
                     logger.info("Stop requested, terminating benchmark")

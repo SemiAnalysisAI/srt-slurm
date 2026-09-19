@@ -667,6 +667,7 @@ class BenchmarkStageMixin:
                 self.benchmark_child_allows_window_mutation = True
             if output_stream is not None:
                 output_stream.poll(final=True)
+                logger.info("End of streamed benchmark logs")
             if host_sampler is not None:
                 host_sampler.stop()
 

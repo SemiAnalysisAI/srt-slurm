@@ -204,6 +204,7 @@ def start_srun_process(
     cpu_bind: str | None = None,
     het_group: int | None = None,
     step_name: str | None = None,
+    working_directory: str | None = None,
 ) -> subprocess.Popen:
     """Start a process via srun with container support.
 
@@ -226,6 +227,7 @@ def start_srun_process(
         step_name: Name the Slurm step (``srun --job-name``) so it can be found in
             ``squeue --steps`` and signalled with ``scancel --signal`` later. SIGTERM
             to the srun process itself only aborts the step (the task is SIGKILLed).
+        working_directory: Directory inside the container, applied before exec.
         srun_options: Additional srun options as dict
         srun_export_env: Env vars to set in the srun *task* environment (rendered as
             ``--export=ALL,K=V,...``). Unlike env_to_set (which exports inside the
@@ -339,6 +341,9 @@ def start_srun_process(
         if bash_preamble:
             bash_parts.append(bash_preamble)
 
+        if working_directory is not None:
+            bash_parts.append("cd -- " + shlex.quote(working_directory))
+
         # exec the main command so it replaces bash as the step's task: srun forwards
         # SIGTERM to the task, and a bash -c parent would hold the signal until its
         # child exited, so the child was only ever SIGKILLed at the cleanup timeout
@@ -349,6 +354,8 @@ def start_srun_process(
         bash_command = " && ".join(bash_parts)
         srun_cmd.extend(["bash", "-c", bash_command])
     else:
+        if working_directory is not None or env_to_set or env_to_unset:
+            raise ValueError("working_directory and environment edits require the native wrapper")
         cluster_preamble = _get_cluster_bash_preamble()
         if cluster_preamble:
             logger.warning(

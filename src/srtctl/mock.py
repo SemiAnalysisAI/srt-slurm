@@ -67,13 +67,6 @@ class FakePopen:
         self.stderr = None
         self.stdin = None
 
-    @property
-    def returncode(self) -> int | None:
-        # Match subprocess.Popen — .poll() sets returncode as a side effect,
-        # so force one poll before the attribute is read.
-        self.poll()
-        return self._returncode
-
         if self._output is not None:
             self._output.parent.mkdir(parents=True, exist_ok=True)
             header = (
@@ -83,6 +76,13 @@ class FakePopen:
                 + "\n"
             )
             self._output.write_text(header)
+
+    @property
+    def returncode(self) -> int | None:
+        # Match subprocess.Popen — .poll() sets returncode as a side effect,
+        # so force one poll before the attribute is read.
+        self.poll()
+        return self._returncode
 
     def _finalize(self) -> None:
         if self._returncode is not None:
@@ -226,7 +226,11 @@ def mock_infrastructure(*, options: MockOptions, output_dir: Path):
         return FakePopen(
             cmd=cmd,
             output=kwargs.get("output"),
-            duration_s=options.child_duration_s,
+            # Native named servers must remain alive until cleanup. The client
+            # and one-shot preparation steps have bounded completion instead.
+            duration_s=float("inf")
+            if kwargs.get("step_name") not in (None, "benchmark-client")
+            else options.child_duration_s,
         )
 
     def _fake_wait_for_port(*_args, **_kwargs) -> bool:

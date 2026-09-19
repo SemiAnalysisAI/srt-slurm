@@ -449,6 +449,9 @@ class BenchmarkStageMixin:
             container_image=str(container_image),
             container_mounts=container_mounts,
             env_to_set=env_to_set,
+            env_to_unset=runner.get_environment_unset(self.config, self.runtime),
+            working_directory=runner.get_working_directory(self.config, self.runtime),
+            step_name="benchmark-client",
             srun_options=self.runtime.srun_options,
             het_group=self.runtime.nodes.het_group_for(bench_node),
         )
@@ -740,6 +743,10 @@ class BenchmarkStageMixin:
         # command should target http://$SRT_FRONTEND_HOST:$SRT_FRONTEND_PORT.
         env["SRT_FRONTEND_HOST"] = get_hostname_ip(self._public_api_node(), self.runtime.network_interface)
         env["SRT_FRONTEND_PORT"] = str(self.runtime.frontend_port)
+        env["SRT_ENDPOINT"] = f"http://{url_host(env['SRT_FRONTEND_HOST'])}:{self.runtime.frontend_port}"
+        env["SRT_JOB_ID"] = self.runtime.job_id
+        env["SRT_LOG_DIR"] = "/logs"
+        env["SRT_MODEL_NAME"] = self.config.served_model_name
 
         # Propagate top-level recipe environment to the bench step. Workers
         # already get this via worker_stage; benches need it too for things

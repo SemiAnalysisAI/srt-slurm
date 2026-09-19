@@ -355,6 +355,23 @@ class TestDryRunEnvironment:
 
 
 class TestDryRunSrunOptions:
+    def test_literal_client_context_is_visible(self, capsys):
+        config = _make_config(
+            {
+                "benchmark": {
+                    "type": "custom",
+                    "argv": ["python3", "-m", "example.client"],
+                    "cwd": "/ix",
+                    "env_unset": ["SIMULATE"],
+                }
+            }
+        )
+        show_config_details(config)
+        output = capsys.readouterr().out
+        assert "example.client" in output
+        assert "/ix" in output
+        assert "SIMULATE" in output
+
     """Test that srun options appear in dry-run output."""
 
     def test_srun_options_shown(self, capsys):

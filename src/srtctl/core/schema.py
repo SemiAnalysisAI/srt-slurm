@@ -847,6 +847,13 @@ class BenchmarkConfig:
     # Render any parameters when generating the recipe. See
     # srtctl.benchmarks.custom.CustomBenchmarkRunner for details.
     command: str | None = None
+    # Literal executable and arguments for a custom client; mutually exclusive
+    # with command. No shell or placeholder expansion is performed.
+    argv: list[str] | None = None
+    # Container working directory for the custom client.
+    cwd: str | None = None
+    # Variables removed from the inherited client environment.
+    env_unset: list[str] = field(default_factory=list)
     container_image: str | None = None
     env: dict[str, str] = field(default_factory=dict)
     # aiperf pip install spec (e.g., "aiperf>=0.7.0", "aiperf @ git+https://...@commit")

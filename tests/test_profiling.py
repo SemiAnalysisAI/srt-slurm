@@ -432,6 +432,7 @@ class TestVllmNsysProfilerConfig:
         runtime = SimpleNamespace(
             model_path=Path("/model"),
             is_hf_model=False,
+            worker_model_arg="/model",
             request_plane="nats",
             network_interface="eth0",
         )

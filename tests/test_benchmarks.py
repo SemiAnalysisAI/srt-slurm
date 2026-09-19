@@ -279,6 +279,7 @@ class TestCustomBenchmarkRunner:
 
         stage = Stage()
         stage.config = SimpleNamespace(
+            served_model_name="test-model",
             benchmark=SimpleNamespace(type=benchmark_type, aiperf_package=None),
             backend=backend,
             backend_type=backend_type,
@@ -289,6 +290,7 @@ class TestCustomBenchmarkRunner:
             telemetry=SimpleNamespace(enabled=False),
         )
         stage.runtime = SimpleNamespace(
+            job_id="12345",
             environment=environment or {},
             frontend_port=8000,
             network_interface="ibp1s0",
@@ -308,7 +310,7 @@ class TestCustomBenchmarkRunner:
             benchmark=BenchmarkConfig(type="custom"),
         )
         errors = runner.validate_config(config)
-        assert errors == ["benchmark.command is required for benchmark.type=custom"]
+        assert errors == ["Exactly one of benchmark.command or benchmark.argv is required for benchmark.type=custom"]
 
     def test_build_command_uses_custom_container_and_env(self):
         from unittest.mock import MagicMock

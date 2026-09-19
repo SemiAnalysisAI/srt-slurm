@@ -185,6 +185,9 @@ Benchmark configuration.
 | `use_chat_template` | bool | `True` | Pass --use-chat-template to benchmark (default: true) |
 | `reuse_http_connections` | bool | `False` | SA-Bench Dynamo adapter: reuse a benchmark-scoped HTTP connection pool. Opt-in to preserve the historical per-request ClientSession behavior. |
 | `command` | str \| None | `None` | Custom benchmark hook. ``command`` is passed to ``bash -lc`` verbatim; srtctl does NOT substitute placeholders like ``{nginx_url}`` or ``{slurm_job_id}``. Render any parameters when generating the recipe. See srtctl.benchmarks.custom.CustomBenchmarkRunner for details. |
+| `argv` | list[str] \| None | `None` | Literal executable and arguments for a custom client; mutually exclusive with command. No shell or placeholder expansion is performed. |
+| `cwd` | str \| None | `None` | Container working directory for the custom client. |
+| `env_unset` | list[str] | `[]` | Variables removed from the inherited client environment. |
 | `container_image` | str \| None | `None` |  |
 | `env` | dict[str, str] | `{}` |  |
 | `aiperf_package` | str \| None | `None` | aiperf pip install spec (e.g., "aiperf>=0.7.0", "aiperf @ git+https://...@commit") If set, runs pip install <spec> before benchmarking. Upgrades if already installed. |

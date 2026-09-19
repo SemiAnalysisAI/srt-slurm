@@ -15,7 +15,6 @@ import json
 import logging
 import math
 import subprocess
-from contextlib import suppress
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
@@ -27,7 +26,7 @@ def _value(raw: object, unit: str) -> str:
     if not isinstance(raw, dict) or raw.get("unit") != unit:
         return "NaN"
     value = raw.get("value")
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if type(value) not in (int, float):
         return "NaN"
     return str(value)
 
@@ -38,17 +37,11 @@ def render_metrics(identities: list[dict[str, Any]], metrics: dict[str, Any]) ->
     Invalid metric values and absent labels remain visible to the shared
     parser, which assigns the established power-contract reason codes.
     """
-    by_index: dict[str, str] = {}
+    # Preserve ambiguous joins as duplicates for the shared per-GPU validation.
+    by_index: dict[str, list[dict[str, Any]]] = {}
     for device in identities:
         index = str(device.get("gpu", ""))
-        uuid = device.get("uuid", "")
-        if uuid == "N/A":
-            uuid = ""
-        if device.get("partition_id") not in (None, 0, "0", "N/A"):
-            raise ValueError("partitioned GPU identity is unsupported")
-        if index in by_index:
-            raise ValueError("ambiguous GPU identity")
-        by_index[index] = uuid
+        by_index.setdefault(index, []).append(device)
 
     lines = [
         "# HELP amd_smi_socket_power_watts AMD SMI power.socket_power in watts.",
@@ -57,16 +50,20 @@ def render_metrics(identities: list[dict[str, Any]], metrics: dict[str, Any]) ->
     ]
     for device in metrics["gpu_data"]:
         index = str(device.get("gpu", ""))
-        # JSON string escaping is also valid for the label characters emitted
-        # here (UUIDs and decimal indices); emit Unicode without JSON-only escapes.
-        uuid = by_index.get(index, "")
-        labels = f"gpu={json.dumps(index, ensure_ascii=False)},uuid={json.dumps(uuid, ensure_ascii=False)}"
         power = device.get("power")
         raw_power = power.get("socket_power") if isinstance(power, dict) else None
-        lines.append(f"amd_smi_socket_power_watts{{{labels}}} {_value(raw_power, 'W')}")
         usage = device.get("usage")
-        if isinstance(usage, dict) and "gfx_activity" in usage:
-            lines.append(f"amd_smi_gfx_activity_percent{{{labels}}} {_value(usage['gfx_activity'], '%')}")
+        for identity in by_index.get(index, [{}]):
+            uuid = identity.get("uuid", "")
+            if uuid == "N/A":
+                uuid = ""
+            labels = f"gpu={json.dumps(index)},uuid={json.dumps(uuid)}"
+            partition = identity.get("partition_id")
+            if partition not in (None, 0, "0", "N/A"):
+                labels += f",partition_id={json.dumps(str(partition))}"
+            lines.append(f"amd_smi_socket_power_watts{{{labels}}} {_value(raw_power, 'W')}")
+            if isinstance(usage, dict) and "gfx_activity" in usage:
+                lines.append(f"amd_smi_gfx_activity_percent{{{labels}}} {_value(usage['gfx_activity'], '%')}")
     return "\n".join(lines) + "\n"
 
 
@@ -97,9 +94,7 @@ def make_server(host: str, port: int, *, binary: str = "amd-smi", command_timeou
             self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
-            # A timed-out collector has already recorded the failure.
-            with suppress(BrokenPipeError, ConnectionResetError):
-                self.wfile.write(payload)
+            self.wfile.write(payload)
 
         def log_message(self, format: str, *args: object) -> None:
             logger.debug(format, *args)

@@ -91,6 +91,7 @@ _RUNTIME_ONLY_REASON_CODES = frozenset(
         Reason.GPU_UUID_MISSING,
         Reason.INVALID_POWER_VALUE,
         Reason.MIG_INSTANCE_UNSUPPORTED,
+        Reason.GPU_PARTITION_UNSUPPORTED,
         Reason.SAMPLES_DIGEST_UNAVAILABLE,
         Reason.COLLECTOR_EXCEPTION,
         Reason.COLLECTOR_INTERRUPTED,
@@ -264,11 +265,8 @@ def _check_wire_contract(manifest: dict[str, Any]) -> list[str]:
     # silently inherit NVIDIA labels or scope during an offline audit.
     profile = DEFAULT_POWER_PROFILE
     if "power_profile" in manifest:
-        raw_profile = manifest["power_profile"]
         try:
-            if not isinstance(raw_profile, dict) or set(raw_profile) != set(DEFAULT_POWER_PROFILE.to_dict()):
-                raise ValueError("expected a complete metric profile object")
-            profile = PowerMetricProfile(**raw_profile)
+            profile = PowerMetricProfile.from_manifest(manifest["power_profile"])
         except (TypeError, ValueError) as exc:
             failures.append(f"power_profile is invalid: {exc}")
         else:

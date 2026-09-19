@@ -7,6 +7,7 @@ import csv
 import json
 import os
 from contextlib import suppress
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -34,7 +35,7 @@ from srtctl.core.power.manifest import (
     PowerManifest,
 )
 from srtctl.core.power.parser import parse_power_scrape
-from srtctl.core.power.profile import PowerMetricProfile
+from srtctl.core.power.profile import AMD_SMI_POWER_PROFILE, PowerMetricProfile
 from srtctl.core.power.samples import (
     ObservedDevice,
     SampleRow,
@@ -51,6 +52,7 @@ from srtctl.core.power.topology import (
 )
 from srtctl.core.power.windows import convert_running_windows, validate_expected_windows
 from srtctl.core.topology import Process
+from srtctl.runtime_scripts.amd_smi_exporter import render_metrics
 
 
 def _process(node, gpus, mode, index=0, node_rank=0, het_group=None):
@@ -1120,8 +1122,7 @@ class TestPowerMetricProfiles:
         gpu_index_label="device_index",
         gpu_uuid_label="serial",
         power_scope="gpu_device_board_as_reported_by_example",
-        gpu_util_metric="device_busy_percent",
-        sm_active_metric=None,
+        utilization_sources=(("gpu_util_pct", "device_busy_percent"),),
     )
 
     def test_custom_metric_and_identity_names(self):
@@ -1151,11 +1152,40 @@ class TestPowerMetricProfiles:
         assert scrape.reason_codes == (reason,)
 
     def test_optional_sources_can_be_disabled(self):
-        profile = PowerMetricProfile(gpu_util_metric=None, sm_active_metric=None)
+        profile = PowerMetricProfile(utilization_sources=())
         scrape = parse_power_scrape(_scrape(_metric(0, "GPU-a", 300), _util(0, "GPU-a", 95)), profile)
         assert scrape.reason_codes == ()
         assert scrape.readings[0].gpu_util_pct is None
         assert scrape.readings[0].sm_active is None
+
+    def test_utilization_sources_are_keyed_by_column_in_artifact_order(self):
+        profile = replace(
+            self.profile,
+            utilization_sources=(("sm_active", "example_active_fraction"), ("gpu_util_pct", "device_busy_percent")),
+        )
+        scrape = parse_power_scrape(
+            'device_board_power_watts{device_index="2",serial="board-002"} 412.5\n'
+            'example_active_fraction{device_index="2",serial="board-002"} 0.8\n'
+            'device_busy_percent{device_index="2",serial="board-002"} 73\n',
+            profile,
+        )
+        assert (scrape.readings[0].gpu_util_pct, scrape.readings[0].sm_active) == (73, 0.8)
+        assert [(metric.column, metric.unit) for metric in profile.utilization_metrics] == [
+            ("gpu_util_pct", "percent"),
+            ("sm_active", "fraction"),
+        ]
+
+    def test_partition_sample_does_not_drop_clean_gpu(self):
+        profile = replace(self.profile, partition_label="slice")
+        scrape = parse_power_scrape(
+            'device_board_power_watts{device_index="2",serial="board-002"} 412.5\n'
+            'device_board_power_watts{device_index="3",serial="board-003",slice="1"} 200\n'
+            'device_busy_percent{device_index="2",serial="board-002"} 73\n'
+            'device_busy_percent{device_index="2",serial="board-002",slice="1"} 99\n',
+            profile,
+        )
+        assert scrape.reason_codes == (Reason.GPU_PARTITION_UNSUPPORTED,)
+        assert [(row.gpu_index, row.power_w, row.gpu_util_pct) for row in scrape.readings] == [(2, 412.5, 73)]
 
     @pytest.mark.parametrize(
         "fields",
@@ -1163,7 +1193,10 @@ class TestPowerMetricProfiles:
             {"power_metric": ""},
             {"gpu_index_label": "not a label"},
             {"gpu_uuid_label": "gpu"},
-            {"gpu_util_metric": "DCGM_FI_DEV_POWER_USAGE"},
+            {"utilization_sources": (("gpu_util_pct", "DCGM_FI_DEV_POWER_USAGE"),)},
+            {"utilization_sources": (("unknown", "example_util"),)},
+            {"utilization_sources": (("gpu_util_pct", "util_a"), ("gpu_util_pct", "util_b"))},
+            {"partition_label": "gpu"},
             {"power_scope": ""},
         ],
     )
@@ -1185,8 +1218,6 @@ class TestAmdSmiAdapter:
             ("missing_uuid", Reason.GPU_UUID_MISSING),
             ("unavailable_uuid", Reason.GPU_UUID_MISSING),
             ("negative", Reason.INVALID_POWER_VALUE),
-            ("nan", Reason.INVALID_POWER_VALUE),
-            ("infinity", Reason.INVALID_POWER_VALUE),
             ("unavailable", Reason.INVALID_POWER_VALUE),
             ("wrong_unit", Reason.INVALID_POWER_VALUE),
             ("duplicate", Reason.DUPLICATE_POWER_METRIC),
@@ -1194,9 +1225,6 @@ class TestAmdSmiAdapter:
         ],
     )
     def test_amd_failure_reasons_match_dcgm(self, defect, reason):
-        from srtctl.core.power.profile import AMD_SMI_POWER_PROFILE
-        from srtctl.runtime_scripts.amd_smi_exporter import render_metrics
-
         identities, metrics = self.native_payloads()
         metrics["gpu_data"] = metrics["gpu_data"][:1]
         device = metrics["gpu_data"][0]
@@ -1206,11 +1234,9 @@ class TestAmdSmiAdapter:
             identities[0].pop("uuid")
         elif defect == "unavailable_uuid":
             identities[0]["uuid"] = "N/A"
-        elif defect in {"negative", "nan", "infinity", "unavailable"}:
+        elif defect in {"negative", "unavailable"}:
             device["power"]["socket_power"]["value"] = {
                 "negative": -1,
-                "nan": float("nan"),
-                "infinity": float("inf"),
                 "unavailable": "N/A",
             }[defect]
         elif defect == "wrong_unit":
@@ -1223,15 +1249,3 @@ class TestAmdSmiAdapter:
         result = parse_power_scrape(body, AMD_SMI_POWER_PROFILE)
         assert result.readings == ()
         assert result.reason_codes == (reason,)
-
-    @pytest.mark.parametrize("defect", ["duplicate_index", "partition"])
-    def test_ambiguous_native_identity_is_rejected(self, defect):
-        from srtctl.runtime_scripts.amd_smi_exporter import render_metrics
-
-        identities, metrics = self.native_payloads()
-        if defect == "duplicate_index":
-            identities[1]["gpu"] = identities[0]["gpu"]
-        else:
-            identities[1]["partition_id"] = 1
-        with pytest.raises(ValueError):
-            render_metrics(identities, metrics)

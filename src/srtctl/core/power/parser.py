@@ -114,6 +114,10 @@ def _collect_power(
         reasons.append(Reason.MIG_INSTANCE_UNSUPPORTED)
         return
 
+    if profile.partition_label and labels.get(profile.partition_label):
+        reasons.append(Reason.GPU_PARTITION_UNSUPPORTED)
+        return
+
     gpu_index = _parse_index(labels.get(profile.gpu_index_label))
     if gpu_index is None:
         reasons.append(Reason.GPU_INDEX_MISSING)
@@ -144,6 +148,8 @@ def _collect_utilization(
 ) -> None:
     """Optional metric: every rejection is silent, so no reason list is threaded through."""
     if any(labels.get(label) for label in _MIG_LABELS):
+        return
+    if profile.partition_label and labels.get(profile.partition_label):
         return
     gpu_index = _parse_index(labels.get(profile.gpu_index_label))
     if gpu_index is None:

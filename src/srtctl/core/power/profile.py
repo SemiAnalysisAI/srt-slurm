@@ -6,7 +6,8 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
+from typing import Any
 
 from srtctl.core.power.contract import (
     GPU_UTIL_METRIC,
@@ -65,5 +66,21 @@ class PowerMetricProfile:
             if source is not None
         )
 
+    def to_dict(self) -> dict[str, Any]:
+        """Self-contained mapping for retained artifact provenance."""
+        return asdict(self)
+
 
 DEFAULT_POWER_PROFILE = PowerMetricProfile()
+
+# The adapter reads AMD SMI's GPU socket sensor. This is deliberately not
+# described as the same measurement boundary as DCGM's device-board metric.
+AMD_SMI_POWER_PROFILE = PowerMetricProfile(
+    name="amd-smi-socket",
+    power_metric="amd_smi_socket_power_watts",
+    gpu_index_label="gpu",
+    gpu_uuid_label="uuid",
+    power_scope="gpu_socket_as_reported_by_amd_smi",
+    gpu_util_metric="amd_smi_gfx_activity_percent",
+    sm_active_metric=None,
+)

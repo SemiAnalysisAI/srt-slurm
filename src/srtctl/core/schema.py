@@ -50,6 +50,7 @@ from srtctl.core.formatting import (
 
 # Leaf module (stdlib-only imports), so this cannot cycle back into schema.
 from srtctl.core.power.contract import CONTAINER_LOG_DIR
+from srtctl.core.power.profile import DEFAULT_POWER_PROFILE, PowerMetricProfile
 from srtctl.core.source import DynamoSourceConfig, is_commit_sha
 from srtctl.ports import DYNAMO_SIDECAR_GRPC_PORT
 from srtctl.services.config import ServiceConfig
@@ -1260,8 +1261,15 @@ class TelemetryExporterConfig:
     port: int
     command: str | None = None
     binary: str | None = None
+    # Metric/identity mapping for GPU power; null retains the NVIDIA defaults.
+    power_profile: PowerMetricProfile | None = None
 
     Schema: ClassVar[type[Schema]] = Schema
+
+    @property
+    def resolved_power_profile(self) -> PowerMetricProfile:
+        """A supplied mapping, or the unchanged DCGM contract."""
+        return self.power_profile if self.power_profile is not None else DEFAULT_POWER_PROFILE
 
 
 # Built-in exporter defaults (sweep path only; the --bash lifecycle keys on the
@@ -1560,9 +1568,11 @@ class CpuPowerExporterConfig:
 
 @dataclass(frozen=True)
 class TelemetryConfig:
-    """DCGM power telemetry for benchmark measurement windows."""
+    """GPU power telemetry for benchmark measurement windows."""
 
     enabled: bool = False
+    # Compatibility name; the exporter profile selects metric semantics.
+    provider: Literal["dcgm-power"] = "dcgm-power"
     dcgm_exporter: TelemetryExporterConfig | None = None
     # Milliseconds between collector cycles. Replaces the retired
     # ``default_frequency``, which despite its name was a period in seconds
@@ -2936,7 +2946,7 @@ class SrtConfig:
                 )
 
     def _validate_dcgm_power(self):
-        """Validate DCGM power telemetry.
+        """Validate profile-driven GPU power telemetry.
 
         It runs its collector in the orchestrator process, so it needs neither
         the scraper image nor node_exporter. Sample and window timestamps must
@@ -2951,6 +2961,8 @@ class SrtConfig:
             raise ValidationError("telemetry.dcgm_exporter.container_image must be non-empty")
         if not 1 <= exporter.port <= 65535:
             raise ValidationError("telemetry.dcgm_exporter.port must be in 1..65535")
+        if exporter.resolved_power_profile != DEFAULT_POWER_PROFILE and not exporter.command:
+            raise ValidationError("a custom power_profile requires an explicit telemetry.dcgm_exporter.command")
 
         for name in ("startup_timeout_seconds",):
             if not _is_finite_positive(getattr(telemetry, name)):

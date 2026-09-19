@@ -168,7 +168,7 @@ class TelemetryStageMixin:
         return managed
 
     def start_power_telemetry(self, registry: ProcessRegistry) -> PowerTelemetrySession | None:
-        """Start DCGM power telemetry when it is enabled.
+        """Start profile-driven GPU power telemetry when it is enabled.
 
         Every provider-originated startup failure becomes session state once the
         session exists, so the orchestrator can still finalize artifacts and
@@ -202,6 +202,7 @@ class TelemetryStageMixin:
                 exporter_command=command,
                 network_interface=self.runtime.network_interface,
                 producer_git_commit=read_producer_commit(),
+                power_profile=exporter_config.resolved_power_profile,
             ),
             expected_devices=build_expected_devices(self.backend_processes),
             expected_windows=[

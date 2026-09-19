@@ -1214,3 +1214,86 @@ class TestPowerMetricProfiles:
     def test_invalid_mappings_fail_before_collection(self, fields):
         with pytest.raises(ValueError):
             PowerMetricProfile(**fields)
+
+
+class TestAmdSmiAdapter:
+    @staticmethod
+    def native_payloads():
+        root = Path(__file__).parent / "fixtures" / "amd-smi"
+        return json.loads((root / "list.json").read_text()), json.loads((root / "metric.json").read_text())
+
+    def test_native_json_preserves_physical_identity_watts_and_utilization(self):
+        from srtctl.core.power.profile import AMD_SMI_POWER_PROFILE
+        from srtctl.runtime_scripts.amd_smi_exporter import render_metrics
+
+        identities, metrics = self.native_payloads()
+        # An unrelated power limit must never become the measurement.
+        metrics["gpu_data"][0]["power"]["power_limit"] = {"value": 9999, "unit": "W"}
+        result = parse_power_scrape(render_metrics(identities, metrics), AMD_SMI_POWER_PROFILE)
+        assert result.reason_codes == ()
+        assert [(r.gpu_index, r.gpu_uuid, r.power_w, r.gpu_util_pct, r.sm_active) for r in result.readings] == [
+            (0, "12345678-0000-1000-8000-000000000001", 440, 85, None),
+            (3, "12345678-0000-1000-8000-000000000004", 480.5, 98, None),
+        ]
+
+    @pytest.mark.parametrize(
+        ("defect", "reason"),
+        [
+            ("missing_index", Reason.GPU_INDEX_MISSING),
+            ("missing_uuid", Reason.GPU_UUID_MISSING),
+            ("unavailable_uuid", Reason.GPU_UUID_MISSING),
+            ("negative", Reason.INVALID_POWER_VALUE),
+            ("nan", Reason.INVALID_POWER_VALUE),
+            ("infinity", Reason.INVALID_POWER_VALUE),
+            ("unavailable", Reason.INVALID_POWER_VALUE),
+            ("wrong_unit", Reason.INVALID_POWER_VALUE),
+            ("duplicate", Reason.DUPLICATE_POWER_METRIC),
+            ("malformed", Reason.ENDPOINT_PARSE_ERROR),
+        ],
+    )
+    def test_amd_failure_reasons_match_dcgm(self, defect, reason):
+        from srtctl.core.power.profile import AMD_SMI_POWER_PROFILE
+        from srtctl.runtime_scripts.amd_smi_exporter import render_metrics
+
+        identities, metrics = self.native_payloads()
+        metrics["gpu_data"] = metrics["gpu_data"][:1]
+        device = metrics["gpu_data"][0]
+        if defect == "missing_index":
+            device.pop("gpu")
+        elif defect == "missing_uuid":
+            identities[0].pop("uuid")
+        elif defect == "unavailable_uuid":
+            identities[0]["uuid"] = "N/A"
+        elif defect in {"negative", "nan", "infinity", "unavailable"}:
+            device["power"]["socket_power"]["value"] = {
+                "negative": -1,
+                "nan": float("nan"),
+                "infinity": float("inf"),
+                "unavailable": "N/A",
+            }[defect]
+        elif defect == "wrong_unit":
+            device["power"]["socket_power"]["unit"] = "mW"
+        elif defect == "duplicate":
+            metrics["gpu_data"].append(device)
+        body = render_metrics(identities, metrics)
+        if defect == "malformed":
+            body += 'amd_smi_socket_power_watts{broken="quote} value\n'
+        result = parse_power_scrape(body, AMD_SMI_POWER_PROFILE)
+        assert result.readings == ()
+        assert result.reason_codes == (reason,)
+
+    @pytest.mark.parametrize("defect", ["duplicate_index", "duplicate_uuid", "partition", "invalid_json_shape"])
+    def test_ambiguous_native_identity_is_rejected(self, defect):
+        from srtctl.runtime_scripts.amd_smi_exporter import render_metrics
+
+        identities, metrics = self.native_payloads()
+        if defect == "duplicate_index":
+            identities[1]["gpu"] = identities[0]["gpu"]
+        elif defect == "duplicate_uuid":
+            identities[1]["uuid"] = identities[0]["uuid"]
+        elif defect == "partition":
+            identities[1]["partition_id"] = 1
+        else:
+            identities = "not device records"
+        with pytest.raises(ValueError):
+            render_metrics(identities, metrics)

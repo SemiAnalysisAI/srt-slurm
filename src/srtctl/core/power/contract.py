@@ -16,12 +16,18 @@ from typing import Any, TypeGuard, cast
 
 from srtctl.core.power.cpu_rails import RAIL_COLUMN_NAMES as CPU_RAIL_COLUMN_NAMES
 
+# v1 fixes the artifact layout, not a vendor or sensor boundary. Non-default
+# sources carry additive profile provenance; old DCGM-only readers reject those
+# sources. Keep NVIDIA's existing version and bytes unchanged.
 SCHEMA_VERSION = 1
 # The samples CSV is versioned independently: SCHEMA_VERSION is shared with
 # manifest.json and with measurement-window files whose writer keeps its own copy.
 SAMPLES_SCHEMA_VERSION_V1 = 1
 SAMPLES_SCHEMA_VERSION = 2
 
+# Legacy format identifiers (also provider and dcgm_exporter keys), not claims
+# that the data came from NVIDIA. source_metric and power_scope identify the
+# actual measurement source; power_profile describes non-default mappings.
 PRODUCER = "srt-slurm.dcgm-power"
 POWER_METRIC = "DCGM_FI_DEV_POWER_USAGE"
 POWER_UNIT = "W"
@@ -138,6 +144,7 @@ class Reason:
     EXPECTED_DEVICE_MISSING = "expected_device_missing"
     GPU_UUID_CHANGED = "gpu_uuid_changed"
     MIG_INSTANCE_UNSUPPORTED = "mig_instance_unsupported"
+    GPU_PARTITION_UNSUPPORTED = "gpu_partition_unsupported"
     TIMESTAMP_NON_MONOTONIC = "timestamp_non_monotonic"
     CONFLICTING_WORKER_ROLES = "conflicting_worker_roles"
     CONFLICTING_HET_GROUPS = "conflicting_het_groups"

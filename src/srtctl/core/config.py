@@ -257,6 +257,11 @@ def resolve_config_with_defaults(user_config: dict[str, Any], cluster_config: di
     if "default_gpu_exporter" in cluster_config:
         tachometer = config.setdefault("observability", {}).setdefault("tachometer", {})
         tachometer.setdefault("default_gpu_exporter", copy.deepcopy(cluster_config["default_gpu_exporter"]))
+        telemetry = config.get("telemetry") or {}
+        # A GPU power request inherits the whole exporter/profile together.
+        # CPU legs are independent; an explicit null opts out of GPU collection.
+        if telemetry.get("enabled"):
+            telemetry.setdefault("dcgm_exporter", copy.deepcopy(cluster_config["default_gpu_exporter"]))
 
     # Resolve every container alias in one pass (model.container,
     # frontend.container_image / nginx_container, benchmark.container_image,

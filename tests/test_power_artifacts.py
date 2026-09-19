@@ -7,6 +7,7 @@ import csv
 import json
 import os
 from contextlib import suppress
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,7 @@ from srtctl.core.power.manifest import (
     PowerManifest,
 )
 from srtctl.core.power.parser import parse_power_scrape
+from srtctl.core.power.profile import AMD_SMI_POWER_PROFILE, PowerMetricProfile
 from srtctl.core.power.samples import (
     ObservedDevice,
     SampleRow,
@@ -50,6 +52,7 @@ from srtctl.core.power.topology import (
 )
 from srtctl.core.power.windows import convert_running_windows, validate_expected_windows
 from srtctl.core.topology import Process
+from srtctl.runtime_scripts.amd_smi_exporter import render_metrics
 
 
 def _process(node, gpus, mode, index=0, node_rank=0, het_group=None):
@@ -1108,3 +1111,141 @@ class TestStorageSubdirSafety:
     @pytest.mark.parametrize("value", ["", "/power", "../power", "power/../..", "a/../../b", "~/power"])
     def test_unsafe_paths_rejected(self, value):
         assert is_safe_relative_subpath(value) is False
+
+
+class TestPowerMetricProfiles:
+    """A new Prometheus source needs configuration, not a parser branch."""
+
+    profile = PowerMetricProfile(
+        name="example-board-exporter",
+        power_metric="device_board_power_watts",
+        gpu_index_label="device_index",
+        gpu_uuid_label="serial",
+        power_scope="gpu_device_board_as_reported_by_example",
+        utilization_sources=(("gpu_util_pct", "device_busy_percent"),),
+    )
+
+    def test_custom_metric_and_identity_names(self):
+        scrape = parse_power_scrape(
+            "# TYPE device_board_power_watts gauge\n"
+            'device_board_power_watts{device_index="2",serial="board-002",Hostname="ignored"} 412.5\n'
+            'device_busy_percent{device_index="2",serial="board-002"} 73\n'
+            'unrelated_temperature{device_index="2"} 60\n',
+            self.profile,
+        )
+        assert scrape.reason_codes == ()
+        assert len(scrape.readings) == 1
+        reading = scrape.readings[0]
+        assert (reading.gpu_index, reading.gpu_uuid, reading.power_w) == (2, "board-002", 412.5)
+        assert (reading.gpu_util_pct, reading.sm_active) == (73, None)
+
+    @pytest.mark.parametrize(
+        ("missing_label", "reason"),
+        [("device_index", Reason.GPU_INDEX_MISSING), ("serial", Reason.GPU_UUID_MISSING)],
+    )
+    def test_custom_identity_labels_are_required(self, missing_label, reason):
+        labels = {"device_index": "2", "serial": "board-002"}
+        labels.pop(missing_label)
+        label_text = ",".join(f'{key}="{value}"' for key, value in labels.items())
+        scrape = parse_power_scrape(f"device_board_power_watts{{{label_text}}} 400\n", self.profile)
+        assert scrape.readings == ()
+        assert scrape.reason_codes == (reason,)
+
+    def test_optional_sources_can_be_disabled(self):
+        profile = PowerMetricProfile(utilization_sources=())
+        scrape = parse_power_scrape(_scrape(_metric(0, "GPU-a", 300), _util(0, "GPU-a", 95)), profile)
+        assert scrape.reason_codes == ()
+        assert scrape.readings[0].gpu_util_pct is None
+        assert scrape.readings[0].sm_active is None
+
+    def test_utilization_sources_are_keyed_by_column_in_artifact_order(self):
+        profile = replace(
+            self.profile,
+            utilization_sources=(("sm_active", "example_active_fraction"), ("gpu_util_pct", "device_busy_percent")),
+        )
+        scrape = parse_power_scrape(
+            'device_board_power_watts{device_index="2",serial="board-002"} 412.5\n'
+            'example_active_fraction{device_index="2",serial="board-002"} 0.8\n'
+            'device_busy_percent{device_index="2",serial="board-002"} 73\n',
+            profile,
+        )
+        assert (scrape.readings[0].gpu_util_pct, scrape.readings[0].sm_active) == (73, 0.8)
+        assert [(metric.column, metric.unit) for metric in profile.utilization_metrics] == [
+            ("gpu_util_pct", "percent"),
+            ("sm_active", "fraction"),
+        ]
+
+    def test_partition_sample_does_not_drop_clean_gpu(self):
+        profile = replace(self.profile, partition_label="slice")
+        scrape = parse_power_scrape(
+            'device_board_power_watts{device_index="2",serial="board-002"} 412.5\n'
+            'device_board_power_watts{device_index="3",serial="board-003",slice="1"} 200\n'
+            'device_busy_percent{device_index="2",serial="board-002"} 73\n'
+            'device_busy_percent{device_index="2",serial="board-002",slice="1"} 99\n',
+            profile,
+        )
+        assert scrape.reason_codes == (Reason.GPU_PARTITION_UNSUPPORTED,)
+        assert [(row.gpu_index, row.power_w, row.gpu_util_pct) for row in scrape.readings] == [(2, 412.5, 73)]
+
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            {"power_metric": ""},
+            {"gpu_index_label": "not a label"},
+            {"gpu_uuid_label": "gpu"},
+            {"utilization_sources": (("gpu_util_pct", "DCGM_FI_DEV_POWER_USAGE"),)},
+            {"utilization_sources": (("unknown", "example_util"),)},
+            {"utilization_sources": (("gpu_util_pct", "util_a"), ("gpu_util_pct", "util_b"))},
+            {"partition_label": "gpu"},
+            {"power_scope": ""},
+        ],
+    )
+    def test_invalid_mappings_fail_before_collection(self, fields):
+        with pytest.raises(ValueError):
+            PowerMetricProfile(**fields)
+
+
+class TestAmdSmiAdapter:
+    @staticmethod
+    def native_payloads():
+        root = Path(__file__).parent / "fixtures" / "amd-smi"
+        return json.loads((root / "list.json").read_text()), json.loads((root / "metric.json").read_text())
+
+    @pytest.mark.parametrize(
+        ("defect", "reason"),
+        [
+            ("missing_index", Reason.GPU_INDEX_MISSING),
+            ("missing_uuid", Reason.GPU_UUID_MISSING),
+            ("unavailable_uuid", Reason.GPU_UUID_MISSING),
+            ("negative", Reason.INVALID_POWER_VALUE),
+            ("unavailable", Reason.INVALID_POWER_VALUE),
+            ("wrong_unit", Reason.INVALID_POWER_VALUE),
+            ("duplicate", Reason.DUPLICATE_POWER_METRIC),
+            ("malformed", Reason.ENDPOINT_PARSE_ERROR),
+        ],
+    )
+    def test_amd_failure_reasons_match_dcgm(self, defect, reason):
+        identities, metrics = self.native_payloads()
+        metrics["gpu_data"] = metrics["gpu_data"][:1]
+        device = metrics["gpu_data"][0]
+        if defect == "missing_index":
+            device.pop("gpu")
+        elif defect == "missing_uuid":
+            identities[0].pop("uuid")
+        elif defect == "unavailable_uuid":
+            identities[0]["uuid"] = "N/A"
+        elif defect in {"negative", "unavailable"}:
+            device["power"]["socket_power"]["value"] = {
+                "negative": -1,
+                "unavailable": "N/A",
+            }[defect]
+        elif defect == "wrong_unit":
+            device["power"]["socket_power"]["unit"] = "mW"
+        elif defect == "duplicate":
+            metrics["gpu_data"].append(device)
+        body = render_metrics(identities, metrics)
+        if defect == "malformed":
+            body += 'amd_smi_socket_power_watts{broken="quote} value\n'
+        result = parse_power_scrape(body, AMD_SMI_POWER_PROFILE)
+        assert result.readings == ()
+        assert result.reason_codes == (reason,)

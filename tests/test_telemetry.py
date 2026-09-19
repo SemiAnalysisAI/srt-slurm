@@ -9,15 +9,19 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 import yaml
 from marshmallow import ValidationError
 
 from srtctl.cli.mixins.frontend_stage import FrontendTopology
 from srtctl.cli.mixins.telemetry_stage import TelemetryStageMixin
+from srtctl.core.config import resolve_config_with_defaults
 from srtctl.core.power.contract import Reason
+from srtctl.core.power.profile import AMD_SMI_POWER_PROFILE, DEFAULT_POWER_PROFILE
 from srtctl.core.processes import ProcessRegistry
 from srtctl.core.schema import (
     BenchmarkConfig,
+    ClusterConfig,
     CpuPowerConfig,
     CpuPowerExporterConfig,
     FrontendConfig,
@@ -1988,3 +1992,127 @@ class TestTelemetryNodes:
                 return []
 
         assert Harness()._telemetry_nodes() == ["pool-a"]
+
+
+def _amd_power_exporter():
+    return {
+        "container_image": "amd-smi-image",
+        "port": 9402,
+        "command": "python3 /srtctl-runtime/amd_smi_exporter.py --port {port}",
+        "power_profile": AMD_SMI_POWER_PROFILE.to_dict(),
+    }
+
+
+def _profile_recipe():
+    return {
+        "name": "power-profile-test",
+        "model": {"path": "/model", "container": "/image", "precision": "bf16"},
+        "resources": {"gpu_type": "mi355x", "agg_nodes": 1},
+        "benchmark": {"type": "manual", "concurrencies": [1]},
+        "telemetry": {"enabled": True, "provider": "dcgm-power"},
+    }
+
+
+@pytest.mark.parametrize("recipe_override", [False, True])
+def test_power_profile_and_exporter_resolve_together(recipe_override):
+    cluster = ClusterConfig.Schema().dump(
+        ClusterConfig.Schema().load(
+            {
+                "default_gpu_exporter": _amd_power_exporter(),
+                "containers": {"amd-smi-image": "rocm:test"},
+            }
+        )
+    )
+    recipe = _profile_recipe()
+    if recipe_override:
+        recipe["telemetry"]["dcgm_exporter"] = {"container_image": "dcgm:test", "port": 9401}
+    config = SrtConfig.Schema().load(resolve_config_with_defaults(recipe, cluster))
+    exporter = config.telemetry.dcgm_exporter
+    assert config.telemetry.provider == "dcgm-power"
+    assert (exporter.container_image, exporter.port) == (
+        ("dcgm:test", 9401) if recipe_override else ("rocm:test", 9402)
+    )
+    assert exporter.resolved_power_profile == (DEFAULT_POWER_PROFILE if recipe_override else AMD_SMI_POWER_PROFILE)
+
+
+@pytest.mark.parametrize("disabled_at", ["cluster", "recipe"])
+def test_explicit_null_disables_power_exporter_default(disabled_at):
+    cluster = ClusterConfig.Schema().dump(
+        ClusterConfig.Schema().load(
+            {
+                "default_gpu_exporter": None if disabled_at == "cluster" else _amd_power_exporter(),
+            }
+        )
+    )
+    recipe = _profile_recipe()
+    if disabled_at == "recipe":
+        recipe["telemetry"]["dcgm_exporter"] = None
+    resolved = resolve_config_with_defaults(recipe, cluster)
+    assert resolved["telemetry"]["dcgm_exporter"] is None
+    # Enabled power with no remaining leg must not silently succeed or launch DCGM.
+    with pytest.raises(ValidationError, match="nothing to collect"):
+        SrtConfig.Schema().load(resolved)
+
+
+@pytest.mark.parametrize("cpu_leg", ["cpu_power", "cpu_power_exporter"])
+@pytest.mark.parametrize("disable_gpu", [False, True])
+def test_cluster_gpu_default_is_independent_of_cpu_collection(cpu_leg, disable_gpu):
+    recipe = _profile_recipe()
+    recipe["telemetry"][cpu_leg] = {"enabled": True} if cpu_leg == "cpu_power" else {"port": 9494}
+    if disable_gpu:
+        recipe["telemetry"]["dcgm_exporter"] = None
+    resolved = resolve_config_with_defaults(recipe, {"default_gpu_exporter": _amd_power_exporter()})
+    config = SrtConfig.Schema().load(resolved)
+    if disable_gpu:
+        assert config.telemetry.dcgm_exporter is None
+    else:
+        assert config.telemetry.dcgm_exporter.resolved_power_profile == AMD_SMI_POWER_PROFILE
+
+
+@pytest.mark.parametrize("telemetry", [None, {"enabled": True, "cpu_power": None}])
+def test_null_telemetry_fields_reach_schema_validation(telemetry):
+    recipe = _profile_recipe()
+    recipe["telemetry"] = telemetry
+    resolved = resolve_config_with_defaults(recipe, {"default_gpu_exporter": _amd_power_exporter()})
+    with pytest.raises(ValidationError, match="Field may not be null"):
+        SrtConfig.Schema().load(resolved)
+
+
+def test_recipe_can_explicitly_restore_gpu_exporter_when_cluster_default_is_null():
+    recipe = _profile_recipe()
+    recipe["telemetry"]["dcgm_exporter"] = _amd_power_exporter()
+    config = SrtConfig.Schema().load(resolve_config_with_defaults(recipe, {"default_gpu_exporter": None}))
+    assert config.telemetry.dcgm_exporter.resolved_power_profile == AMD_SMI_POWER_PROFILE
+
+
+def test_custom_profile_without_custom_command_cannot_accidentally_launch_dcgm():
+    recipe = _profile_recipe()
+    recipe["telemetry"]["dcgm_exporter"] = _amd_power_exporter()
+    recipe["telemetry"]["dcgm_exporter"].pop("command")
+    with pytest.raises(ValidationError, match="explicit.*command"):
+        SrtConfig.Schema().load(recipe)
+
+
+def test_amd_launch_uses_configured_command_and_profile(tmp_path):
+    harness = _power_harness(tmp_path, [_worker("node-a", [0, 3])])
+    harness.config = _make_config(
+        benchmark=_sa_bench(),
+        telemetry=_dcgm_power(
+            dcgm_exporter=TelemetryExporterConfig.Schema().load(_amd_power_exporter()),
+        ),
+    )
+    with (
+        patch("srtctl.cli.mixins.telemetry_stage.start_srun_process", return_value=_running_exporter()) as launch,
+        patch("srtctl.core.power.session.PowerTelemetrySession.start_and_wait_for_readiness", return_value=True),
+        patch("srtctl.core.power.session.PowerTelemetrySession.stop_and_finalize"),
+    ):
+        session = harness.start_power_telemetry(ProcessRegistry(job_id="12345"))
+    assert launch.call_args.kwargs["command"] == ["python3", "/srtctl-runtime/amd_smi_exporter.py", "--port", "9402"]
+    assert launch.call_args.kwargs["container_image"] == "amd-smi-image"
+    assert launch.call_args.kwargs["use_bash_wrapper"] is False
+    manifest = json.loads(session.manifest_path.read_text())
+    assert manifest["power_profile"] == AMD_SMI_POWER_PROFILE.to_dict()
+    assert manifest["dcgm_exporter"]["command"] == "python3 /srtctl-runtime/amd_smi_exporter.py --port 9402"
+    # No collector thread was started, but its initialized CSV still needs closing.
+    with patch("srtctl.core.power.session.requests.get", side_effect=requests.ConnectionError):
+        session.stop_and_finalize()

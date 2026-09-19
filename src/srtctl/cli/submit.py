@@ -722,11 +722,17 @@ def show_config_details(config: SrtConfig) -> None:
 
         if config.telemetry.enabled:
             exporter = config.telemetry.dcgm_exporter
-            details.add_row("telemetry", "provider", "dcgm-power")
+            details.add_row("telemetry", "provider", config.telemetry.provider)
             details.add_row("telemetry", "required", str(config.telemetry.required))
             details.add_row("telemetry", "artifacts", f"<log_dir>/{config.telemetry.storage_subdir}")
             if exporter is not None:
                 details.add_row("telemetry", "dcgm_exporter", f"{exporter.container_image} (port {exporter.port})")
+                if exporter.power_profile is not None:
+                    profile = exporter.power_profile
+                    details.add_row("telemetry", "power_profile", profile.name)
+                    details.add_row("telemetry", "power_metric", profile.power_metric)
+                    details.add_row("telemetry", "power_scope", profile.power_scope)
+                    details.add_row("telemetry", "exporter_command", exporter.command or "DCGM default")
 
             cpu_exporter = config.telemetry.cpu_power_exporter
             if cpu_exporter is not None:

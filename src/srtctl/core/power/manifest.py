@@ -11,15 +11,13 @@ from typing import Any
 from srtctl import __version__ as PRODUCER_VERSION
 from srtctl.core.power.contract import (
     CLOCK_SOURCE,
-    POWER_METRIC,
-    POWER_SCOPE,
     POWER_UNIT,
     PRODUCER,
     SAMPLES_SCHEMA_VERSION,
     SCHEMA_VERSION,
-    UTILIZATION_METRICS,
     dedupe,
 )
+from srtctl.core.power.profile import DEFAULT_POWER_PROFILE, PowerMetricProfile
 from srtctl.core.power.samples import ObservedDevice
 from srtctl.core.power.topology import ExpectedDevice
 
@@ -127,6 +125,7 @@ class PowerManifest:
     window_validations: list[WindowValidation] = field(default_factory=list)
     artifact_errors: list[ArtifactError] = field(default_factory=list)
     reason_codes: list[str] = field(default_factory=list)
+    power_profile: PowerMetricProfile = DEFAULT_POWER_PROFILE
     _terminal_committed: bool = field(default=False, init=False, repr=False)
 
     def mark_terminal(self, *, status: str, stopped_at_unix: float, publication_valid: bool) -> None:
@@ -141,18 +140,18 @@ class PowerManifest:
         self._terminal_committed = True
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "schema_version": SCHEMA_VERSION,
             "producer": PRODUCER,
             "producer_version": PRODUCER_VERSION,
             "producer_git_commit": self.producer_git_commit,
-            "source_metric": POWER_METRIC,
+            "source_metric": self.power_profile.power_metric,
             "unit": POWER_UNIT,
-            "power_scope": POWER_SCOPE,
+            "power_scope": self.power_profile.power_scope,
             "samples_schema_version": SAMPLES_SCHEMA_VERSION,
             "utilization_metrics": [
                 {"column": metric.column, "source_metric": metric.metric, "unit": metric.unit}
-                for metric in UTILIZATION_METRICS
+                for metric in self.power_profile.utilization_metrics
             ],
             "timestamp_source": CLOCK_SOURCE,
             "job_id": self.job_id,
@@ -176,3 +175,8 @@ class PowerManifest:
             "artifact_errors": [error.to_dict() for error in self.artifact_errors],
             "reason_codes": list(dedupe(self.reason_codes)),
         }
+        # Legacy DCGM bundles remain byte-identical. A non-default mapping is
+        # additive provenance, sufficient for an offline reader without config.
+        if self.power_profile != DEFAULT_POWER_PROFILE:
+            payload["power_profile"] = self.power_profile.to_dict()
+        return payload

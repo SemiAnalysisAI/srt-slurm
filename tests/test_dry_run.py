@@ -10,8 +10,10 @@ from unittest.mock import patch
 
 import pytest
 import yaml
+from rich.console import Console
 
 from srtctl.cli.submit import show_config_details
+from srtctl.core.power.profile import AMD_SMI_POWER_PROFILE
 from srtctl.core.schema import SrtConfig
 
 # Minimal valid config that all tests build on
@@ -1103,3 +1105,27 @@ def test_explicit_profiling_explains_observability_precedence(capsys):
     output = capsys.readouterr().out
     assert "superseded by profiling" in output
     assert "nsys targets" not in output
+
+
+def test_custom_power_profile_is_visible_in_dry_run(capsys, monkeypatch):
+    monkeypatch.setattr("srtctl.cli.submit.console", Console(width=180))
+    config = _make_config(
+        {
+            "benchmark": {"type": "manual", "concurrencies": [1]},
+            "telemetry": {
+                "enabled": True,
+                "provider": "dcgm-power",
+                "dcgm_exporter": {
+                    "container_image": "rocm:test",
+                    "port": 9402,
+                    "command": "python3 /srtctl-runtime/amd_smi_exporter.py --port {port}",
+                    "power_profile": AMD_SMI_POWER_PROFILE.to_dict(),
+                },
+            },
+        }
+    )
+    show_config_details(config)
+    output = capsys.readouterr().out
+    assert config.telemetry.provider in output
+    assert "amd-smi-socket" in output
+    assert "gpu_socket_as_reported_by_amd_smi" in output

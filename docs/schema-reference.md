@@ -247,11 +247,12 @@ Observability configuration for OTEL tracing.
 
 ### TelemetryConfig
 
-DCGM power telemetry for benchmark measurement windows.
+GPU power telemetry for benchmark measurement windows.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | bool | `False` |  |
+| `provider` | one of `'dcgm-power'` | `'dcgm-power'` | Compatibility name; the exporter profile selects metric semantics. |
 | `dcgm_exporter` | [TelemetryExporterConfig](#telemetryexporterconfig) \| None | `None` |  |
 | `collect_interval_ms` | int | `1000` | Milliseconds between collector cycles. Replaces the retired ``default_frequency``, which despite its name was a period in seconds (1000ms == the old 1.0 default). |
 | `storage_subdir` | str | `'power'` |  |
@@ -417,6 +418,7 @@ Configuration for a metrics exporter deployed on worker nodes.
 | `port` | int | required |  |
 | `command` | str \| None | `None` |  |
 | `binary` | str \| None | `None` |  |
+| `power_profile` | [PowerMetricProfile](#powermetricprofile) \| None | `None` | Metric/identity mapping for GPU power; null retains the NVIDIA defaults. |
 
 ### CpuPowerExporterConfig
 
@@ -539,6 +541,20 @@ S3 upload configuration for log artifacts.
 | `secret_access_key` | str \| None | `None` | AWS secret access key (falls back to AWS_SECRET_ACCESS_KEY env var) |
 | `exclude` | list[str] \| None | `None` | Patterns `aws s3 sync` skips, relative to the log directory (`*` matches across directories). Omit for the defaults: aiperf's per-interval metrics scrapes and `inputs.json` under `artifacts/*/` and `sa-bench_*/*/` (tachometer already stores that series as parquet), `perf_dashboard_bundle/`, `perf_dashboard.json`. Set to `[]` to ship the whole directory. |
 | `archive` | list[str] \| None | `None` | Patterns (Python glob, `**` allowed) packed into one `bundle.tar.zst` uploaded next to the loose files and left out of the plain sync. Omit for the default, aiperf's per-request `profile_export.jsonl`; set to `[]` for no archive. |
+
+### PowerMetricProfile
+
+Map exporter metrics to the artifact's fixed columns, units, and bounds.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `name` | str | `'dcgm'` |  |
+| `power_metric` | str | `'DCGM_FI_DEV_POWER_USAGE'` |  |
+| `gpu_index_label` | str | `'gpu'` |  |
+| `gpu_uuid_label` | str | `'UUID'` |  |
+| `power_scope` | str | `'gpu_device_board_as_reported_by_dcgm'` |  |
+| `utilization_sources` | tuple[tuple[str, str], ...] | `(('gpu_util_pct', 'DCGM_FI_DEV_GPU_UTIL'), ('sm_active', 'DCGM_FI_PROF_SM_ACTIVE'))` |  |
+| `partition_label` | str \| None | `None` |  |
 
 ### TcpProbe
 

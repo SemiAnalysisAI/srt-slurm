@@ -27,8 +27,6 @@ from srtctl.core.power.contract import (
     FATAL_LIFECYCLE_REASONS,
     MANIFEST_FILENAME,
     MAX_SAMPLE_GAP_SECONDS,
-    POWER_METRIC,
-    POWER_SCOPE,
     POWER_UNIT,
     PRODUCER,
     SAMPLES_FILENAME,
@@ -39,6 +37,7 @@ from srtctl.core.power.contract import (
     sha256_file,
 )
 from srtctl.core.power.manifest import STATUS_COMPLETE, ArtifactError, ExpectedWindow, WindowValidation
+from srtctl.core.power.profile import DEFAULT_POWER_PROFILE, PowerMetricProfile
 from srtctl.core.power.samples import ObservedDevice, SampleRow, derive_observed_devices, read_samples
 from srtctl.core.power.topology import (
     WORKER_ROLES,
@@ -92,6 +91,7 @@ _RUNTIME_ONLY_REASON_CODES = frozenset(
         Reason.GPU_UUID_MISSING,
         Reason.INVALID_POWER_VALUE,
         Reason.MIG_INSTANCE_UNSUPPORTED,
+        Reason.GPU_PARTITION_UNSUPPORTED,
         Reason.SAMPLES_DIGEST_UNAVAILABLE,
         Reason.COLLECTOR_EXCEPTION,
         Reason.COLLECTOR_INTERRUPTED,
@@ -260,15 +260,32 @@ def _check_wire_contract(manifest: dict[str, Any]) -> list[str]:
     """
     failures: list[str] = []
 
+    # Old bundles omit this field and retain the exact DCGM requirements.
+    # New profiles must be complete: partial or malformed provenance must not
+    # silently inherit NVIDIA labels or scope during an offline audit.
+    profile = DEFAULT_POWER_PROFILE
+    if "power_profile" in manifest:
+        try:
+            profile = PowerMetricProfile.from_manifest(manifest["power_profile"])
+        except (TypeError, ValueError) as exc:
+            failures.append(f"power_profile is invalid: {exc}")
+        else:
+            expected_utilization = [
+                {"column": metric.column, "source_metric": metric.metric, "unit": metric.unit}
+                for metric in profile.utilization_metrics
+            ]
+            if manifest.get("utilization_metrics") != expected_utilization:
+                failures.append("utilization_metrics disagrees with power_profile")
+
     schema_version = manifest.get("schema_version")
     if not isinstance(schema_version, int) or isinstance(schema_version, bool) or schema_version != SCHEMA_VERSION:
         failures.append(f"schema_version is {schema_version!r}, expected {SCHEMA_VERSION!r}")
 
     for key, expected in (
         ("producer", PRODUCER),
-        ("source_metric", POWER_METRIC),
+        ("source_metric", profile.power_metric),
         ("unit", POWER_UNIT),
-        ("power_scope", POWER_SCOPE),
+        ("power_scope", profile.power_scope),
         ("timestamp_source", CLOCK_SOURCE),
     ):
         if manifest.get(key) != expected:

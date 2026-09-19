@@ -942,3 +942,59 @@ def test_default_nvidia_bundle_matches_pre_profile_bytes(package, monkeypatch):
     actual = {path.relative_to(log_dir): path.read_bytes() for path in log_dir.rglob("*") if path.is_file()}
     assert actual == expected
     assert _validate(power_dir, log_dir).ok is True
+
+
+@pytest.mark.parametrize("defect", ["null", "incomplete", "invalid_label", "metric", "scope", "utilization"])
+def test_offline_validator_rejects_inconsistent_custom_profile_provenance(package, defect):
+    from srtctl.core.power.profile import AMD_SMI_POWER_PROFILE
+
+    log_dir, power_dir = package()
+    path = power_dir / MANIFEST_FILENAME
+    manifest = json.loads(path.read_text())
+    manifest.update(
+        source_metric=AMD_SMI_POWER_PROFILE.power_metric,
+        power_scope=AMD_SMI_POWER_PROFILE.power_scope,
+        power_profile=AMD_SMI_POWER_PROFILE.to_dict(),
+        utilization_metrics=[
+            {"column": "gpu_util_pct", "source_metric": "amd_smi_gfx_activity_percent", "unit": "percent"}
+        ],
+    )
+    if defect == "null":
+        manifest["power_profile"] = None
+    elif defect == "incomplete":
+        manifest["power_profile"].pop("gpu_uuid_label")
+    elif defect == "invalid_label":
+        manifest["power_profile"]["gpu_index_label"] = "not a label"
+    elif defect == "metric":
+        manifest["source_metric"] = "DCGM_FI_DEV_POWER_USAGE"
+    elif defect == "scope":
+        manifest["power_scope"] = "gpu_device_board_as_reported_by_dcgm"
+    else:
+        manifest["utilization_metrics"][0]["unit"] = "fraction"
+    atomic_write_json(path, manifest)
+    assert _validate(power_dir, log_dir).ok is False
+
+
+def test_third_vendor_profile_is_self_describing_without_a_registry(package):
+    from srtctl.core.power.profile import PowerMetricProfile
+
+    profile = PowerMetricProfile(
+        name="example-vendor",
+        power_metric="example_device_watts",
+        gpu_index_label="card",
+        gpu_uuid_label="device_id",
+        power_scope="device_socket_as_reported_by_example",
+        gpu_util_metric=None,
+        sm_active_metric=None,
+    )
+    log_dir, power_dir = package()
+    path = power_dir / MANIFEST_FILENAME
+    manifest = json.loads(path.read_text())
+    manifest.update(
+        source_metric=profile.power_metric,
+        power_scope=profile.power_scope,
+        power_profile=profile.to_dict(),
+        utilization_metrics=[],
+    )
+    atomic_write_json(path, manifest)
+    assert _validate(power_dir, log_dir).ok is True

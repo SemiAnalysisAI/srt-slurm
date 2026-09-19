@@ -1103,3 +1103,28 @@ def test_explicit_profiling_explains_observability_precedence(capsys):
     output = capsys.readouterr().out
     assert "superseded by profiling" in output
     assert "nsys targets" not in output
+
+
+def test_custom_power_profile_is_visible_in_dry_run(capsys):
+    from srtctl.core.power.profile import AMD_SMI_POWER_PROFILE
+
+    config = _make_config(
+        {
+            "benchmark": {"type": "manual", "concurrencies": [1]},
+            "telemetry": {
+                "enabled": True,
+                "provider": "dcgm-power",
+                "dcgm_exporter": {
+                    "container_image": "rocm:test",
+                    "port": 9402,
+                    "command": "python3 /srtctl-runtime/amd_smi_exporter.py --port {port}",
+                    "power_profile": AMD_SMI_POWER_PROFILE.to_dict(),
+                },
+            },
+        }
+    )
+    show_config_details(config)
+    output = capsys.readouterr().out
+    assert "amd-smi-socket" in output
+    # Rich may wrap long words to fit the test terminal.
+    assert "gpu_socket_as_reported_by_amd_smi" in output.replace("\n", "").replace(" ", "").replace("│", "")

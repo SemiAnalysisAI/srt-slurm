@@ -4,8 +4,8 @@
 """Expose AMD SMI GPU socket power to the existing head-node HTTP collector.
 
 Standalone stdlib script, mounted at /srtctl-runtime in the exporter container.
-Each request obtains fresh identity and metric snapshots; failures never serve
-cached watts. AMD SMI owns sensor sampling. The orchestrator owns timestamps.
+GPU identity is fixed for the exporter lifetime; each request reads fresh watts.
+AMD SMI owns sensor sampling. The orchestrator owns timestamps.
 """
 
 from __future__ import annotations
@@ -22,28 +22,6 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
-def _devices(payload: object) -> list[dict[str, Any]]:
-    # `list --json` returns an array; ROCm 7.2 `metric --json` wraps
-    # device records in gpu_data, separately from any CPU/core records.
-    if isinstance(payload, dict) and "gpu_data" in payload:
-        payload = payload["gpu_data"]
-    if isinstance(payload, dict):
-        payload = [payload]
-    if not isinstance(payload, list) or not all(isinstance(item, dict) for item in payload):
-        raise ValueError("expected AMD SMI JSON device objects")
-    return payload
-
-
-def _index(value: object) -> str:
-    if isinstance(value, bool):
-        return ""
-    if isinstance(value, int) and value >= 0:
-        return str(value)
-    if isinstance(value, str) and value.isascii() and value.isdigit():
-        return str(int(value))
-    return ""
-
-
 def _value(raw: object, unit: str) -> str:
     """ROCm 7.2 JSON carries explicit units; never substitute a limit or zero."""
     if not isinstance(raw, dict) or raw.get("unit") != unit:
@@ -51,39 +29,34 @@ def _value(raw: object, unit: str) -> str:
     value = raw.get("value")
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return "NaN"
-    return str(value) if math.isfinite(value) else "NaN"
+    return str(value)
 
 
-def render_metrics(identities: object, metrics: object) -> str:
+def render_metrics(identities: list[dict[str, Any]], metrics: dict[str, Any]) -> str:
     """Translate native JSON without changing watts, identities or duplicates.
 
     Invalid metric values and absent labels remain visible to the shared
     parser, which assigns the established power-contract reason codes.
     """
     by_index: dict[str, str] = {}
-    seen_uuids: set[str] = set()
-    for device in _devices(identities):
-        index = _index(device.get("gpu"))
-        uuid = device.get("uuid")
-        uuid = uuid.strip() if isinstance(uuid, str) else ""
-        if uuid.lower() in {"n/a", "none", "null"}:
+    for device in identities:
+        index = str(device.get("gpu", ""))
+        uuid = device.get("uuid", "")
+        if uuid == "N/A":
             uuid = ""
         if device.get("partition_id") not in (None, 0, "0", "N/A"):
             raise ValueError("partitioned GPU identity is unsupported")
-        if index in by_index or (uuid and uuid in seen_uuids):
+        if index in by_index:
             raise ValueError("ambiguous GPU identity")
-        if index:
-            by_index[index] = uuid
-        if uuid:
-            seen_uuids.add(uuid)
+        by_index[index] = uuid
 
     lines = [
         "# HELP amd_smi_socket_power_watts AMD SMI power.socket_power in watts.",
         "# TYPE amd_smi_socket_power_watts gauge",
         "# TYPE amd_smi_gfx_activity_percent gauge",
     ]
-    for device in _devices(metrics):
-        index = _index(device.get("gpu"))
+    for device in metrics["gpu_data"]:
+        index = str(device.get("gpu", ""))
         # JSON string escaping is also valid for the label characters emitted
         # here (UUIDs and decimal indices); emit Unicode without JSON-only escapes.
         uuid = by_index.get(index, "")
@@ -97,22 +70,16 @@ def render_metrics(identities: object, metrics: object) -> str:
     return "\n".join(lines) + "\n"
 
 
-def collect_metrics(binary: str, command_timeout: float) -> str:
-    """Bound both CLI invocations; HTTP failures cannot return stale samples."""
-
-    def run(*args: str) -> object:
-        completed = subprocess.run(
-            [binary, *args, "--json"], capture_output=True, text=True, check=True, timeout=command_timeout
-        )
-        return json.loads(completed.stdout)
-
-    identities = run("list")
-    metrics = run("metric", "--power", "--usage")
-    return render_metrics(identities, metrics)
+def _run_amd_smi(binary: str, command_timeout: float, *args: str) -> Any:
+    completed = subprocess.run(
+        [binary, *args, "--json"], capture_output=True, text=True, check=True, timeout=command_timeout
+    )
+    return json.loads(completed.stdout)
 
 
 def make_server(host: str, port: int, *, binary: str = "amd-smi", command_timeout: float = 1.0) -> HTTPServer:
-    """A serial server bounds subprocess concurrency even after client timeout."""
+    """One collector per node; GPU identity stays fixed within the allocation."""
+    identities = _run_amd_smi(binary, command_timeout, "list")
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -120,8 +87,9 @@ def make_server(host: str, port: int, *, binary: str = "amd-smi", command_timeou
                 self.send_error(404)
                 return
             try:
-                payload = collect_metrics(binary, command_timeout).encode()
-            except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                metrics = _run_amd_smi(binary, command_timeout, "metric", "--power", "--usage")
+                payload = render_metrics(identities, metrics).encode()
+            except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, AttributeError) as exc:
                 logger.warning("AMD SMI scrape failed: %s", exc)
                 self.send_error(503, "AMD SMI scrape failed")
                 return

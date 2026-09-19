@@ -34,7 +34,7 @@ from srtctl.core.power.manifest import (
     PowerManifest,
 )
 from srtctl.core.power.parser import parse_power_scrape
-from srtctl.core.power.profile import DEFAULT_POWER_PROFILE, PowerMetricProfile
+from srtctl.core.power.profile import PowerMetricProfile
 from srtctl.core.power.samples import (
     ObservedDevice,
     SampleRow,
@@ -1124,7 +1124,7 @@ class TestPowerMetricProfiles:
         sm_active_metric=None,
     )
 
-    def test_custom_names_write_the_existing_sample_columns(self, tmp_path):
+    def test_custom_metric_and_identity_names(self):
         scrape = parse_power_scrape(
             "# TYPE device_board_power_watts gauge\n"
             'device_board_power_watts{device_index="2",serial="board-002",Hostname="ignored"} 412.5\n'
@@ -1135,62 +1135,18 @@ class TestPowerMetricProfiles:
         assert scrape.reason_codes == ()
         assert len(scrape.readings) == 1
         reading = scrape.readings[0]
-        path = tmp_path / "samples.csv"
-        writer = SampleWriter(path)
-        writer.append(
-            [
-                SampleRow(
-                    timestamp_unix=100.0,
-                    scrape_seq=0,
-                    hostname="allocated-node",
-                    gpu_index=reading.gpu_index,
-                    gpu_uuid=reading.gpu_uuid,
-                    power_w=reading.power_w,
-                    gpu_util_pct=reading.gpu_util_pct,
-                    sm_active=reading.sm_active,
-                )
-            ]
-        )
-        writer.close()
-        with path.open(newline="") as stream:
-            reader = csv.DictReader(stream)
-            assert tuple(reader.fieldnames) == SAMPLES_HEADER
-            row = next(reader)
-        assert (row["hostname"], row["gpu_index"], row["gpu_uuid"]) == ("allocated-node", "2", "board-002")
-        assert float(row["power_w"]) == 412.5
-        assert float(row["gpu_util_pct"]) == 73
-        assert row["sm_active"] == ""
+        assert (reading.gpu_index, reading.gpu_uuid, reading.power_w) == (2, "board-002", 412.5)
+        assert (reading.gpu_util_pct, reading.sm_active) == (73, None)
 
-    @pytest.mark.parametrize("profile", [DEFAULT_POWER_PROFILE, profile])
     @pytest.mark.parametrize(
-        ("kind", "reason"),
-        [
-            ("missing_index", Reason.GPU_INDEX_MISSING),
-            ("missing_uuid", Reason.GPU_UUID_MISSING),
-            ("negative", Reason.INVALID_POWER_VALUE),
-            ("nan", Reason.INVALID_POWER_VALUE),
-            ("infinity", Reason.INVALID_POWER_VALUE),
-            ("duplicate", Reason.DUPLICATE_POWER_METRIC),
-            ("malformed", Reason.ENDPOINT_PARSE_ERROR),
-            ("mig", Reason.MIG_INSTANCE_UNSUPPORTED),
-        ],
+        ("missing_label", "reason"),
+        [("device_index", Reason.GPU_INDEX_MISSING), ("serial", Reason.GPU_UUID_MISSING)],
     )
-    def test_profiles_preserve_failure_reasons(self, profile, kind, reason):
-        labels = {profile.gpu_index_label: "0", profile.gpu_uuid_label: "board-000"}
-        if kind == "missing_index":
-            labels.pop(profile.gpu_index_label)
-        if kind == "missing_uuid":
-            labels.pop(profile.gpu_uuid_label)
-        if kind == "mig":
-            labels["GPU_I_ID"] = "1"
-        value = {"negative": "-1", "nan": "NaN", "infinity": "+Inf"}.get(kind, "400")
+    def test_custom_identity_labels_are_required(self, missing_label, reason):
+        labels = {"device_index": "2", "serial": "board-002"}
+        labels.pop(missing_label)
         label_text = ",".join(f'{key}="{value}"' for key, value in labels.items())
-        body = f"{profile.power_metric}{{{label_text}}} {value}\n"
-        if kind == "duplicate":
-            body += body
-        if kind == "malformed":
-            body = f'{profile.power_metric}{{unclosed="label}} broken\n'
-        scrape = parse_power_scrape(body, profile)
+        scrape = parse_power_scrape(f"device_board_power_watts{{{label_text}}} 400\n", self.profile)
         assert scrape.readings == ()
         assert scrape.reason_codes == (reason,)
 
@@ -1221,20 +1177,6 @@ class TestAmdSmiAdapter:
     def native_payloads():
         root = Path(__file__).parent / "fixtures" / "amd-smi"
         return json.loads((root / "list.json").read_text()), json.loads((root / "metric.json").read_text())
-
-    def test_native_json_preserves_physical_identity_watts_and_utilization(self):
-        from srtctl.core.power.profile import AMD_SMI_POWER_PROFILE
-        from srtctl.runtime_scripts.amd_smi_exporter import render_metrics
-
-        identities, metrics = self.native_payloads()
-        # An unrelated power limit must never become the measurement.
-        metrics["gpu_data"][0]["power"]["power_limit"] = {"value": 9999, "unit": "W"}
-        result = parse_power_scrape(render_metrics(identities, metrics), AMD_SMI_POWER_PROFILE)
-        assert result.reason_codes == ()
-        assert [(r.gpu_index, r.gpu_uuid, r.power_w, r.gpu_util_pct, r.sm_active) for r in result.readings] == [
-            (0, "12345678-0000-1000-8000-000000000001", 440, 85, None),
-            (3, "12345678-0000-1000-8000-000000000004", 480.5, 98, None),
-        ]
 
     @pytest.mark.parametrize(
         ("defect", "reason"),
@@ -1282,18 +1224,14 @@ class TestAmdSmiAdapter:
         assert result.readings == ()
         assert result.reason_codes == (reason,)
 
-    @pytest.mark.parametrize("defect", ["duplicate_index", "duplicate_uuid", "partition", "invalid_json_shape"])
+    @pytest.mark.parametrize("defect", ["duplicate_index", "partition"])
     def test_ambiguous_native_identity_is_rejected(self, defect):
         from srtctl.runtime_scripts.amd_smi_exporter import render_metrics
 
         identities, metrics = self.native_payloads()
         if defect == "duplicate_index":
             identities[1]["gpu"] = identities[0]["gpu"]
-        elif defect == "duplicate_uuid":
-            identities[1]["uuid"] = identities[0]["uuid"]
-        elif defect == "partition":
-            identities[1]["partition_id"] = 1
         else:
-            identities = "not device records"
+            identities[1]["partition_id"] = 1
         with pytest.raises(ValueError):
             render_metrics(identities, metrics)

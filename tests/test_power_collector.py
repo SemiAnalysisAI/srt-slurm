@@ -6,6 +6,7 @@
 import hashlib
 import json
 import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -13,6 +14,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+import requests
 
 from srtctl.cli.do_sweep import SweepOrchestrator
 from srtctl.cli.mixins.benchmark_stage import BenchmarkStageMixin
@@ -1257,3 +1259,102 @@ class TestShutdown:
         assert manifest["max_scrape_duration_seconds"] > 0
         assert len(manifest["observed_devices"]) == 2 * GPUS_PER_NODE
         assert Path(manifest["dcgm_exporter"]["container_image_resolved"]).name == "dcgm-exporter.sqsh"
+
+
+@pytest.fixture
+def amd_smi_endpoint(tmp_path):
+    """Real adapter HTTP/subprocess boundary; only the hardware CLI is a fixture."""
+    from srtctl.runtime_scripts.amd_smi_exporter import make_server
+
+    fixtures = Path(__file__).parent / "fixtures" / "amd-smi"
+    for name in ("list.json", "metric.json"):
+        (tmp_path / name).write_bytes((fixtures / name).read_bytes())
+    binary = tmp_path / "amd-smi"
+    binary.write_text(
+        f"#!{sys.executable}\n"
+        "import json, pathlib, sys, time\n"
+        f"root = pathlib.Path({str(tmp_path)!r})\n"
+        "with (root / 'calls.jsonl').open('a') as stream: stream.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "if (root / 'slow').exists(): time.sleep(5)\n"
+        "if (root / 'fail').exists(): sys.exit(1)\n"
+        "print((root / (sys.argv[1] + '.json')).read_text())\n"
+    )
+    binary.chmod(0o755)
+    server = make_server("127.0.0.1", 0, binary=str(binary), command_timeout=0.5)
+    thread = threading.Thread(target=lambda: server.serve_forever(poll_interval=0.01), daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}/metrics", tmp_path
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+
+def test_amd_native_adapter_to_session_and_validator_cli(tmp_path, amd_smi_endpoint):
+    from dataclasses import replace
+
+    from srtctl.core.power.profile import AMD_SMI_POWER_PROFILE
+
+    url, native_dir = amd_smi_endpoint
+    process = replace(_processes()[0], gpu_indices=frozenset({0, 3}), endpoint_mode="agg")
+    session = _session(
+        tmp_path,
+        _endpoints(("node-a", url)),
+        processes=[process],
+        power_profile=AMD_SMI_POWER_PROFILE,
+        request_timeout_seconds=1.5,
+        collector_join_timeout_seconds=10.0,
+        exporter_command="python3 /srtctl-runtime/amd_smi_exporter.py --port 9401",
+    )
+    session.initialize()
+    assert session.start_and_wait_for_readiness() is True
+    start = time.time()
+    time.sleep(0.01)
+    end = time.time()
+    TestPublication()._write_window_and_result(session, start, end)
+    outcome = session.stop_and_finalize(allow_window_mutation=True)
+    assert outcome.publication_valid is True
+    rows, reasons = read_samples(session.samples_path)
+    assert reasons == ()
+    assert {(r.gpu_index, r.power_w, r.gpu_util_pct, r.sm_active) for r in rows} == {
+        (0, 440, 85, None),
+        (3, 480.5, 98, None),
+    }
+    manifest = _manifest(session)
+    assert manifest["power_scope"] == "gpu_socket_as_reported_by_amd_smi"
+    assert manifest["power_profile"] == AMD_SMI_POWER_PROFILE.to_dict()
+    calls = [json.loads(line) for line in (native_dir / "calls.jsonl").read_text().splitlines()]
+    assert ["list", "--json"] in calls
+    assert ["metric", "--power", "--usage", "--json"] in calls
+
+    command = [
+        str(Path(sys.executable).with_name("srtctl-validate-power")),
+        "--power-dir",
+        str(session.power_dir),
+        "--result-root",
+        str(session.power_dir.parent),
+    ]
+    valid = subprocess.run(command, text=True, capture_output=True, timeout=10, check=False)
+    assert valid.returncode == 0, valid.stdout + valid.stderr
+    window_file = next(session.windows_dir.glob("*.json"))
+    window = json.loads(window_file.read_text())
+    window["benchmark_end_time_unix"] += 10
+    window_file.write_text(json.dumps(window))
+    corrupted = subprocess.run(command, text=True, capture_output=True, timeout=10, check=False)
+    assert corrupted.returncode == 1
+    assert "measurement_window" in corrupted.stdout
+
+
+@pytest.mark.parametrize("failure", ["fail", "slow", "malformed"])
+def test_amd_adapter_never_reuses_a_successful_scrape_after_native_failure(amd_smi_endpoint, failure):
+    url, native_dir = amd_smi_endpoint
+    assert requests.get(url, timeout=2).status_code == 200
+    if failure == "malformed":
+        (native_dir / "metric.json").write_text("not JSON")
+    else:
+        (native_dir / failure).touch()
+    response = requests.get(url, timeout=2)
+    assert response.status_code == 503
+    assert "amd_smi_socket_power_watts" not in response.text

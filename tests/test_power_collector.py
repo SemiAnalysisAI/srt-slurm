@@ -9,6 +9,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -21,6 +22,7 @@ from srtctl.cli.mixins.benchmark_stage import BenchmarkStageMixin
 from srtctl.cli.mixins.telemetry_stage import TelemetryStageMixin
 from srtctl.core.power.contract import MANIFEST_FILENAME, SAMPLES_FILENAME, WINDOWS_DIRNAME, Reason
 from srtctl.core.power.manifest import ExpectedWindow
+from srtctl.core.power.profile import AMD_SMI_POWER_PROFILE
 from srtctl.core.power.samples import read_samples
 from srtctl.core.power.session import PowerEndpoint, PowerSessionSettings, PowerTelemetrySession, _run_daemon_workers
 from srtctl.core.power.topology import build_expected_devices
@@ -28,6 +30,7 @@ from srtctl.core.power.validate_artifacts import validate_power_artifacts
 from srtctl.core.processes import ManagedProcess, ProcessRegistry
 from srtctl.core.schema import TelemetryExporterConfig
 from srtctl.core.topology import Process
+from srtctl.runtime_scripts.amd_smi_exporter import make_server
 
 GPUS_PER_NODE = 4
 
@@ -578,39 +581,40 @@ class TestFailurePaths:
         assert outcome.publication_valid is False
 
 
+def _write_window_and_result(session, start, end):
+    result_dir = session.power_dir.parent / "sa-bench_isl_8192_osl_1024"
+    result_dir.mkdir(parents=True, exist_ok=True)
+    stem = "results_concurrency_4_gpus_8_ctx_4_gen_4"
+    (result_dir / f"{stem}.json").write_text(
+        json.dumps(
+            {
+                "duration": end - start,
+                "benchmark_start_time_unix": start,
+                "benchmark_end_time_unix": end,
+                "completed": 40,
+            }
+        )
+    )
+    (session.windows_dir / f"{stem}.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "benchmark_type": "sa-bench",
+                "result_path": f"sa-bench_isl_8192_osl_1024/{stem}.json",
+                "concurrency": 4,
+                "benchmark_start_time_unix": start,
+                "benchmark_end_time_unix": end,
+                "duration": end - start,
+                "clock_source": "head_node_unix_clock",
+                "status": "completed",
+                "reason": None,
+            }
+        )
+    )
+
+
 class TestPublication:
     """A complete session with a covered formal window is publishable."""
-
-    def _write_window_and_result(self, session, start, end):
-        result_dir = session.power_dir.parent / "sa-bench_isl_8192_osl_1024"
-        result_dir.mkdir(parents=True, exist_ok=True)
-        stem = "results_concurrency_4_gpus_8_ctx_4_gen_4"
-        (result_dir / f"{stem}.json").write_text(
-            json.dumps(
-                {
-                    "duration": end - start,
-                    "benchmark_start_time_unix": start,
-                    "benchmark_end_time_unix": end,
-                    "completed": 40,
-                }
-            )
-        )
-        (session.windows_dir / f"{stem}.json").write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "benchmark_type": "sa-bench",
-                    "result_path": f"sa-bench_isl_8192_osl_1024/{stem}.json",
-                    "concurrency": 4,
-                    "benchmark_start_time_unix": start,
-                    "benchmark_end_time_unix": end,
-                    "duration": end - start,
-                    "clock_source": "head_node_unix_clock",
-                    "status": "completed",
-                    "reason": None,
-                }
-            )
-        )
 
     def test_covered_window_publishes(self, tmp_path, exporters):
         a = exporters(_body("a"))
@@ -622,7 +626,7 @@ class TestPublication:
         start = time.time()
         time.sleep(0.6)
         end = time.time()
-        self._write_window_and_result(session, start, end)
+        _write_window_and_result(session, start, end)
 
         outcome = session.stop_and_finalize(allow_window_mutation=True)
         manifest = _manifest(session)
@@ -653,7 +657,7 @@ class TestPublication:
         start = time.time()
         time.sleep(0.6)
         end = time.time()
-        self._write_window_and_result(session, start, end)
+        _write_window_and_result(session, start, end)
 
         with patch("srtctl.core.power.session.sha256_file", side_effect=PermissionError("digest denied")):
             outcome = session.stop_and_finalize(allow_window_mutation=True)
@@ -676,7 +680,7 @@ class TestPublication:
         start = time.time()
         time.sleep(0.6)
         end = time.time()
-        self._write_window_and_result(session, start, end)
+        _write_window_and_result(session, start, end)
         (session.windows_dir / "broken.json").write_text("{not json")
 
         outcome = session.stop_and_finalize(allow_window_mutation=True)
@@ -703,7 +707,7 @@ class TestPublication:
         start = time.time()
         time.sleep(0.5)
         end = time.time()
-        self._write_window_and_result(session, start, end)
+        _write_window_and_result(session, start, end)
 
         outcome = session.stop_and_finalize(allow_window_mutation=True)
 
@@ -1262,13 +1266,19 @@ class TestShutdown:
 
 
 @pytest.fixture
-def amd_smi_endpoint(tmp_path):
+def amd_smi_endpoint(tmp_path, request):
     """Real adapter HTTP/subprocess boundary; only the hardware CLI is a fixture."""
-    from srtctl.runtime_scripts.amd_smi_exporter import make_server
-
     fixtures = Path(__file__).parent / "fixtures" / "amd-smi"
     for name in ("list.json", "metric.json"):
         (tmp_path / name).write_bytes((fixtures / name).read_bytes())
+    defect = getattr(request, "param", None)
+    if defect:
+        identities = json.loads((tmp_path / "list.json").read_text())
+        if defect == "partition":
+            identities[1]["partition_id"] = 1
+        else:
+            identities.append({**identities[1], "uuid": "12345678-0000-1000-8000-000000000005"})
+        (tmp_path / "list.json").write_text(json.dumps(identities))
     binary = tmp_path / "amd-smi"
     binary.write_text(
         f"#!{sys.executable}\n"
@@ -1293,10 +1303,6 @@ def amd_smi_endpoint(tmp_path):
 
 
 def test_amd_native_adapter_to_session_and_validator_cli(tmp_path, amd_smi_endpoint):
-    from dataclasses import replace
-
-    from srtctl.core.power.profile import AMD_SMI_POWER_PROFILE
-
     url, native_dir = amd_smi_endpoint
     process = replace(_processes()[0], gpu_indices=frozenset({0, 3}), endpoint_mode="agg")
     session = _session(
@@ -1313,7 +1319,7 @@ def test_amd_native_adapter_to_session_and_validator_cli(tmp_path, amd_smi_endpo
     start = time.time()
     time.sleep(0.01)
     end = time.time()
-    TestPublication()._write_window_and_result(session, start, end)
+    _write_window_and_result(session, start, end)
     outcome = session.stop_and_finalize(allow_window_mutation=True)
     assert outcome.publication_valid is True
     rows, reasons = read_samples(session.samples_path)
@@ -1330,7 +1336,9 @@ def test_amd_native_adapter_to_session_and_validator_cli(tmp_path, amd_smi_endpo
     assert calls.count(["metric", "--power", "--usage", "--json"]) >= 2
 
     command = [
-        str(Path(sys.executable).with_name("srtctl-validate-power")),
+        sys.executable,
+        "-m",
+        "srtctl.cli.validate_power_artifacts",
         "--power-dir",
         str(session.power_dir),
         "--result-root",
@@ -1345,6 +1353,32 @@ def test_amd_native_adapter_to_session_and_validator_cli(tmp_path, amd_smi_endpo
     corrupted = subprocess.run(command, text=True, capture_output=True, timeout=10, check=False)
     assert corrupted.returncode == 1
     assert "measurement_window" in corrupted.stdout
+
+
+@pytest.mark.parametrize(
+    "amd_smi_endpoint, reason",
+    [("partition", Reason.GPU_PARTITION_UNSUPPORTED), ("ambiguous", Reason.DUPLICATE_POWER_METRIC)],
+    indirect=["amd_smi_endpoint"],
+)
+def test_amd_device_failure_preserves_healthy_gpu_rows(tmp_path, amd_smi_endpoint, reason):
+    url, _ = amd_smi_endpoint
+    process = replace(_processes()[0], gpu_indices=frozenset({0, 3}), endpoint_mode="agg")
+    session = _session(
+        tmp_path,
+        _endpoints(("node-a", url)),
+        processes=[process],
+        power_profile=AMD_SMI_POWER_PROFILE,
+        request_timeout_seconds=1.5,
+    )
+    session.initialize()
+    session.collect_once()
+    outcome = session.stop_and_finalize()
+
+    rows, csv_reasons = read_samples(session.samples_path)
+    assert csv_reasons == ()
+    assert [(row.gpu_index, row.power_w) for row in rows] == [(0, 440)]
+    assert reason in outcome.reason_codes
+    assert Reason.ENDPOINT_HTTP_ERROR not in outcome.reason_codes
 
 
 @pytest.mark.parametrize("failure", ["fail", "slow", "malformed", "schema"])

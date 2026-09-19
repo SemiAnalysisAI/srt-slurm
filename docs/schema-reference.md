@@ -547,7 +547,7 @@ S3 upload configuration for log artifacts.
 
 ### PowerMetricProfile
 
-A Prometheus exporter's identity and watts mapping, independent of vendor.
+Map exporter metrics to the artifact's fixed columns, units, and bounds.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
@@ -556,8 +556,8 @@ A Prometheus exporter's identity and watts mapping, independent of vendor.
 | `gpu_index_label` | str | `'gpu'` |  |
 | `gpu_uuid_label` | str | `'UUID'` |  |
 | `power_scope` | str | `'gpu_device_board_as_reported_by_dcgm'` |  |
-| `gpu_util_metric` | str \| None | `'DCGM_FI_DEV_GPU_UTIL'` |  |
-| `sm_active_metric` | str \| None | `'DCGM_FI_PROF_SM_ACTIVE'` |  |
+| `utilization_sources` | tuple[tuple[str, str], ...] | `(('gpu_util_pct', 'DCGM_FI_DEV_GPU_UTIL'), ('sm_active', 'DCGM_FI_PROF_SM_ACTIVE'))` |  |
+| `partition_label` | str \| None | `None` |  |
 
 ### TcpProbe
 

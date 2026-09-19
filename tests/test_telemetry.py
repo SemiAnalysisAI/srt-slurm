@@ -15,10 +15,13 @@ from marshmallow import ValidationError
 
 from srtctl.cli.mixins.frontend_stage import FrontendTopology
 from srtctl.cli.mixins.telemetry_stage import TelemetryStageMixin
+from srtctl.core.config import resolve_config_with_defaults
 from srtctl.core.power.contract import Reason
+from srtctl.core.power.profile import AMD_SMI_POWER_PROFILE, DEFAULT_POWER_PROFILE
 from srtctl.core.processes import ProcessRegistry
 from srtctl.core.schema import (
     BenchmarkConfig,
+    ClusterConfig,
     CpuPowerConfig,
     CpuPowerExporterConfig,
     FrontendConfig,
@@ -1994,8 +1997,6 @@ class TestTelemetryNodes:
 
 
 def _amd_power_exporter():
-    from srtctl.core.power.profile import AMD_SMI_POWER_PROFILE
-
     return {
         "container_image": "amd-smi-image",
         "port": 9402,
@@ -2016,10 +2017,6 @@ def _profile_recipe():
 
 @pytest.mark.parametrize("recipe_override", [False, True])
 def test_power_profile_and_exporter_resolve_together(recipe_override):
-    from srtctl.core.config import resolve_config_with_defaults
-    from srtctl.core.power.profile import AMD_SMI_POWER_PROFILE, DEFAULT_POWER_PROFILE
-    from srtctl.core.schema import ClusterConfig
-
     cluster = ClusterConfig.Schema().dump(
         ClusterConfig.Schema().load(
             {
@@ -2042,9 +2039,6 @@ def test_power_profile_and_exporter_resolve_together(recipe_override):
 
 @pytest.mark.parametrize("disabled_at", ["cluster", "recipe"])
 def test_explicit_null_disables_power_exporter_default(disabled_at):
-    from srtctl.core.config import resolve_config_with_defaults
-    from srtctl.core.schema import ClusterConfig
-
     cluster = ClusterConfig.Schema().dump(
         ClusterConfig.Schema().load(
             {
@@ -2063,20 +2057,30 @@ def test_explicit_null_disables_power_exporter_default(disabled_at):
 
 
 @pytest.mark.parametrize("cpu_leg", ["cpu_power", "cpu_power_exporter"])
-def test_cluster_gpu_default_does_not_enable_gpu_collection_for_cpu_only_recipe(cpu_leg):
-    from srtctl.core.config import resolve_config_with_defaults
-
+@pytest.mark.parametrize("disable_gpu", [False, True])
+def test_cluster_gpu_default_is_independent_of_cpu_collection(cpu_leg, disable_gpu):
     recipe = _profile_recipe()
     recipe["telemetry"][cpu_leg] = {"enabled": True} if cpu_leg == "cpu_power" else {"port": 9494}
+    if disable_gpu:
+        recipe["telemetry"]["dcgm_exporter"] = None
     resolved = resolve_config_with_defaults(recipe, {"default_gpu_exporter": _amd_power_exporter()})
     config = SrtConfig.Schema().load(resolved)
-    assert config.telemetry.dcgm_exporter is None
+    if disable_gpu:
+        assert config.telemetry.dcgm_exporter is None
+    else:
+        assert config.telemetry.dcgm_exporter.resolved_power_profile == AMD_SMI_POWER_PROFILE
+
+
+@pytest.mark.parametrize("telemetry", [None, {"enabled": True, "cpu_power": None}])
+def test_null_telemetry_fields_reach_schema_validation(telemetry):
+    recipe = _profile_recipe()
+    recipe["telemetry"] = telemetry
+    resolved = resolve_config_with_defaults(recipe, {"default_gpu_exporter": _amd_power_exporter()})
+    with pytest.raises(ValidationError, match="Field may not be null"):
+        SrtConfig.Schema().load(resolved)
 
 
 def test_recipe_can_explicitly_restore_gpu_exporter_when_cluster_default_is_null():
-    from srtctl.core.config import resolve_config_with_defaults
-    from srtctl.core.power.profile import AMD_SMI_POWER_PROFILE
-
     recipe = _profile_recipe()
     recipe["telemetry"]["dcgm_exporter"] = _amd_power_exporter()
     config = SrtConfig.Schema().load(resolve_config_with_defaults(recipe, {"default_gpu_exporter": None}))
@@ -2092,8 +2096,6 @@ def test_custom_profile_without_custom_command_cannot_accidentally_launch_dcgm()
 
 
 def test_amd_launch_uses_configured_command_and_profile(tmp_path):
-    from srtctl.core.power.profile import AMD_SMI_POWER_PROFILE
-
     harness = _power_harness(tmp_path, [_worker("node-a", [0, 3])])
     harness.config = _make_config(
         benchmark=_sa_bench(),

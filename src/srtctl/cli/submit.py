@@ -722,7 +722,7 @@ def show_config_details(config: SrtConfig) -> None:
 
         if config.telemetry.enabled:
             exporter = config.telemetry.dcgm_exporter
-            details.add_row("telemetry", "provider", "dcgm-power")
+            details.add_row("telemetry", "provider", config.telemetry.provider)
             details.add_row("telemetry", "required", str(config.telemetry.required))
             details.add_row("telemetry", "artifacts", f"<log_dir>/{config.telemetry.storage_subdir}")
             if exporter is not None:

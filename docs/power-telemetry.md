@@ -75,8 +75,9 @@ default_gpu_exporter:
     gpu_index_label: gpu
     gpu_uuid_label: uuid
     power_scope: gpu_socket_as_reported_by_amd_smi
-    gpu_util_metric: amd_smi_gfx_activity_percent
-    sm_active_metric: null
+    utilization_sources:
+      - [gpu_util_pct, amd_smi_gfx_activity_percent]
+    partition_label: partition_id
 ```
 
 The recipe enables `telemetry: {enabled: true, provider: dcgm-power,
@@ -90,19 +91,23 @@ Config loading copies the whole cluster exporter/profile into GPU power
 telemetry. An explicit recipe `telemetry.dcgm_exporter` replaces it, including
 an explicit `null`; cluster `default_gpu_exporter: null` disables the default.
 Omitting or nulling `power_profile` inside an explicit exporter retains DCGM.
-CPU-only telemetry never implicitly enables GPU power; combined CPU/GPU
-collection explicitly supplies `telemetry.dcgm_exporter`. Enabled telemetry
-with no remaining collector is rejected. A custom profile requires an explicit
+GPU and CPU legs resolve independently: an enabled CPU leg does not suppress
+the cluster GPU default. For CPU-only collection, explicitly set
+`telemetry.dcgm_exporter: null`, or use a cluster with no GPU exporter default.
+Enabled telemetry with no remaining collector is rejected. A custom profile requires an explicit
 exporter command, preventing an accidental DCGM launch.
 
 The bundled adapter reads `amd-smi list --json` once at startup; device identity
 is fixed for the exporter lifetime within an allocation. Each HTTP request runs
 `amd-smi metric --power --usage --json` for fresh watts from all local GPUs. It
 supports the ROCm 7.2 JSON shape, including the `gpu_data` envelope and explicit
-units. Native command errors, timeouts, malformed JSON, and ambiguous or
-partitioned identities fail closed; previous watts are never cached. Missing
-labels and invalid watts retain the shared parser's reason codes. Its
-metric-command timeout must fit within `request_timeout_seconds` with HTTP overhead.
+units. Native command errors, timeouts, and malformed payloads fail the request;
+previous watts are never cached. A partitioned device carries the configured
+`partition_label` and is rejected with `gpu_partition_unsupported`; duplicate
+identity indices reach the parser as duplicate power samples. Other devices on
+the node keep reporting. Missing labels and invalid watts retain the shared
+parser's reason codes. Its metric-command timeout must fit within
+`request_timeout_seconds` with HTTP overhead.
 The existing collector timestamps requests on the head node; AMD SMI owns the
 sensor's sampling cadence. The adapter does not reproduce the native
 InferenceX watch loop or its energy-accumulator sidecars.
@@ -123,7 +128,12 @@ migration or simultaneous native collection enabled.
 A third Prometheus exporter needs only its command/image and a new mapping in
 `power_profile`; no collector/parser dispatch or vendor registry is involved.
 Metrics must already use watts, percent (`gpu_util_pct`) and fraction
-(`sm_active`), respectively. Use null for unavailable utilization sources.
+(`sm_active`), respectively. `utilization_sources` maps supported artifact column
+names to exporter metric names; omit unavailable sources from the list, or use
+`[]` when none are available. Unknown columns are rejected at config load.
+An optional `partition_label` identifies unsupported samples by a nonempty
+label value; the adapter owns how native partition state maps to that label.
+Adding a new artifact column remains an explicit contract change.
 
 ## Artifacts
 
@@ -156,6 +166,12 @@ Non-default profiles add a self-contained `power_profile` object; the manifest's
 The offline validator requires them to agree. NVIDIA defaults omit the additive
 object and retain their previous artifact bytes. Schema versions, producer name,
 the historical `dcgm_exporter` identity key, windows, and topology are unchanged.
+`dcgm-power`, `srt-slurm.dcgm-power`, and `dcgm_exporter` are retained format and
+configuration identifiers; they do not assert a vendor. The source metric and
+scope describe the actual measurement. Version 1 denotes the artifact layout;
+non-default profiles add provenance and may use additional reason codes. Old
+DCGM-only readers reject those bundles, while existing NVIDIA bundles retain
+their exact contract.
 
 A window file records the formal benchmark boundaries on the head-node Unix
 clock plus a monotonic `duration`, and points at the SA-Bench result it

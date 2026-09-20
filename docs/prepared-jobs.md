@@ -38,6 +38,25 @@ checks actual allocated node cardinality. Mutable installed files or source edit
 require preparation of a new bundle. Preserve the qualified environment and
 source for every in-flight intent.
 
+Prepared single-node direct-vLLM jobs also bind readiness to the launched worker.
+Startup rejects an occupied public port. A standard-library container wrapper
+records the worker's Linux PID, start ticks, and PID/network namespaces before
+replacing itself with the unchanged engine command. Before HTTP readiness and
+again before launching the client, the host verifies that every listening socket
+on the public port belongs to that process or one of its current descendants.
+A foreign listener with the same served model name is rejected, including one
+that appears after the initial free-port probe.
+
+This narrow path requires shared host PID/network namespaces and readable Linux
+`/proc` process/socket records; unavailable evidence fails closed. Linux CI tests
+real sockets and exec/descendant ownership. The actual cluster must separately
+qualify visibility through its Pyxis/enroot setup. The existing one-second client
+poll loop and final success boundary recheck ownership, so a surviving parent
+cannot hide a vanished or replaced serving descendant. Detected ownership loss
+stops and reaps the client and fails execution. Polling cannot guarantee zero
+packets after a takeover between checks; it never accepts observed ownership loss. Other
+frontends and non-prepared jobs retain their existing launch behavior.
+
 ## Literal client hook
 
 ```yaml

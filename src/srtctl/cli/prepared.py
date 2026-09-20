@@ -9,6 +9,7 @@ import argparse
 import json
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from srtctl.core.prepared import (
@@ -59,6 +60,17 @@ def run_prepared(directory: str) -> None:
     profile = yaml.safe_load(profile_path.read_text())
     with cluster_config_scope(profile):
         runtime = RuntimeContext.from_config(config, job_id)
+        if config.frontend.type == "vllm" and prepared.manifest["resources"]["nodes"] == 1:
+            from srtctl.runtime_scripts.owned_worker import require_free_port
+
+            if (
+                prepared.manifest["resources"]["workers"] != 1
+                or config.resources.num_agg != 1
+                or config.resources.is_disaggregated
+            ):
+                raise ValueError("Prepared single-node direct vLLM requires exactly one aggregate worker")
+            require_free_port(runtime.frontend_port)
+            runtime = replace(runtime, prepared_direct_worker=runtime.log_dir / "direct-vllm-worker.json")
         orchestrator = SweepOrchestrator(config=config, runtime=runtime)
         exit_code = orchestrator.run()
     completion = {

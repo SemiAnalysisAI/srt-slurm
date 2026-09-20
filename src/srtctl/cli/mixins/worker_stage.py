@@ -11,6 +11,7 @@ import logging
 import shlex
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from srtctl.core.fingerprint import generate_capture_script
@@ -188,6 +189,17 @@ class WorkerStageMixin:
             dump_config_path=config_dump,
             profiling=profiling,
         )
+        direct_worker = getattr(self.runtime, "prepared_direct_worker", None)
+        if isinstance(direct_worker, Path):
+            cmd = [
+                "python3",
+                "-I",
+                "/srtctl-runtime/owned_worker.py",
+                "--identity",
+                f"/logs/{direct_worker.name}",
+                "--",
+                *cmd,
+            ]
 
         # Environment variables
         env_to_set = {

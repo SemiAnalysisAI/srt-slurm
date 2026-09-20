@@ -27,7 +27,14 @@ from srtctl.benchmarks import get_runner
 from srtctl.core.config import cluster_config_scope, expand_engine_config_defaults, resolve_config_with_defaults
 from srtctl.core.schema import ClusterConfig, SrtConfig
 
-CAPABILITIES = ("prepared-v1", "durable-intent-v1", "custom-argv-v1", "controller-observation-v1", "bounded-cleanup-v1")
+CAPABILITIES = (
+    "prepared-v1",
+    "durable-intent-v1",
+    "custom-argv-v1",
+    "controller-observation-v1",
+    "bounded-cleanup-v1",
+    "prepared-direct-listener-ownership-v1",
+)
 
 
 class UniqueKeyLoader(yaml.SafeLoader):

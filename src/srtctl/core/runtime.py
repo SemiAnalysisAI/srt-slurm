@@ -251,6 +251,9 @@ class RuntimeContext:
     # Frontend port (for benchmark endpoint)
     frontend_port: int = FRONTEND_PUBLIC_PORT
 
+    # Only prepared single-node direct vLLM records/checks its actual listening process.
+    prepared_direct_worker: Path | None = None
+
     # Optional lustre->node-local model staging (see model.stage_dir)
     stage_dir: str | None = None
     staged_model_path: Path | None = None

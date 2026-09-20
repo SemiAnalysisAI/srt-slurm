@@ -243,13 +243,22 @@ class BenchmarkStageMixin:
         logger.info("Waiting for server health (expecting %d health entries: %s)...", num_workers, count_desc)
 
         hc = self.config.health_check
+        readiness_timeout = float(hc.max_attempts * hc.interval_seconds)
+        direct_worker = getattr(self.runtime, "prepared_direct_worker", None)
+        if isinstance(direct_worker, Path):
+            from srtctl.runtime_scripts.owned_worker import wait_for_owned_listener
+
+            started = time.monotonic()
+            if not wait_for_owned_listener(direct_worker, self.runtime.frontend_port, readiness_timeout, stop_event):
+                return False
+            readiness_timeout = max(0.0, readiness_timeout - (time.monotonic() - started))
         if not wait_for_model(
             host=self._public_api_node(),
             port=FRONTEND_PUBLIC_PORT,
             n_prefill=n_prefill,
             n_decode=n_decode,
             poll_interval=float(hc.interval_seconds),
-            timeout=float(hc.max_attempts * hc.interval_seconds),
+            timeout=readiness_timeout,
             report_every=60.0,
             frontend_type=self.config.frontend.type,
             stop_event=stop_event,
@@ -395,6 +404,17 @@ class BenchmarkStageMixin:
 
         # Run the benchmark script
         benchmark_log = self.runtime.log_dir / "benchmark.out"
+        direct_worker = getattr(self.runtime, "prepared_direct_worker", None)
+        if isinstance(direct_worker, Path):
+            from srtctl.runtime_scripts.owned_worker import listener_owned
+
+            if (
+                stop_event.is_set()
+                or registry.check_failures()
+                or not listener_owned(direct_worker, self.runtime.frontend_port)
+            ):
+                logger.error("Prepared direct worker lost its listener before the client started")
+                return 1
         try:
             exit_code = self._run_benchmark_script(runner, benchmark_log, stop_event)
         finally:
@@ -462,12 +482,16 @@ class BenchmarkStageMixin:
         self.benchmark_child_allows_window_mutation = False
         try:
             while proc.poll() is None:
-                if stop_event.is_set():
+                if stop_event.is_set() or not self._prepared_listener_valid():
+                    stop_event.set()
                     logger.info("Stop requested, terminating benchmark")
                     return 1
                 time.sleep(1)
             self.benchmark_child_reaped = True
             self.benchmark_child_allows_window_mutation = True
+            if proc.returncode == 0 and not self._prepared_listener_valid():
+                stop_event.set()
+                return 1
             return proc.returncode or 0
         finally:
             if proc.poll() is None:
@@ -486,6 +510,20 @@ class BenchmarkStageMixin:
                 self.benchmark_child_allows_window_mutation = True
             if host_sampler is not None:
                 host_sampler.stop()
+
+    def _prepared_listener_valid(self) -> bool:
+        direct_worker = getattr(self.runtime, "prepared_direct_worker", None)
+        if not isinstance(direct_worker, Path):
+            return True
+        from srtctl.runtime_scripts.owned_worker import listener_owned
+
+        try:
+            if listener_owned(direct_worker, self.runtime.frontend_port):
+                return True
+            logger.error("Prepared direct worker no longer owns a listening socket")
+        except (OSError, ValueError, RuntimeError, KeyError):
+            logger.exception("Prepared direct worker listener ownership could not be verified")
+        return False
 
     def _get_benchmark_profiling_env(
         self,

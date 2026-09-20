@@ -12,6 +12,7 @@ This module provides lifecycle management for srun processes, including:
 
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -124,7 +125,7 @@ class ManagedProcess:
     def request_stop(self, step_ids: dict[str, str] | None = None, *, deadline: float | None = None) -> None:
         """Deliver SIGTERM without waiting (phase one of a group shutdown); ``await_stop`` finishes it.
 
-        ``step_ids`` is one ``squeue --steps`` listing shared by the whole group so
+        ``step_ids`` is one job-scoped step listing shared by the whole group so
         a job with dozens of workers does not query Slurm dozens of times.
         """
         if not self.is_running:
@@ -193,30 +194,67 @@ class ManagedProcess:
 NamedProcesses = dict[str, ManagedProcess]
 
 
+def _parse_running_steps(output: str, job_id: str) -> dict[str, str] | None:
+    """Parse scontrol's one-record-per-line format without guessing at ownership."""
+    steps: dict[str, str] = {}
+    names: set[str] = set()
+    identifiers: set[str] = set()
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        fields: dict[str, str] = {}
+        matches = list(re.finditer(r"(?:^|[ \t]+)([A-Za-z][A-Za-z0-9_:]*)=", line))
+        if not matches or matches[0].start() != 0 or matches[0][1] != "StepId":
+            return None
+        for index, match in enumerate(matches):
+            key = match[1]
+            if key in fields:
+                return None
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(line)
+            fields[key] = line[match.end() : end].rstrip()
+        step_id, name, state = (fields.get(key, "") for key in ("StepId", "Name", "State"))
+        if (
+            not re.fullmatch(re.escape(job_id) + r"\.(?:[0-9]+|batch|extern|interactive)", step_id)
+            or not name
+            or not re.fullmatch(r"[A-Z_]+", state)
+            or name in names
+            or step_id in identifiers
+        ):
+            return None
+        names.add(name)
+        identifiers.add(step_id)
+        if state == "RUNNING":
+            steps[name] = step_id
+    return steps
+
+
 def list_step_ids(job_id: str | None = None, *, timeout: float = 30) -> dict[str, str] | None:
-    """``{step name: <job>.<step>}`` for the running steps of this job; None when Slurm cannot be asked."""
+    """Running ``{step name: <job>.<step>}``; None on unavailable or ambiguous evidence.
+
+    A job-specific scontrol query reaches Slurm's step manager. squeue --steps
+    can see only the controller's batch/extern steps on stepmgr-enabled sites.
+    """
     job_id = job_id or os.environ.get("SLURM_JOB_ID") or os.environ.get("SLURM_JOBID")
-    if not job_id or shutil.which("squeue") is None:
+    if not job_id or not re.fullmatch(r"[1-9][0-9]*", job_id) or shutil.which("scontrol") is None:
         return None
     try:
         result = subprocess.run(
-            ["squeue", "--steps", f"--jobs={job_id}", "--noheader", "--format=%i %j"],
+            ["scontrol", "--oneliner", "show", "steps", job_id],
             capture_output=True,
             text=True,
             timeout=max(0.01, timeout),
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        logger.warning("squeue --steps failed: %s", exc)
+        logger.warning("scontrol show steps failed: %s", exc)
         return None
     if result.returncode != 0:
-        logger.warning("squeue --steps exited %d: %s", result.returncode, result.stderr.strip())
+        logger.warning("scontrol show steps exited %d: %s", result.returncode, result.stderr.strip())
         return None
-    steps: dict[str, str] = {}
-    for line in result.stdout.splitlines():
-        parts = line.split()
-        if len(parts) >= 2:
-            steps.setdefault(parts[1], parts[0])
+    steps = _parse_running_steps(result.stdout, job_id)
+    if steps is None:
+        logger.warning("scontrol show steps returned malformed or ambiguous records for job %s", job_id)
     return steps
 
 
@@ -363,7 +401,11 @@ class ProcessRegistry:
         # can arrive at any instruction; the handler only requests shutdown.
         deadline = time.monotonic() + max(0, timeout)
         logger.info("Cleaning up %d running processes...", len(running))
-        step_ids = list_step_ids(timeout=min(5, max(0.01, timeout))) if any(p.step_name for p in running) else None
+        step_ids = (
+            list_step_ids(self.job_id, timeout=min(5, max(0.01, timeout)))
+            if any(p.step_name for p in running)
+            else None
+        )
         complete = True
         for tier in sorted({proc.shutdown_tier for proc in running}):
             group = [proc for proc in running if proc.shutdown_tier == tier and proc.is_running]

@@ -140,16 +140,20 @@ def test_tachometer_terminate_signals_the_step_then_waits() -> None:
     popen = MagicMock()
     popen.poll.return_value = None
     proc = ManagedProcess(name="tachometer", popen=popen, terminate_timeout=90.0, step_name="tachometer")
-    squeue = SimpleNamespace(returncode=0, stdout="12440.16 tachometer\n12440.extern extern\n", stderr="")
+    scontrol = SimpleNamespace(
+        returncode=0,
+        stdout="StepId=12440.16 State=RUNNING Name=tachometer\nStepId=12440.extern State=RUNNING Name=extern\n",
+        stderr="",
+    )
     scancel = SimpleNamespace(returncode=0, stdout="", stderr="")
     with (
         patch.dict("os.environ", {"SLURM_JOB_ID": "12440"}),
         patch("srtctl.core.processes.shutil.which", return_value="/usr/bin/slurm-tool"),
-        patch("srtctl.core.processes.subprocess.run", side_effect=[squeue, scancel]) as run,
+        patch("srtctl.core.processes.subprocess.run", side_effect=[scontrol, scancel]) as run,
         patch("srtctl.core.processes.terminate_and_reap") as reap,
     ):
         proc.terminate()
-    assert run.call_args_list[0].args[0][:3] == ["squeue", "--steps", "--jobs=12440"]
+    assert run.call_args_list[0].args[0] == ["scontrol", "--oneliner", "show", "steps", "12440"]
     assert run.call_args_list[1].args[0] == ["scancel", "--signal=TERM", "--full", "12440.16"]
     popen.wait.assert_called_once_with(timeout=90.0)
     reap.assert_not_called()  # srun exited on its own once the task handled SIGTERM
@@ -159,11 +163,11 @@ def test_terminate_falls_back_to_srun_sigterm_when_the_step_is_not_found() -> No
     popen = MagicMock()
     popen.poll.return_value = None
     proc = ManagedProcess(name="tachometer", popen=popen, step_name="tachometer")
-    squeue = SimpleNamespace(returncode=0, stdout="12440.extern extern\n", stderr="")
+    scontrol = SimpleNamespace(returncode=0, stdout="StepId=12440.extern State=RUNNING Name=extern\n", stderr="")
     with (
         patch.dict("os.environ", {"SLURM_JOB_ID": "12440"}),
         patch("srtctl.core.processes.shutil.which", return_value="/usr/bin/slurm-tool"),
-        patch("srtctl.core.processes.subprocess.run", return_value=squeue),
+        patch("srtctl.core.processes.subprocess.run", return_value=scontrol),
         patch("srtctl.core.processes.terminate_and_reap") as reap,
     ):
         reap.return_value = SimpleNamespace(reaped=True, force_killed=False)

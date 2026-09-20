@@ -2051,6 +2051,19 @@ def main():
 
     dry_run_parser = subparsers.add_parser("dry-run", help="Validate without submitting")
     add_common_args(dry_run_parser)
+    docker_parser = subparsers.add_parser(
+        "render-docker", help="Write a native single-node aggregate Docker server command as a .txt file"
+    )
+    docker_parser.add_argument("-f", "--file", required=True, dest="config", help="Recipe file or file:selector")
+    add_override_args(docker_parser)
+    docker_parser.add_argument("--to", type=Path, required=True, dest="docker_output", help="Output text file")
+    docker_parser.add_argument(
+        "--image", help="Docker worker image (overrides identity.container.image/model.container)"
+    )
+    docker_parser.add_argument("--mooncake-image", help="Docker image for the Mooncake master")
+    docker_parser.add_argument(
+        "--host-ip", default="127.0.0.1", help="Host IPv4 address; use the RDMA NIC IP for Mooncake RDMA"
+    )
     render_parser = subparsers.add_parser(
         "render",
         help="Write a self-contained sbatch script instead of submitting it",
@@ -2431,6 +2444,25 @@ def main():
             if not effective_config_path.exists():
                 console.print(f"[bold red]Config not found:[/] {config_path}")
                 sys.exit(1)
+
+            if args.command == "render-docker":
+                from srtctl.core.docker_render import load_docker_config, render_docker
+
+                if not effective_config_path.is_file():
+                    raise ValueError("render-docker expects one recipe file, not a directory")
+                raw = yaml.safe_load(effective_config_path.read_text())
+                if not isinstance(raw, dict):
+                    raise ValueError("render-docker expects a YAML mapping")
+                config = load_docker_config(raw, selector)
+                text = render_docker(config, image=args.image, mooncake_image=args.mooncake_image, host_ip=args.host_ip)
+                destination = args.docker_output.expanduser().resolve()
+                if destination == config_path.expanduser().resolve():
+                    raise ValueError("render-docker output must not overwrite the input recipe")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(text)
+                print(str(destination), flush=True)
+                restore_console()
+                return
 
             # resolve-override has its own simple dispatch path
             if args.command == "resolve-override":

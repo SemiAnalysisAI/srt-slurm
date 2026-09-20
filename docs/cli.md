@@ -18,6 +18,7 @@
   - [srtctl apply](#srtctl-apply)
   - [srtctl dry-run](#srtctl-dry-run)
   - [srtctl render](#srtctl-render)
+  - [srtctl render-docker](#srtctl-render-docker)
   - [srtctl resolve-override](#srtctl-resolve-override)
   - [srtctl migrate](#srtctl-migrate)
   - [srtctl monitor](#srtctl-monitor)
@@ -390,6 +391,78 @@ that runs `render` from somewhere else should set `SRTSLURM_CONFIG`.
 | `--serve-only` | Render a serve-only job (deploy, hold, no benchmark) |
 | `--setup-script` | Custom setup script in `configs/` |
 | `--no-preflight` | Skip the pre-render model/container/telemetry filesystem checks |
+
+### `srtctl render-docker`
+
+Write a native SGLang or vLLM server command into a copyable `.txt` file. This
+does not submit a job or require Docker, SLURM, GPUs, or model files on the
+rendering machine.
+
+```bash
+srtctl render-docker -f recipe.yaml --to server.txt
+srtctl render-docker -f variants.yaml:override_tp4 --to server.txt
+srtctl render-docker -f recipe.yaml --to server.txt \
+  --set roles.agg.args.tensor-parallel-size=4 --set roles.agg.gpus=4
+
+# For an Enroot/SquashFS recipe, supply the corresponding Docker image.
+srtctl render-docker -f recipe.yaml --to server.txt --image vllm/vllm-openai:nightly
+
+# Mooncake: use the serving host's transfer/RDMA NIC address, not the login node.
+srtctl render-docker -f mooncake.yaml --to mooncake-server.txt \
+  --host-ip 192.0.2.10 --mooncake-image registry.example/mooncake:my-build
+
+# Inspect the output, then run on the serving host.
+bash server.txt
+```
+
+The export requires exactly one aggregate worker on one engine node. It uses the
+existing native command builders, retaining aggregate CLI arguments, role/global
+environment (global wins), local model mounts and literal extra/container mounts.
+Both schema 1 and schema 2 recipes, cluster aliases, override selectors, `--set`,
+and `--unset` are supported. The output path is printed on stdout.
+
+This exports the engine as a direct API server on port 8000, even if the recipe
+normally uses a Dynamo frontend or router. Benchmark clients, routers, telemetry,
+profiling and SLURM options are intentionally not reproduced. Failover, Dynamo
+sidecars/source builds, setup scripts, host setup, model staging, service pools
+and additional explicitly declared services are rejected rather than silently
+dropped. Bake setup-script changes and required packages into the selected image
+before removing those settings from the export recipe.
+
+The worker image comes from `--image`, then `identity.container.image`, then
+`model.container`. Registry references using `docker://` or Enroot's `registry#image`
+notation are converted; local `.sqsh` files cannot be run by Docker. A separately
+configured Mooncake master image can be replaced with `--mooncake-image`.
+
+The generated command explicitly overrides the image entrypoint, uses host
+networking and IPC, enables privileged access and unlimited memlock, and mounts
+the Hugging Face cache. NVIDIA uses `--gpus all`; MI/AMD recipes use `/dev/kfd`
+and `/dev/dri`. GPU visibility restricts a partial-node worker to its allocated
+GPUs. Review the privileged mounts and environment before running or sharing.
+Secret-like environment names, including `HF_TOKEN`, are exported by name from
+the launch shell; their recipe values are not written to the text file. Arbitrary
+CLI arguments and service preambles are retained, so review those for secrets too.
+
+For a managed Mooncake recipe the same text file includes:
+
+- The vLLM store JSON heredoc, preserving the recipe's sizes, protocol and device
+  settings, including `device_names_by_gpu` for the aggregate worker.
+- A detached master container using the existing master-command builder and
+  recipe arguments, environment and preamble.
+- A master readiness check on ports 8700/8701/8702, followed by the server with
+  matching `MOONCAKE_*` environment and the mounted JSON.
+- Cleanup of the master container when the foreground server exits.
+
+SGLang uses its Mooncake environment and native HiCache flags without the
+vLLM-only JSON. Configure the engine's Mooncake flags in `roles.agg.args`; the
+export does not invent connector flags or memory capacities. The images must
+already contain compatible Mooncake binaries and dependencies.
+
+Generated files and logs go into `${SRT_DOCKER_DIR:-$PWD/srtctl-docker}` on the
+serving host. Without `--host-ip`, the master uses loopback and the script
+requires `MOONCAKE_LOCAL_HOSTNAME` from the launch environment unless the recipe
+already pins that value; set it to the transfer NIC address. External masters
+and custom master command/source/build/srun settings are not supported.
 
 ### `srtctl resolve-override`
 

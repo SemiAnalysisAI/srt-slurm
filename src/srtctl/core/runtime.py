@@ -251,6 +251,9 @@ class RuntimeContext:
     # Frontend port (for benchmark endpoint)
     frontend_port: int = FRONTEND_PUBLIC_PORT
 
+    # Only prepared single-node direct vLLM records/checks its actual listening process.
+    prepared_direct_worker: Path | None = None
+
     # Optional lustre->node-local model staging (see model.stage_dir)
     stage_dir: str | None = None
     staged_model_path: Path | None = None
@@ -462,6 +465,12 @@ class RuntimeContext:
             return str(self.model_path)
         if self.staged_model_path is not None:
             return str(self.staged_model_path)
+        # A Hugging Face snapshot contains ../../blobs symlinks. Re-rooting
+        # only that directory at /model breaks them. An explicit same-path
+        # ancestor mount preserves the cache tree without copying weights.
+        for host, container in self.container_mounts.items():
+            if host == container and self.model_path.is_relative_to(host):
+                return str(self.model_path)
         return "/model"
 
     def format_string(self, template: str, **extra_kwargs) -> str:

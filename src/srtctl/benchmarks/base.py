@@ -95,6 +95,14 @@ class BenchmarkRunner(ABC):
         """Get benchmark-specific environment variables."""
         return {}
 
+    def get_environment_unset(self, config: SrtConfig, runtime: RuntimeContext) -> list[str]:
+        """Variables explicitly removed before executing the child."""
+        return list(config.benchmark.env_unset) if config.benchmark.type == "custom" else []
+
+    def get_working_directory(self, config: SrtConfig, runtime: RuntimeContext) -> str | None:
+        """Working directory inside the selected container."""
+        return config.benchmark.cwd if config.benchmark.type == "custom" else None
+
 
 class AIPerfBenchmarkRunner(BenchmarkRunner):
     """Base class for AIPerf-driven benchmarks.

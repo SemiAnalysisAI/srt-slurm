@@ -664,6 +664,7 @@ class TestSGLangProtocol:
         runtime = MagicMock()
         runtime.model_path = Path("/model")
         runtime.is_hf_model = False
+        runtime.worker_model_arg = "/model"
 
         with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):
             command = SGLangProtocol().build_worker_command(process, [process], runtime)
@@ -2895,6 +2896,7 @@ class TestVLLMDataParallelMode:
         runtime = MagicMock()
         runtime.model_path = Path("/model")
         runtime.is_hf_model = False
+        runtime.worker_model_arg = "/model"
         runtime.frontend_port = 9000
         runtime.network_interface = "eth0"
 
@@ -2943,6 +2945,7 @@ class TestVLLMDataParallelMode:
         runtime = MagicMock()
         runtime.model_path = Path("/model")
         runtime.is_hf_model = False
+        runtime.worker_model_arg = "/model"
         runtime.frontend_port = 9000
         runtime.network_interface = "eth0"
 
@@ -2989,6 +2992,7 @@ class TestVLLMDataParallelMode:
         runtime = MagicMock()
         runtime.model_path = Path("/model")
         runtime.is_hf_model = False
+        runtime.worker_model_arg = "/model"
         runtime.frontend_port = 8000
         profiling = MagicMock(is_nsys=True, is_nsys_time=False)
         profiling._get_phase_config.return_value = SimpleNamespace(
@@ -3110,6 +3114,7 @@ class TestVLLMDataParallelMode:
         mock_runtime = MagicMock()
         mock_runtime.model_path = Path("/model")
         mock_runtime.is_hf_model = False
+        mock_runtime.worker_model_arg = "/model"
 
         with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):
             cmd = backend.build_worker_command(
@@ -3177,6 +3182,7 @@ class TestVLLMDataParallelMode:
         runtime = MagicMock()
         runtime.model_path = Path("/model")
         runtime.is_hf_model = False
+        runtime.worker_model_arg = "/model"
         runtime.request_plane = "tcp"
 
         with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):
@@ -3231,6 +3237,7 @@ class TestVLLMDataParallelMode:
         runtime = MagicMock()
         runtime.model_path = Path("/model")
         runtime.is_hf_model = False
+        runtime.worker_model_arg = "/model"
         runtime.request_plane = "tcp"
 
         with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):
@@ -3272,6 +3279,7 @@ class TestVLLMDataParallelMode:
         runtime = MagicMock()
         runtime.model_path = Path("/model")
         runtime.is_hf_model = False
+        runtime.worker_model_arg = "/model"
         runtime.request_plane = "tcp"
 
         with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):
@@ -3304,7 +3312,9 @@ class TestVLLMDataParallelMode:
             gpus_per_node=4,
         )
         processes = backend.endpoints_to_processes([endpoint])
-        runtime = MagicMock(model_path=Path("/model"), is_hf_model=False, request_plane="tcp")
+        runtime = MagicMock(
+            model_path=Path("/model"), is_hf_model=False, worker_model_arg="/model", request_plane="tcp"
+        )
 
         with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):
             commands = [backend.build_worker_command(process, processes, runtime) for process in processes]
@@ -3337,7 +3347,9 @@ class TestVLLMDataParallelMode:
             gpus_per_node=4,
         )
         processes = backend.endpoints_to_processes([endpoint])
-        runtime = MagicMock(model_path=Path("/model"), is_hf_model=False, request_plane="tcp")
+        runtime = MagicMock(
+            model_path=Path("/model"), is_hf_model=False, worker_model_arg="/model", request_plane="tcp"
+        )
 
         with patch("srtctl.core.slurm.get_hostname_ip", side_effect=lambda node: f"10.0.0.{int(node[-1]) + 1}"):
             commands = [backend.build_worker_command(process, processes, runtime) for process in processes]
@@ -3411,7 +3423,9 @@ class TestVLLMDataParallelMode:
             gpus_per_node=4,
         )
         processes = backend.endpoints_to_processes([endpoint])
-        runtime = MagicMock(model_path=Path("/model"), is_hf_model=False, request_plane="tcp")
+        runtime = MagicMock(
+            model_path=Path("/model"), is_hf_model=False, worker_model_arg="/model", request_plane="tcp"
+        )
 
         with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):
             commands = [backend.build_worker_command(process, processes, runtime) for process in processes]
@@ -3566,6 +3580,7 @@ class TestVLLMDataParallelMode:
         mock_runtime = MagicMock()
         mock_runtime.model_path = Path("/model")
         mock_runtime.is_hf_model = False
+        mock_runtime.worker_model_arg = "/model"
 
         cmd = backend.build_worker_command(
             process=process,
@@ -3633,6 +3648,7 @@ class TestVLLMDataParallelMode:
         mock_runtime = MagicMock()
         mock_runtime.model_path = Path("/model")
         mock_runtime.is_hf_model = False
+        mock_runtime.worker_model_arg = "/model"
 
         with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):
             cmd = backend.build_worker_command(
@@ -3696,6 +3712,7 @@ class TestVLLMDataParallelMode:
         mock_runtime = MagicMock()
         mock_runtime.model_path = Path("/model")
         mock_runtime.is_hf_model = False
+        mock_runtime.worker_model_arg = "/model"
 
         with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):
             cmd = backend.build_worker_command(
@@ -3745,6 +3762,7 @@ class TestVLLMDataParallelMode:
         mock_runtime = MagicMock()
         mock_runtime.model_path = Path("/model")
         mock_runtime.is_hf_model = False
+        mock_runtime.worker_model_arg = "/model"
 
         with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):
             return backend.build_worker_command(
@@ -3865,6 +3883,7 @@ class TestHuggingFaceModelSupport:
         else:
             runtime.model_path = Path("/models/my-model")
             runtime.is_hf_model = False
+            runtime.worker_model_arg = "/model"
         # build_worker_command reads runtime.worker_model_arg (a real
         # RuntimeContext property); the mock must provide it. No staging here.
         runtime.worker_model_arg = str(runtime.model_path) if is_hf else "/model"
@@ -4436,6 +4455,7 @@ class TestDirectVllmMultiNode:
         runtime = MagicMock()
         runtime.model_path = Path("/model")
         runtime.is_hf_model = False
+        runtime.worker_model_arg = "/model"
         runtime.frontend_port = 9000
         runtime.network_interface = "eth0"
 
@@ -4540,6 +4560,7 @@ class TestDirectVllmMultiNode:
         runtime = MagicMock()
         runtime.model_path = Path("/model")
         runtime.is_hf_model = False
+        runtime.worker_model_arg = "/model"
         runtime.frontend_port = 9000
         runtime.network_interface = "ib0"
 
@@ -4580,6 +4601,7 @@ class TestDirectVllmMultiNode:
         runtime = MagicMock()
         runtime.model_path = Path("/model")
         runtime.is_hf_model = False
+        runtime.worker_model_arg = "/model"
         runtime.frontend_port = 9000
         runtime.network_interface = "ib0"
 
@@ -4634,6 +4656,7 @@ class TestDirectVllmMultiNode:
         runtime = MagicMock()
         runtime.model_path = Path("/model")
         runtime.is_hf_model = False
+        runtime.worker_model_arg = "/model"
         runtime.network_interface = "ib0"
         runtime.request_plane = "nats"
 
@@ -4716,6 +4739,7 @@ class TestDirectVllmMultiNode:
         runtime = MagicMock()
         runtime.model_path = Path("/model")
         runtime.is_hf_model = False
+        runtime.worker_model_arg = "/model"
         runtime.frontend_port = 9000
 
         with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):
@@ -4748,6 +4772,7 @@ class TestDirectVllmMultiNode:
         runtime = MagicMock()
         runtime.model_path = Path("/model")
         runtime.is_hf_model = False
+        runtime.worker_model_arg = "/model"
         runtime.frontend_port = 9000
 
         with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):

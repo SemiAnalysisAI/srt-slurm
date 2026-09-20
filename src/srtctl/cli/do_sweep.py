@@ -327,6 +327,7 @@ class SweepOrchestrator(
         -- a failed teardown must not overwrite the job's real exit code.
         """
         setup = self.config.host_setup
+        self.restoration_success = True
         if not setup.teardown or not getattr(self, "_host_setup_ran", False):
             return
         try:
@@ -334,8 +335,10 @@ class SweepOrchestrator(
         except Exception:
             # Cleanup path: a teardown failure must never mask the job's result.
             logger.exception("host_setup teardown raised; node state may need manual cleanup")
+            self.restoration_success = False
             return
         if failures:
+            self.restoration_success = False
             logger.error(
                 "host_setup teardown failed on %s; those nodes may be left in a modified state",
                 ", ".join(failures),
@@ -734,12 +737,17 @@ class SweepOrchestrator(
 
         finally:
             logger.info("Cleanup")
+            if stop_event.is_set() or registry.check_failures():
+                exit_code = exit_code or 1
+            registry.finalizing = True
             # NOTE: finalize before registry.cleanup() so samples and manifest are durable.
             exit_code = self.finalize_power_telemetry(exit_code, interrupted=stop_event.is_set())
             exit_code = self.finalize_cpu_power_telemetry(exit_code, interrupted=stop_event.is_set())
             exit_code = self.finalize_cpu_power_host_telemetry(exit_code, interrupted=stop_event.is_set())
             stop_event.set()
-            registry.cleanup()
+            self.cleanup_complete = registry.cleanup() and self.benchmark_child_allows_window_mutation is not False
+            if not self.cleanup_complete:
+                exit_code = exit_code or 1
             # After cleanup so the GPUs are idle before node state is reverted.
             self._run_host_teardown()
             if exit_code != 0:

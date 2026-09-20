@@ -996,10 +996,8 @@ class VLLMProtocol:
         else:
             leader_ip = get_hostname_ip(endpoint_nodes[0])
 
-        # Determine model path: HF model ID or container mount path
-        # For HF models (hf:prefix), model_path contains the HF model ID (e.g., "facebook/opt-125m")
-        # For local models, model is mounted to /model in the container
-        model_arg = str(runtime.model_path) if runtime.is_hf_model else "/model"
+        # Honor native staging and same-path cache mounts (HF blob symlinks).
+        model_arg = runtime.worker_model_arg
 
         # Get served model name from config or use model path name
         served_model_name = self.get_served_model_name(runtime.model_path.name)
@@ -1466,6 +1464,8 @@ def _config_to_cli_args(config: dict[str, Any]) -> list[str]:
         elif isinstance(value, list):
             args.append(f"--{flag_name}")
             args.extend(str(v) for v in value)
+        elif isinstance(value, dict):
+            args.extend([f"--{flag_name}", json.dumps(value, separators=(",", ":"), allow_nan=False)])
         elif value is not None:
             args.extend([f"--{flag_name}", str(value)])
     return args

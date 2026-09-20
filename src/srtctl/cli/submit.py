@@ -546,6 +546,12 @@ def show_config_details(config: SrtConfig) -> None:
             details.add_row("benchmark", "type", config.benchmark.type)
             if config.benchmark.command:
                 details.add_row("benchmark", "command", config.benchmark.command)
+            if config.benchmark.argv:
+                details.add_row("benchmark", "argv (literal)", repr(config.benchmark.argv))
+            if config.benchmark.cwd:
+                details.add_row("benchmark", "cwd", config.benchmark.cwd)
+            if config.benchmark.env_unset:
+                details.add_row("benchmark", "env_unset", ", ".join(config.benchmark.env_unset))
 
         # Surface a non-default benchmark container regardless of type — accuracy
         # benchmarks like AIME (run via type: custom + the NeMo Skills container)
@@ -700,6 +706,8 @@ def generate_minimal_sbatch_script(
     output_dir: Path | None = None,
     runtime_config_filename: str = "config.yaml",
     serve_only: bool = False,
+    prepared_dir: Path | None = None,
+    runtime_python: str | None = None,
 ) -> str:
     """Generate minimal sbatch script that calls the Python orchestrator.
 
@@ -805,6 +813,8 @@ def generate_minimal_sbatch_script(
         setup_script=setup_script,
         serve_only=serve_only,
         config_environment={key: shlex.quote(str(value)) for key, value in config_environment.items()},
+        prepared_dir=shlex.quote(str(prepared_dir)) if prepared_dir else None,
+        runtime_python=shlex.quote(runtime_python) if runtime_python else None,
     )
 
     return rendered
@@ -1663,6 +1673,20 @@ def resolve_override_cmd(
 
 
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] in {
+        "prepare",
+        "submit-prepared",
+        "wait",
+        "cancel",
+        "reconcile",
+        "capabilities",
+        "cancel-known",
+        "wait-known",
+        "intent-path",
+    }:
+        from srtctl.cli.prepared import main as prepared_main
+
+        sys.exit(prepared_main(sys.argv[1:]))
     # If no args at all, launch interactive mode
     if len(sys.argv) == 1:
         from srtctl.cli.interactive import run_interactive
@@ -1701,6 +1725,21 @@ def main():
     parser.add_argument("--version", action="version", version=str(version_info()))
 
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    # Dispatch above owns these parsers; register their names here as well so
+    # the public top-level help exposes the supported prepared-job protocol.
+    for command, description in {
+        "prepare": "Freeze and validate one native job before allocation",
+        "submit-prepared": "Claim an intent and submit its immutable job",
+        "intent-path": "Locate an intent receipt before interruptible submission",
+        "reconcile": "Recover acceptance without submitting again",
+        "wait": "Observe an accepted job and validate completion evidence",
+        "cancel": "Request cancellation of an accepted owned job",
+        "cancel-known": "Cancel every comment-verified known allocation",
+        "wait-known": "Wait for all known allocations to close",
+        "capabilities": "Print prepared runtime protocol capabilities",
+    }.items():
+        subparsers.add_parser(command, help=description)
 
     def add_override_args(p):
         p.add_argument(

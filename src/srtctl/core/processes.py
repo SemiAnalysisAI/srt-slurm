@@ -12,10 +12,10 @@ This module provides lifecycle management for srun processes, including:
 
 import logging
 import os
+import re
 import shutil
 import signal
 import subprocess
-import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -122,29 +122,53 @@ class ManagedProcess:
         if not outcome.reaped:
             logger.error("Process %s was not reaped after SIGKILL", self.name)
 
-    def request_stop(self, step_ids: dict[str, str] | None = None) -> None:
+    def request_stop(self, step_ids: dict[str, str] | None = None, *, deadline: float | None = None) -> None:
         """Deliver SIGTERM without waiting (phase one of a group shutdown); ``await_stop`` finishes it.
 
-        ``step_ids`` is one ``squeue --steps`` listing shared by the whole group so
+        ``step_ids`` is one job-scoped step listing shared by the whole group so
         a job with dozens of workers does not query Slurm dozens of times.
         """
         if not self.is_running:
             return
-        self._stopped_via_step = bool(self.step_name) and signal_step(self.step_name or "", "TERM", step_ids=step_ids)
+        remaining = max(0.01, deadline - time.monotonic()) if deadline is not None else 30
+        self._stopped_via_step = bool(self.step_name) and signal_step(
+            self.step_name or "", "TERM", step_ids=step_ids, timeout=remaining
+        )
         if not self._stopped_via_step:
             self.popen.terminate()
-        self._stop_deadline = time.monotonic() + self.terminate_timeout
+        self._stop_deadline = (
+            min(time.monotonic() + self.terminate_timeout, deadline)
+            if deadline is not None
+            else time.monotonic() + self.terminate_timeout
+        )
 
-    def await_stop(self) -> None:
+    def await_stop(self, *, deadline: float | None = None, step_ids: dict[str, str] | None = None) -> bool:
         """Wait out this process's own deadline after ``request_stop``, then escalate to SIGKILL."""
         if not self.is_running:
-            return
-        deadline = self._stop_deadline if self._stop_deadline is not None else time.monotonic()
+            return True
+        stop_deadline = self._stop_deadline if self._stop_deadline is not None else time.monotonic()
+        if deadline is not None:
+            stop_deadline = min(stop_deadline, max(time.monotonic(), deadline - 1))
         try:
-            self.popen.wait(timeout=max(0.0, deadline - time.monotonic()))
-            return
+            self.popen.wait(timeout=max(0.0, stop_deadline - time.monotonic()))
+            return True
         except subprocess.TimeoutExpired:
             pass
+        if deadline is not None:
+            remote_closed = not (self.step_name and os.environ.get("SLURM_JOB_ID"))
+            if self.step_name:
+                remote_closed = (
+                    signal_step(
+                        self.step_name, "KILL", step_ids=step_ids, timeout=max(0.01, deadline - time.monotonic())
+                    )
+                    or remote_closed
+                )
+            self.popen.kill()
+            try:
+                self.popen.wait(timeout=max(0.0, deadline - time.monotonic()))
+                return remote_closed
+            except subprocess.TimeoutExpired:
+                return False
         if self._stopped_via_step:
             logger.warning(
                 "Step %s (%s) did not exit %.0fs after SIGTERM; terminating srun",
@@ -163,36 +187,74 @@ class ManagedProcess:
                 outcome = TerminationOutcome(reaped=False, force_killed=True)
         if not outcome.reaped:
             logger.error("Process %s was not reaped after SIGKILL", self.name)
+        return outcome.reaped
 
 
 # Type alias for named process collections
 NamedProcesses = dict[str, ManagedProcess]
 
 
-def list_step_ids(job_id: str | None = None) -> dict[str, str] | None:
-    """``{step name: <job>.<step>}`` for the running steps of this job; None when Slurm cannot be asked."""
+def _parse_running_steps(output: str, job_id: str) -> dict[str, str] | None:
+    """Parse scontrol's one-record-per-line format without guessing at ownership."""
+    steps: dict[str, str] = {}
+    names: set[str] = set()
+    identifiers: set[str] = set()
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        fields: dict[str, str] = {}
+        matches = list(re.finditer(r"(?:^|[ \t]+)([A-Za-z][A-Za-z0-9_:]*)=", line))
+        if not matches or matches[0].start() != 0 or matches[0][1] != "StepId":
+            return None
+        for index, match in enumerate(matches):
+            key = match[1]
+            if key in fields:
+                return None
+            end = matches[index + 1].start() if index + 1 < len(matches) else len(line)
+            fields[key] = line[match.end() : end].rstrip()
+        step_id, name, state = (fields.get(key, "") for key in ("StepId", "Name", "State"))
+        if (
+            not re.fullmatch(re.escape(job_id) + r"\.(?:[0-9]+|batch|extern|interactive)", step_id)
+            or not name
+            or not re.fullmatch(r"[A-Z_]+", state)
+            or name in names
+            or step_id in identifiers
+        ):
+            return None
+        names.add(name)
+        identifiers.add(step_id)
+        if state == "RUNNING":
+            steps[name] = step_id
+    return steps
+
+
+def list_step_ids(job_id: str | None = None, *, timeout: float = 30) -> dict[str, str] | None:
+    """Running ``{step name: <job>.<step>}``; None on unavailable or ambiguous evidence.
+
+    A job-specific scontrol query reaches Slurm's step manager. squeue --steps
+    can see only the controller's batch/extern steps on stepmgr-enabled sites.
+    """
     job_id = job_id or os.environ.get("SLURM_JOB_ID") or os.environ.get("SLURM_JOBID")
-    if not job_id or shutil.which("squeue") is None:
+    if not job_id or not re.fullmatch(r"[1-9][0-9]*", job_id) or shutil.which("scontrol") is None:
         return None
     try:
         result = subprocess.run(
-            ["squeue", "--steps", f"--jobs={job_id}", "--noheader", "--format=%i %j"],
+            ["scontrol", "--oneliner", "show", "steps", job_id],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=max(0.01, timeout),
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        logger.warning("squeue --steps failed: %s", exc)
+        logger.warning("scontrol show steps failed: %s", exc)
         return None
     if result.returncode != 0:
-        logger.warning("squeue --steps exited %d: %s", result.returncode, result.stderr.strip())
+        logger.warning("scontrol show steps exited %d: %s", result.returncode, result.stderr.strip())
         return None
-    steps: dict[str, str] = {}
-    for line in result.stdout.splitlines():
-        parts = line.split()
-        if len(parts) >= 2:
-            steps.setdefault(parts[1], parts[0])
+    steps = _parse_running_steps(result.stdout, job_id)
+    if steps is None:
+        logger.warning("scontrol show steps returned malformed or ambiguous records for job %s", job_id)
     return steps
 
 
@@ -202,7 +264,9 @@ def find_step_id(step_name: str, job_id: str | None = None) -> str | None:
     return steps.get(step_name) if steps else None
 
 
-def signal_step(step_name: str, sig: str = "TERM", *, step_ids: dict[str, str] | None = None) -> bool:
+def signal_step(
+    step_name: str, sig: str = "TERM", *, step_ids: dict[str, str] | None = None, timeout: float = 30
+) -> bool:
     """Send ``sig`` to every process of the Slurm step named ``step_name``; True when delivered.
 
     ``srun`` turns a SIGTERM aimed at itself into a step abort that SIGKILLs the
@@ -219,7 +283,11 @@ def signal_step(step_name: str, sig: str = "TERM", *, step_ids: dict[str, str] |
         return False
     try:
         result = subprocess.run(
-            ["scancel", f"--signal={sig}", "--full", step_id], capture_output=True, text=True, timeout=30, check=False
+            ["scancel", f"--signal={sig}", "--full", step_id],
+            capture_output=True,
+            text=True,
+            timeout=max(0.01, timeout),
+            check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         logger.warning("scancel --signal=%s %s failed: %s", sig, step_id, exc)
@@ -258,6 +326,9 @@ class ProcessRegistry:
         self._processes: dict[str, ManagedProcess] = {}
         self._lock = threading.Lock()
         self._failed_processes: list[str] = []
+        self._cleanup_started = False
+        self.finalizing = False
+        self.cleanup_complete = False
 
     def add_process(self, process: ManagedProcess) -> None:
         """Add a process to the registry.
@@ -296,10 +367,12 @@ class ProcessRegistry:
             True if any critical process has exited with non-zero code
         """
         with self._lock:
+            if self._cleanup_started:
+                return bool(self._failed_processes)
             for name, proc in self._processes.items():
                 if proc.critical and not proc.is_running:
                     exit_code = proc.exit_code
-                    if exit_code != 0 and name not in self._failed_processes:
+                    if name not in self._failed_processes:
                         self._failed_processes.append(name)
                         logger.error(
                             "Critical process '%s' exited with code %d",
@@ -309,7 +382,7 @@ class ProcessRegistry:
 
             return len(self._failed_processes) > 0
 
-    def cleanup(self) -> None:
+    def cleanup(self, timeout: float = 120) -> bool:
         """Stop every registered process: SIGTERM to a whole tier at once, wait, escalate, next tier.
 
         Within a tier the signal goes out in reverse registration order without
@@ -320,22 +393,36 @@ class ProcessRegistry:
         left deregistering from a plane that has already gone away.
         """
         with self._lock:
+            if self._cleanup_started:
+                return self.cleanup_complete
+            self._cleanup_started = True
             running = [proc for proc in self._processes.values() if proc.is_running]
-            logger.info("Cleaning up %d processes (%d running)...", len(self._processes), len(running))
-            step_ids = list_step_ids() if any(proc.step_name for proc in running) else None
-            for tier in sorted({proc.shutdown_tier for proc in running}):
-                group = [proc for proc in running if proc.shutdown_tier == tier and proc.is_running]
-                for proc in reversed(group):
-                    logger.debug("Stopping process: %s", proc.name)
-                    try:
-                        proc.request_stop(step_ids)
-                    except Exception as e:  # noqa: BLE001
-                        logger.warning("Failed to signal %s: %s", proc.name, e)
-                for proc in group:
-                    try:
-                        proc.await_stop()
-                    except Exception as e:  # noqa: BLE001
-                        logger.warning("Failed to stop %s: %s", proc.name, e)
+        # Never hold the registry lock while waiting or calling Slurm. A signal
+        # can arrive at any instruction; the handler only requests shutdown.
+        deadline = time.monotonic() + max(0, timeout)
+        logger.info("Cleaning up %d running processes...", len(running))
+        step_ids = (
+            list_step_ids(self.job_id, timeout=min(5, max(0.01, timeout)))
+            if any(p.step_name for p in running)
+            else None
+        )
+        complete = True
+        for tier in sorted({proc.shutdown_tier for proc in running}):
+            group = [proc for proc in running if proc.shutdown_tier == tier and proc.is_running]
+            for proc in reversed(group):
+                try:
+                    proc.request_stop(step_ids or {}, deadline=deadline)
+                except Exception as exc:  # noqa: BLE001 - attempt every owned process even after a cleanup error
+                    logger.warning("Failed to signal %s: %s", proc.name, exc)
+                    complete = False
+            for proc in group:
+                try:
+                    complete = proc.await_stop(deadline=deadline, step_ids=step_ids or {}) and complete
+                except Exception as exc:  # noqa: BLE001 - attempt every owned process even after a cleanup error
+                    logger.warning("Failed to stop %s: %s", proc.name, exc)
+                    complete = False
+        self.cleanup_complete = complete and all(not proc.is_running for proc in running)
+        return self.cleanup_complete
 
     def print_failure_details(self, tail_lines: int = 50) -> None:
         """Print detailed failure information including log tails.
@@ -402,12 +489,18 @@ def setup_signal_handlers(
         registry: ProcessRegistry to cleanup on signal
     """
 
+    received = False
+
     def signal_handler(signum, frame):
+        nonlocal received
         sig_name = signal.Signals(signum).name
-        logger.warning("Received signal %s, initiating cleanup...", sig_name)
         stop_event.set()
-        registry.cleanup()
-        sys.exit(1)
+        if received:
+            return
+        received = True
+        # No registry lock, waiting or recursive cleanup from a signal handler.
+        if not registry._cleanup_started and not registry.finalizing:
+            raise InterruptedError(f"Received signal {sig_name}")
 
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
@@ -434,9 +527,8 @@ def start_process_monitor(
             if registry.check_failures():
                 logger.error("Critical process failure detected!")
                 stop_event.set()
-                registry.cleanup()
-                sys.exit(1)
-            time.sleep(poll_interval)
+                return
+            stop_event.wait(poll_interval)
 
     thread = threading.Thread(
         target=monitor_loop,

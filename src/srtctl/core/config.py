@@ -12,10 +12,13 @@ This module provides:
 
 import copy
 import fnmatch
+import hashlib
 import logging
 import os
 import re
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +29,18 @@ from .lockfile import verify_lock_integrity
 from .schema import ClusterConfig, SrtConfig
 
 logger = logging.getLogger(__name__)
+
+_CLUSTER_SNAPSHOT: ContextVar[dict[str, Any] | None] = ContextVar("srtctl_cluster_snapshot", default=None)
+
+
+@contextmanager
+def cluster_config_scope(config: dict[str, Any]):
+    """Use an explicit already validated profile for all native settings reads."""
+    token = _CLUSTER_SNAPSHOT.set(copy.deepcopy(config))
+    try:
+        yield
+    finally:
+        _CLUSTER_SNAPSHOT.reset(token)
 
 
 def find_cluster_config_path() -> Path | None:
@@ -59,7 +74,19 @@ def load_cluster_config() -> dict[str, Any] | None:
 
     Returns None if file doesn't exist (graceful degradation).
     """
+    snapshot = _CLUSTER_SNAPSHOT.get()
+    if snapshot is not None:
+        return copy.deepcopy(snapshot)
     cluster_config_path = find_cluster_config_path()
+    expected_digest = os.environ.get("SRTSLURM_CONFIG_SHA256")
+    if expected_digest:
+        if cluster_config_path is None:
+            raise ValueError("The required prepared cluster profile is missing")
+        data = cluster_config_path.read_bytes()
+        if hashlib.sha256(data).hexdigest() != expected_digest:
+            raise ValueError("Prepared cluster profile digest mismatch")
+        schema = ClusterConfig.Schema()
+        return schema.dump(schema.load(yaml.safe_load(data)))
     if not cluster_config_path:
         return None
 
@@ -951,7 +978,7 @@ def expand_engine_config_defaults(resolved_config: dict) -> dict:
     return resolved_config
 
 
-def load_config(path: Path | str) -> SrtConfig:
+def load_config(path: Path | str, *, frozen: bool = False) -> SrtConfig:
     """
     Load and validate YAML config, applying cluster defaults.
 
@@ -990,10 +1017,10 @@ def load_config(path: Path | str) -> SrtConfig:
             logger.warning("Comparison results may not reflect the original run")
 
     # Load cluster defaults (optional)
-    cluster_config = load_cluster_config()
+    cluster_config = None if frozen else load_cluster_config()
 
     # Resolve with defaults (applies aliases and default values)
-    resolved_config = resolve_config_with_defaults(user_config, cluster_config)
+    resolved_config = user_config if frozen else resolve_config_with_defaults(user_config, cluster_config)
 
     # Expand the single `observability.enabled` knob into the individual
     # launch flags and bake in the TRT-LLM engine-config defaults. Done on the

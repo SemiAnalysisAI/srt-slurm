@@ -2,7 +2,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #SBATCH --job-name={{ job_name }}
+{% if prepared_dir %}
+#SBATCH --output={{ output_base }}/native-logs/%j.log
+{% else %}
 #SBATCH --output={{ output_base }}/%j/logs/sweep_%j.log
+{% endif %}
 {% if het_components %}
 {# SLURM applies each `#SBATCH ...` to the component immediately preceding it.
    Per-component required scheduling directives (--account/--partition/--time
@@ -120,6 +124,12 @@ export {{ key }}={{ value }}
 echo ""
 echo "Preparing srtctl environment..."
 
+{% if prepared_dir %}
+# The installed interpreter and dependency inventory were frozen at preparation.
+# No package resolution, installation, or shared-venv mutation in an allocation.
+exec {{ runtime_python }} -I -m srtctl.cli.prepared run-prepared {{ prepared_dir }}
+{% else %}
+
 # Use compute-arch uv from srt-slurm/bin (installed by make setup ARCH=<compute_arch>)
 # This avoids arch mismatch when login node (x86_64) != compute node (aarch64)
 export PATH="${SRTCTL_SOURCE}/bin:$HOME/.local/bin:$PATH"
@@ -181,3 +191,4 @@ echo "End: $(date)"
 echo "=========================================="
 
 exit ${EXIT_CODE}
+{% endif %}

@@ -63,5 +63,6 @@ Once allocated, workers launch inside containers, discover each other through et
 - [Profiling](profiling.md) - Performance analysis with torch/nsys
 - [SGLang Router](sglang-router.md) - Alternative to Dynamo for PD disaggregation
 - [Services](services.md) - Sidecars and standalone stores launched next to the job
+- [Prepared Jobs](prepared-jobs.md) - Immutable single-point inputs, literal clients, durable ownership and recovery
 - [Configuration Reference](config-reference.md) - Every recipe section, with the generated field tables in [Schema Reference](schema-reference.md)
 - [Legacy (v1) layout](legacy-v1.md) - The old `backend:` recipe layout; `srtctl migrate` rewrites it

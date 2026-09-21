@@ -112,6 +112,24 @@ class CpuPowerReader(ABC):
         """Release source resources."""
 
 
+def is_power_meter_hwmon(hwmon_dir: Path) -> bool:
+    """Whether one ``hwmonN/`` directory belongs to the ACPI ``power_meter`` driver.
+
+    ``acpi_power_meter`` registers through the legacy ``hwmon_device_register()``,
+    which creates no ``name`` attribute on the hwmon class node; the driver
+    publishes ``name`` on its parent ACPI device, reachable through ``device/``.
+    Grace nodes on 6.8.0-nvidia-64k expose the meters only that way, so both
+    locations are accepted.
+    """
+    for name_path in (hwmon_dir / "name", hwmon_dir / "device" / "name"):
+        try:
+            if name_path.read_text().strip() == "power_meter":
+                return True
+        except OSError:
+            continue
+    return False
+
+
 class AcpiPowerMeterReader(CpuPowerReader):
     """Read ACPI ``power_meter`` socket totals and reference component rails."""
 
@@ -170,10 +188,7 @@ class AcpiPowerMeterReader(CpuPowerReader):
         seen_paths: set[str] = set()
         seen_domains: set[tuple[int, str]] = set()
         for hwmon_dir in sorted(hwmon_root.glob("hwmon*")):
-            try:
-                if (hwmon_dir / "name").read_text().strip() != "power_meter":
-                    continue
-            except OSError:
+            if not is_power_meter_hwmon(hwmon_dir):
                 continue
             for attribute_root in (hwmon_dir / "device", hwmon_dir):
                 channels = {

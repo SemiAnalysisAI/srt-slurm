@@ -25,6 +25,7 @@ from srtctl.core.cpu_power import (
     _add_standard_dcgm_binding_path,
     format_local_timestamp,
 )
+from srtctl.core.cpu_power_exporter import _find_power_meter_sensors
 from srtctl.core.cpu_power_session import CpuPowerSessionSettings, CpuPowerTelemetrySession
 
 
@@ -36,11 +37,13 @@ def _make_acpi_sensor(
     microwatts: int,
     domain: str | None = None,
     value_attribute: str = "average",
+    legacy_layout: bool = False,
 ) -> None:
     hwmon = root / f"hwmon{hwmon_id}"
     device = hwmon / "device"
     device.mkdir(parents=True)
-    (hwmon / "name").write_text("power_meter\n")
+    # Legacy hwmon_device_register() publishes name only on the parent device.
+    (device / "name" if legacy_layout else hwmon / "name").write_text("power_meter\n")
     (device / f"power1_{value_attribute}").write_text(f"{microwatts}\n")
     (device / "power1_oem_info").write_text(f"{domain or f'CPU Power Socket {socket_id}'}\n")
     (device / "power1_accuracy").write_text("1\n")
@@ -89,6 +92,47 @@ def test_acpi_reader_does_not_treat_grace_cpu_rail_as_socket_total(tmp_path: Pat
 
     with pytest.raises(CpuPowerSourceUnavailable, match="no ACPI socket-total"):
         AcpiPowerMeterReader(tmp_path)
+
+
+def test_acpi_reader_accepts_legacy_hwmon_without_class_name(tmp_path: Path) -> None:
+    # acpi_power_meter on 6.8.0-nvidia-64k registers through the legacy hwmon
+    # API: hwmonN/ has no name attribute; name and channels sit on device/.
+    _make_acpi_sensor(
+        tmp_path,
+        hwmon_id=11,
+        socket_id=0,
+        microwatts=98_029_000,
+        domain="Grace Power Socket 0",
+        legacy_layout=True,
+    )
+    _make_acpi_sensor(tmp_path, hwmon_id=12, socket_id=0, microwatts=46_046_000, legacy_layout=True)
+    (tmp_path / "hwmon1" / "device").mkdir(parents=True)
+    (tmp_path / "hwmon1" / "device" / "name").write_text("nvme\n")
+    (tmp_path / "hwmon1" / "device" / "power1_average").write_text("1000000\n")
+
+    reader = AcpiPowerMeterReader(tmp_path)
+
+    assert reader.read_watts() == {
+        "CPU0:cpuSidePowerUsageW": 98.029,
+        "CPU0:cpuRailPowerUsageW": 46.046,
+    }
+
+
+def test_exporter_discovers_legacy_hwmon_without_class_name(tmp_path: Path) -> None:
+    _make_acpi_sensor(
+        tmp_path,
+        hwmon_id=11,
+        socket_id=1,
+        microwatts=88_706_000,
+        domain="Grace Power Socket 1",
+        legacy_layout=True,
+    )
+    (tmp_path / "hwmon0").mkdir()
+    (tmp_path / "hwmon0" / "name").write_text("acpitz\n")
+
+    sensors = _find_power_meter_sensors(tmp_path)
+
+    assert [(s["oem"], s["socket"]) for s in sensors] == [("Grace Power Socket 1", "1")]
 
 
 def test_acpi_reader_collects_breakdowns_without_double_counting_total(tmp_path: Path) -> None:

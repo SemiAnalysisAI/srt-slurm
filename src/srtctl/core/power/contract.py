@@ -89,6 +89,17 @@ CPU_SAMPLES_HEADER = (
 # socket) are unaffected.
 
 MAX_SAMPLE_GAP_SECONDS = 3.0
+
+# A gap past MAX_SAMPLE_GAP_SECONDS is interpolated rather than measured, which
+# bounds the per-device energy error at (dynamic range) x gap / 2 -- under 0.04%
+# for 3.3s of a 3640s window -- while rejecting the window discards an hour of
+# measurement on every GPU of the job. A collector that actually stopped is a
+# different failure and still has to be caught, so the tolerance needs both a
+# ceiling and a budget rather than one threshold. The budget is a fraction so it
+# tracks what the window actually loses.
+MAX_SAMPLE_GAP_HARD_SECONDS = 10.0
+MAX_OVERLONG_GAP_FRACTION = 0.005
+
 COLLECT_CYCLE_TIMEOUT_GRACE_SECONDS = 1.0
 
 BENCHMARK_TYPE_SA_BENCH = "sa-bench"

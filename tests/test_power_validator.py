@@ -65,7 +65,7 @@ def _processes(*, decode_het_group=1):
 def package(tmp_path):
     """A retained, publishable 1P1D artifact package."""
 
-    def build(*, processes=None, rows=None, publication_valid=True):
+    def build(*, processes=None, rows=None, publication_valid=True, end=END):
         log_dir = tmp_path / "logs"
         power_dir = log_dir / "power"
         (power_dir / WINDOWS_DIRNAME).mkdir(parents=True)
@@ -73,7 +73,7 @@ def package(tmp_path):
 
         expected = build_expected_devices(processes or _processes())
 
-        written = rows if rows is not None else _rows(expected)
+        written = rows if rows is not None else _rows(expected, end=end)
         writer = SampleWriter(power_dir / SAMPLES_FILENAME)
         writer.append(written)
         writer.close()
@@ -81,9 +81,9 @@ def package(tmp_path):
         (log_dir / RESULT_SUBDIR / f"{RESULT_STEM}.json").write_text(
             json.dumps(
                 {
-                    "duration": END - START,
+                    "duration": end - START,
                     "benchmark_start_time_unix": START,
-                    "benchmark_end_time_unix": END,
+                    "benchmark_end_time_unix": end,
                     "completed": 40,
                 }
             )
@@ -96,8 +96,8 @@ def package(tmp_path):
                 "result_path": f"{RESULT_SUBDIR}/{RESULT_STEM}.json",
                 "concurrency": 4,
                 "benchmark_start_time_unix": START,
-                "benchmark_end_time_unix": END,
-                "duration": END - START,
+                "benchmark_end_time_unix": end,
+                "duration": end - START,
                 "clock_source": "head_node_unix_clock",
                 "status": "completed",
                 "reason": None,
@@ -135,18 +135,27 @@ def package(tmp_path):
             observed_devices=observed,
             artifact_errors=manifest.artifact_errors,
         )
-        manifest.mark_terminal(status=STATUS_COMPLETE, stopped_at_unix=END + 5, publication_valid=publication_valid)
+        manifest.mark_terminal(status=STATUS_COMPLETE, stopped_at_unix=end + 5, publication_valid=publication_valid)
         atomic_write_json(power_dir / MANIFEST_FILENAME, manifest.to_dict())
         return log_dir, power_dir
 
     return build
 
 
-def _rows(expected, *, step=1.0, skip=()):
+def _rows(expected, *, step=1.0, skip=(), end=END, pauses=()):
+    """Samples at ``step`` cadence, with a longer dwell injected at each pause.
+
+    ``pauses`` is a sequence of ``(offset_from_start, gap_seconds)``: the
+    collector emits nothing for ``gap_seconds`` starting at that offset, which
+    is exactly one gap of that size in the bracketing sequence.
+    """
+    # A pause fires on the first sample at or past its offset and is consumed,
+    # so a pause never lands off the cadence grid and silently disappears.
+    pending = sorted(pauses)
     rows = []
     seq = 0
     timestamp = START - 2.0
-    while timestamp <= END + 2.0:
+    while timestamp <= end + 2.0:
         for device in expected:
             if device.key in skip:
                 continue
@@ -156,7 +165,10 @@ def _rows(expected, *, step=1.0, skip=()):
                 )
             )
         seq += 1
-        timestamp += step
+        advance = step
+        if pending and timestamp - START >= pending[0][0]:
+            advance = pending.pop(0)[1]
+        timestamp = round(timestamp + advance, 3)
     return rows
 
 
@@ -277,6 +289,59 @@ class TestIndependenceFromTheManifestBooleans:
 
         assert report.ok is False
         assert any("sample_gap_exceeded" in failure for failure in report.failures)
+
+    def test_isolated_overlong_gaps_are_absorbed_by_a_long_window(self, package):
+        """An hour of measurement is not discarded over two scrapes running late.
+
+        H200 Kimi-K3 run 35532102407 lost the TP16 lane this way: one node's
+        exporter answered in 3.26 s and 3.10 s during a 3640 s window, 0.175% of
+        it, and every point on 32 GPUs was voided. The energy those two gaps can
+        misstate is bounded by the dynamic range times the gap, under 0.04%.
+        """
+        expected = build_expected_devices(_processes())
+        end = START + 3600.0
+        rows = _rows(expected, end=end, pauses=[(600.0, 3.26), (1800.0, 3.10)])
+
+        log_dir, power_dir = package(rows=rows, end=end)
+        report = _validate(power_dir, log_dir)
+
+        assert report.ok is True
+        assert report.failures == ()
+        assert report.summary["max_sample_gap_seconds"] == pytest.approx(3.26)
+
+    def test_one_gap_past_the_hard_ceiling_is_rejected(self, package):
+        """A collector that stopped is not a late scrape, however short the outage.
+
+        11 s is 0.3% of this window, well inside the over-long budget, so only
+        the hard ceiling can catch it.
+        """
+        expected = build_expected_devices(_processes())
+        end = START + 3600.0
+        rows = _rows(expected, end=end, pauses=[(600.0, 11.0)])
+
+        log_dir, power_dir = package(rows=rows, end=end)
+        report = _validate(power_dir, log_dir)
+
+        assert report.ok is False
+        assert any("sample_gap_exceeded" in failure for failure in report.failures)
+
+    def test_overlong_gaps_are_rejected_once_they_leave_the_budget(self, package):
+        """Individually tolerable gaps still add up to lost coverage.
+
+        Six 3.5 s gaps is 21 s of a 3600 s window, past the 0.5% budget, while
+        no single one reaches the hard ceiling.
+        """
+        expected = build_expected_devices(_processes())
+        end = START + 3600.0
+        rows = _rows(expected, end=end, pauses=[(300.0 * n, 3.5) for n in range(1, 7)])
+
+        log_dir, power_dir = package(rows=rows, end=end)
+        report = _validate(power_dir, log_dir)
+
+        assert report.ok is False
+        assert any("sample_gap_exceeded" in failure for failure in report.failures)
+        # No single gap reaches the hard ceiling: only the budget can reject this.
+        assert report.summary["max_sample_gap_seconds"] == pytest.approx(3.5)
 
     def test_reversed_short_window_is_rejected_end_to_end(self, package):
         log_dir, power_dir = package()

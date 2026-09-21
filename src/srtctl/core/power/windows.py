@@ -19,6 +19,8 @@ from pathlib import Path
 
 from srtctl.core.power.contract import (
     CLOCK_SOURCE,
+    MAX_OVERLONG_GAP_FRACTION,
+    MAX_SAMPLE_GAP_HARD_SECONDS,
     MAX_SAMPLE_GAP_SECONDS,
     SCHEMA_VERSION,
     WINDOWS_DIRNAME,
@@ -363,9 +365,12 @@ def _check_coverage(
         if sequence is None:
             reasons.append(Reason.MEASUREMENT_WINDOW_NOT_BRACKETED)
             continue
-        largest = max((later - earlier for earlier, later in itertools.pairwise(sequence)), default=0.0)
+        observed = [later - earlier for earlier, later in itertools.pairwise(sequence)]
+        largest = max(observed, default=0.0)
         gaps[f"{device.hostname}/{device.gpu_uuids[0]}"] = largest
-        if largest > MAX_SAMPLE_GAP_SECONDS:
+        overlong = sum(gap for gap in observed if gap > MAX_SAMPLE_GAP_SECONDS)
+        budget = MAX_OVERLONG_GAP_FRACTION * (end - start)
+        if largest > MAX_SAMPLE_GAP_HARD_SECONDS or overlong > budget:
             reasons.append(Reason.SAMPLE_GAP_EXCEEDED)
 
     return gaps, reasons

@@ -93,6 +93,11 @@ class ReportingStatusConfig:
 
     endpoint: str | None = None
     endpoints: list[str] | None = None
+    # Name of the environment variable holding the bearer token the reporter sends as
+    # ``Authorization: Bearer`` on every request (default SRTCTL_STATUS_TOKEN). Only the
+    # variable name belongs in a recipe: the resolved config is written to the lockfile
+    # and the log directory, so a literal token there would leak.
+    token_env: str | None = None
 
     Schema: ClassVar[type[Schema]] = Schema
 
@@ -186,6 +191,39 @@ class AIAnalysisConfig:
     Schema: ClassVar[type[Schema]] = Schema
 
 
+# What ``aws s3 sync`` skips by default. Patterns follow the AWS CLI rules (relative to the
+# log directory, ``*`` matches across directories). The aiperf per-interval scrapes of the
+# worker and DCGM ``/metrics`` endpoints are the same time series tachometer stores as
+# parquet, at 50 to 100 times the bytes; ``perf_dashboard_bundle/`` is the re-renderable
+# intermediate and holds a reshaped copy of that scrape; ``perf_dashboard.json`` duplicates
+# the self-contained ``perf_dashboard.html``. A 2.2 GB run becomes about 60 MB.
+#
+# The aiperf patterns are scoped to the two directories the aiperf-driven runners write
+# to (trace-replay, agentperf and mooncake-router under ``artifacts/<run>/``, sa-bench under
+# ``sa-bench_*/conc_*/aiperf_artifacts/``) so a same-named file from another benchmark type
+# (a custom runner's own ``inputs.json``, say) is never dropped by accident.
+_AIPERF_ARTIFACT_ROOTS = ("artifacts/*", "sa-bench_*/*")
+_AIPERF_METRIC_SCRAPES = (
+    "server_metrics_export.jsonl",
+    "server_metrics_export.json",
+    "gpu_telemetry_export.jsonl",
+    "inputs.json",
+)
+DEFAULT_S3_EXCLUDE: tuple[str, ...] = (
+    *(f"{root}/{name}" for root in _AIPERF_ARTIFACT_ROOTS for name in _AIPERF_METRIC_SCRAPES),
+    "perf_dashboard_bundle/*",
+    "perf_dashboard.json",
+)
+# What goes into the compressed archive uploaded next to the loose files: aiperf's
+# per-request records, the raw truth behind every latency number (13 to 40 MB raw, under
+# 1 MB compressed). Python ``glob`` rules with ``**``; the same files are excluded from the
+# plain sync.
+DEFAULT_S3_ARCHIVE: tuple[str, ...] = (
+    "artifacts/**/profile_export.jsonl",
+    "sa-bench_*/**/profile_export.jsonl",
+)
+
+
 @dataclass(frozen=True)
 class S3Config:
     """S3 upload configuration for log artifacts.
@@ -205,6 +243,16 @@ class S3Config:
     endpoint_url: str | None = None
     access_key_id: str | None = None
     secret_access_key: str | None = None
+    # Patterns `aws s3 sync` skips, relative to the log directory (`*` matches across
+    # directories). Omit for the defaults: aiperf's per-interval metrics scrapes and
+    # `inputs.json` under `artifacts/*/` and `sa-bench_*/*/` (tachometer already stores that
+    # series as parquet), `perf_dashboard_bundle/`, `perf_dashboard.json`. Set to `[]` to ship
+    # the whole directory.
+    exclude: list[str] | None = None
+    # Patterns (Python glob, `**` allowed) packed into one `bundle.tar.zst` uploaded next to the
+    # loose files and left out of the plain sync. Omit for the default, aiperf's per-request
+    # `profile_export.jsonl`; set to `[]` for no archive.
+    archive: list[str] | None = None
 
     Schema: ClassVar[type[Schema]] = Schema
 
@@ -312,6 +360,9 @@ class ClusterConfig:
     default_health_check: dict[str, int] | None = None
     srtctl_root: str | None = None
     output_dir: str | None = None  # Custom output directory for job logs
+    # Cluster-wide default for recording exact realized srun commands. Recipes
+    # can opt in independently with output.record_launch_plan.
+    record_launch_plan: bool = False
     model_paths: dict[str, str] | None = None
     containers: dict[str, str] | None = None
     cloud: dict[str, str] | None = None
@@ -610,6 +661,14 @@ class ResourceConfig:
     agg_nodes: int | None = None
     agg_workers: int | None = None
 
+    # A worker exit normally fails the run (the process monitor tears the job
+    # down). A role's flag set to False keeps the run alive when one of its
+    # workers exits, for workloads that kill workers on purpose (migration or
+    # fault-tolerance probes). The per-role spelling is ``roles.<role>.critical``.
+    prefill_critical: bool = True  # A prefill worker exiting fails the run. False keeps the run alive.
+    decode_critical: bool = True  # A decode worker exiting fails the run. False keeps the run alive.
+    agg_critical: bool = True  # An aggregated worker exiting fails the run. False keeps the run alive.
+
     # If True, place each partial-node worker on its own node instead of
     # packing multiple onto the same node. Caller must reserve enough nodes
     # (e.g. give roles.decode as many nodes as workers when its gpus < gpus_per_node).
@@ -659,11 +718,20 @@ class ResourceConfig:
     def is_disaggregated(self) -> bool:
         return self.prefill_nodes is not None or self.decode_nodes is not None
 
+    def worker_critical(self, mode: str) -> bool:
+        """Whether a worker of ``mode`` (``prefill``, ``decode``, ``agg``) failing fails the run."""
+        return {"prefill": self.prefill_critical, "decode": self.decode_critical, "agg": self.agg_critical}[mode]
+
     @property
     def total_nodes(self) -> int:
         if self.is_disaggregated:
             return (self.prefill_nodes or 0) + (self.decode_nodes or 0)
         return self.agg_nodes or 1
+
+    @property
+    def has_engine_workers(self) -> bool:
+        """Whether any prefill, decode, or aggregated worker is requested."""
+        return (self.num_prefill + self.num_decode + self.num_agg) > 0
 
     @property
     def num_prefill(self) -> int:
@@ -874,6 +942,9 @@ class ProfilingPhaseConfig:
 
     start_step: int | None = None  # Step to start profiling
     stop_step: int | None = None  # Step to stop profiling
+    capture_scope: Literal["selected", "all"] = "all"
+    worker_index: int = 0  # Logical worker within the phase
+    worker_rank: int = 0  # Physical process rank within that worker
 
     @property
     def vllm_nsys_delay_iterations(self) -> int:
@@ -905,6 +976,21 @@ class ProfilingConfig:
 
     # Extra arguments passed to nsys profile (appended before `-o`; see get_nsys_prefix)
     extra_nsys_args: list[str] | None = None
+
+    # Non-TRT-LLM Nsight activity domains. ``cuda-sw`` can be selected
+    # explicitly where software tracing is preferred over hardware tracing.
+    nsys_trace: str = "cuda,nvtx"
+
+    # None preserves the existing Dynamo-specific default. Set explicitly for
+    # worker launchers that require or cannot tolerate child-process injection.
+    trace_fork_before_exec: bool | None = None
+
+    # Non-TRT-LLM behavior when cudaProfilerStop closes a capture range.
+    capture_range_end: str = "stop"
+
+    # Optional paths prepended to LD_LIBRARY_PATH for the Nsight wrapper and
+    # profiled worker, for containers that do not discover the host libcuda.
+    nsys_library_paths: list[str] | None = None
 
     # Phase-specific profiling step configs (not used for nsys-time)
     prefill: ProfilingPhaseConfig | None = None
@@ -951,7 +1037,7 @@ class ProfilingConfig:
 
         Args:
             mode: Worker mode (prefill/decode/agg)
-            profile_dir: Base directory for profiling output
+            profile_dir: Base directory for profiling output.
 
         Returns:
             Dictionary of environment variables
@@ -984,6 +1070,22 @@ class ProfilingConfig:
             env["TLLM_LLMAPI_ENABLE_NVTX"] = "1"
 
         return env
+
+    def selects_process(self, mode: str, worker_index: int, worker_rank: int) -> bool:
+        """Whether an iteration-triggered capture targets this process."""
+        phase = self._get_phase_config(mode)
+        return bool(
+            phase is not None
+            and (
+                phase.capture_scope == "all"
+                or (phase.worker_index == worker_index and phase.worker_rank == worker_rank)
+            )
+        )
+
+    def captures_all_processes(self, mode: str) -> bool:
+        """Whether the phase captures every physical process."""
+        phase = self._get_phase_config(mode)
+        return bool(phase is not None and phase.capture_scope == "all")
 
     @property
     def nsys_binary(self) -> str:
@@ -1066,17 +1168,17 @@ class ProfilingConfig:
         if backend_type == "trtllm":
             return self._get_nsys_prefix_trtllm(output_file)
 
-        # Time-based capture for non-TRTLLM backends (vllm, sglang). Required
-        # for vllm+dynamo because dynamo's HTTP frontend doesn't proxy
-        # /start_profile to the vllm worker (returns 404), so cudaProfilerApi
-        # capture can't be triggered from the bench client — we drive capture
-        # purely by --delay/--duration instead.
+        trace_fork_before_exec = self.trace_fork_before_exec
+        if trace_fork_before_exec is None:
+            trace_fork_before_exec = frontend_type == "dynamo"
+
+        # Time-based capture for non-TRTLLM backends (vllm, sglang).
         if self.is_nsys_time:
             cmd = [
                 self.nsys_binary,
                 "profile",
                 "-t",
-                "cuda,nvtx",
+                self.nsys_trace,
                 "--cuda-graph-trace=node",
                 "--force-overwrite",
                 "true",
@@ -1088,7 +1190,7 @@ class ProfilingConfig:
             if self.extra_nsys_args:
                 cmd.extend(self.extra_nsys_args)
             cmd.extend(["-o", output_file])
-            if frontend_type == "dynamo":
+            if trace_fork_before_exec:
                 cmd.insert(-2, "--trace-fork-before-exec=true")
             return cmd
 
@@ -1097,12 +1199,12 @@ class ProfilingConfig:
             self.nsys_binary,
             "profile",
             "-t",
-            "cuda,nvtx",
+            self.nsys_trace,
             "--cuda-graph-trace=node",
             "-c",
             "cudaProfilerApi",
             "--capture-range-end",
-            "stop",
+            self.capture_range_end,
             "--force-overwrite",
             "true",
         ]
@@ -1112,7 +1214,7 @@ class ProfilingConfig:
 
         cmd.extend(["-o", output_file])
 
-        if frontend_type == "dynamo":
+        if trace_fork_before_exec:
             cmd.insert(-2, "--trace-fork-before-exec=true")
 
         return cmd
@@ -1249,6 +1351,42 @@ class TachometerConfig:
 
 
 @dataclass(frozen=True)
+class NsysObservabilityConfig:
+    """Automatic NVTX tracing and CPU sampling of workers and Dynamo frontends.
+
+    Enabled by ``observability.enabled`` unless explicitly opted out. An
+    explicit top-level ``profiling`` mode takes precedence over this preset.
+    By default the benchmark starts capture after warmup and stops it when
+    measured work finishes. ``including_startup`` captures from process launch
+    through teardown, including initialization and warmup.
+    """
+
+    # Set false to keep other observability signals without launching nsys.
+    enabled: bool = True
+    # measured_workload excludes warmup; including_startup spans process launch through teardown.
+    capture_window: Literal["measured_workload", "including_startup"] = "measured_workload"
+    # Maximum wait for a control acknowledgment or a step's report finalization.
+    report_timeout_secs: int = 1800
+    # Optional container path to libToolsInjection64.so for NVTX injection.
+    nvtx_injection_path: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.capture_window not in {"measured_workload", "including_startup"}:
+            raise ValidationError("observability.nsys.capture_window must be measured_workload or including_startup")
+        if self.report_timeout_secs <= 0:
+            raise ValidationError("observability.nsys.report_timeout_secs must be positive")
+        if self.nvtx_injection_path is not None and not self.nvtx_injection_path.startswith("/"):
+            raise ValidationError("observability.nsys.nvtx_injection_path must be an absolute container path")
+
+    @property
+    def terminate_timeout(self) -> int:
+        """Allow report finalization, then the application tree's shutdown grace."""
+        return self.report_timeout_secs + 150
+
+    Schema: ClassVar[type[Schema]] = Schema
+
+
+@dataclass(frozen=True)
 class ObservabilityConfig:
     """Observability configuration for OTEL tracing.
 
@@ -1277,6 +1415,9 @@ class ObservabilityConfig:
 
     and, for the run's server-side capture:
 
+    * Nsight Systems NVTX tracing and CPU sampling on all worker processes/ranks
+      and Dynamo frontends (``nsys.enabled: false`` opts out).
+      Explicit top-level ``profiling`` takes precedence.
     * native Tachometer collection of every ``/metrics`` endpoint the benchmark
       client does not already poll (see ``TelemetryStageMixin.start_tachometer``
       and ``tachometer`` below).
@@ -1306,6 +1447,7 @@ class ObservabilityConfig:
             and frontends. Requires otel_endpoint to be set. Default: False.
         otel_endpoint: OTEL collector endpoint (e.g. "http://10.0.0.1:4317").
             Required when enable_otel is True.
+        nsys: Automatic Nsight Systems capture, enabled with the master switch.
         tachometer: Native Tachometer capture configuration. Follows ``enabled``
             unless ``tachometer.enabled`` is set explicitly (see
             :class:`TachometerConfig`).
@@ -1321,6 +1463,7 @@ class ObservabilityConfig:
     otel_endpoint: str | None = None
 
     tachometer: TachometerConfig = field(default_factory=TachometerConfig)
+    nsys: NsysObservabilityConfig = field(default_factory=NsysObservabilityConfig)
 
     Schema: ClassVar[type[Schema]] = Schema
 
@@ -1951,8 +2094,10 @@ class FrontendConfig:
         type: Frontend type - "dynamo" (default); "sglang-router" (SGLang Model
             Gateway) and "vllm-router" (static routers); "sglang", "vllm", and
             "trtllm_serve" (direct: the single aggregate worker binds the public
-            port, no router process). In schema 1 recipes "sglang" still means
-            the router and loads as "sglang-router".
+            port, no router process); "none" (services-only job: no router, no
+            OpenAI endpoint, no worker-count health gate; requires no engine
+            roles). In schema 1 recipes "sglang" still means the router and
+            loads as "sglang-router".
         enable_multiple_frontends: Scale with nginx + multiple routers.
             When ``True`` (default), srtctl stands up nginx and fans out
             to ``num_additional_frontends + 1`` router replicas. When
@@ -1976,6 +2121,10 @@ class FrontendConfig:
         nginx_session_affinity_header: Header hashed when affinity is on (default
             ``X-Dynamo-Session-ID``). Set ``X-Correlation-ID`` for clients (e.g. aiperf) that
             carry the session id in that header instead.
+        worker_selection: Inline Dynamo worker-selection policy configuration. srtctl
+            writes this mapping under the top-level ``worker_selection`` key in a
+            generated router policy YAML and passes it to the Dynamo frontend via
+            ``--router-policy-config``.
         args: CLI arguments passed to the frontend/router process
         env: Environment variables for frontend processes
         container_image: Optional router-specific image. Static routers use the
@@ -1990,6 +2139,7 @@ class FrontendConfig:
     nginx_session_affinity: bool = False
     nginx_session_affinity_header: str = "X-Dynamo-Session-ID"
     nginx_keepalive_timeout: str = "600s"
+    worker_selection: dict[str, Any] | None = None
     args: dict[str, Any] | None = None
     env: dict[str, str] | None = None
     container_image: str | None = None
@@ -2011,11 +2161,12 @@ class FrontendConfig:
 
 @dataclass(frozen=True)
 class OutputConfig:
-    """Output configuration with formattable paths."""
+    """Output paths and optional reproducibility artifacts."""
 
     log_dir: Annotated[FormattablePath, FormattablePathField()] = field(
         default_factory=lambda: FormattablePath(template="./outputs/{job_id}/logs")
     )
+    record_launch_plan: bool = False
 
     Schema: ClassVar[type[Schema]] = Schema
 
@@ -2139,6 +2290,7 @@ class SrtConfig:
 
     def __post_init__(self):
         """Validate configuration after initialization."""
+        self._validate_frontend_worker_selection()
         self._validate_profiling()
         self._validate_observability()
         self._validate_telemetry()
@@ -2151,10 +2303,48 @@ class SrtConfig:
         self._validate_sglang_direct_frontend()
         self._validate_static_router_frontend()
         self._validate_dynamo_sidecar()
+        self._validate_vllm_failover()
         self._validate_host_setup()
         self._validate_benchmark_type()
+        self._validate_services_only()
         self._validate_services()
         self._warn_dp_launch_mode()
+
+    def _validate_services_only(self) -> None:
+        """Rules for ``frontend.type: none`` and for services that own nodes (pools).
+
+        ``frontend.type: none`` means no OpenAI endpoint and no worker-count
+        health gate: readiness is the services' own probes, and the benchmark
+        step is the only thing that runs against them. With engine workers
+        present that gate is what keeps a run from benchmarking a half-loaded
+        fleet, so ``none`` is refused until per-worker readiness exists.
+
+        A service with ``nodes`` owns a pool that adds to the allocation next to
+        the engine roles' nodes. Pools are whole nodes, carved in declaration
+        order; a heterogeneous SLURM job cannot carry them.
+        """
+        owners = self.pool_services
+        if owners and self.resources.het_jobs is True:
+            raise ValidationError(
+                "services[].nodes (pools) are not supported together with resources.het_jobs: true; "
+                f"owners: {', '.join(svc.name for svc in owners)}"
+            )
+        owner_names = {svc.name for svc in owners}
+        for svc in self.services:
+            pool = svc.placement.pool if svc.placement is not None else None
+            if pool is not None and pool not in owner_names:
+                raise ValidationError(
+                    f"services[{svc.name}].placement.pool {pool!r} names no service that declares nodes "
+                    f"(pools: {', '.join(sorted(owner_names)) or 'none'})"
+                )
+        if self.frontend.type == "none":
+            if self.resources.has_engine_workers:
+                raise ValidationError(
+                    "frontend.type: none is only supported without engine roles (no prefill/decode/agg workers); "
+                    "pick a frontend for the workers or drop them"
+                )
+            if self.frontend.dedicated_node:
+                raise ValidationError("frontend.type: none has no frontend process; frontend.dedicated_node is invalid")
 
     def _validate_services(self) -> None:
         """Whole-list checks for ``services:``: unique names, then each kind's recipe-level rules.
@@ -2171,6 +2361,21 @@ class SrtConfig:
                 raise ValidationError(f"services[].name must be unique; duplicate: {service.name!r}")
             seen.add(service.name)
             get_service_kind(service.type).validate(service, self)
+
+        # A terminal service is the job's run: the job ends when it exits. It cannot share
+        # that role with a benchmark step, and an external service never runs here.
+        terminal = self.terminal_services
+        if terminal and self.benchmark.type != "manual":
+            names = ", ".join(svc.name for svc in terminal)
+            raise ValidationError(
+                f"services[{names}].terminal ends the job when the service exits, so the job cannot also run "
+                f"benchmark.type: {self.benchmark.type}; drop the benchmark block (manual) or the terminal flag"
+            )
+        for svc in terminal:
+            if svc.external:
+                raise ValidationError(
+                    f"services[{svc.name}].terminal needs a process to wait for; an external service launches nothing"
+                )
 
     def _validate_benchmark_type(self) -> None:
         """Reject a benchmark.type that no runner is registered for.
@@ -2231,6 +2436,48 @@ class SrtConfig:
                 "if something outside this recipe set the node state"
             )
 
+    def _validate_vllm_failover(self) -> None:
+        """Rules for ``backend.failover`` (vLLM shadow engine recovery).
+
+        The election and the shadow's parked state live in ``dynamo.vllm``
+        (``--gms-shadow-mode``), so only the Dynamo frontend can drive it; a static
+        router would also list the parked shadows as targets. Data-parallel
+        layouts are refused because their per-rank processes would each need a
+        GMS session and a lock of their own, which is not modeled.
+        """
+        failover = getattr(self.backend, "failover", None)
+        if failover is None:
+            return
+        assert isinstance(self.backend, VLLMProtocol)
+        if self.frontend.type != "dynamo":
+            raise ValidationError(
+                f"engine.failover requires frontend.type: dynamo (shadow engines are elected by dynamo.vllm); "
+                f"got {self.frontend.type!r}"
+            )
+        if self.dynamo.sidecar:
+            raise ValidationError("engine.failover cannot be combined with dynamo.sidecar: true")
+        dp_modes = self.backend.find_dp_modes()
+        if dp_modes:
+            names = ", ".join(mode for mode, _ in dp_modes)
+            raise ValidationError(f"engine.failover does not support data-parallel-size (set on {names})")
+        for mode_name, mode_config in (
+            ("prefill", self.backend.vllm_config.prefill if self.backend.vllm_config else None),
+            ("decode", self.backend.vllm_config.decode if self.backend.vllm_config else None),
+            ("aggregated", self.backend.vllm_config.aggregated if self.backend.vllm_config else None),
+        ):
+            for key, value in (mode_config or {}).items():
+                if str(key).replace("_", "-") == "load-format" and str(value) != "gms":
+                    raise ValidationError(
+                        f"engine.failover loads weights through the GPU Memory Service; "
+                        f"vllm_config.{mode_name}.load-format must be gms or unset, got {value!r}"
+                    )
+        if installs_dynamo(self):
+            logger.warning(
+                "engine.failover needs the gpu_memory_service package, which the ai-dynamo PyPI wheel does not "
+                "include; the container must ship it (nvcr.io/nvidia/ai-dynamo/vllm-runtime does). "
+                "Consider dynamo.install: false."
+            )
+
     def _validate_dynamo_sidecar(self) -> None:
         """Validate native sidecar configuration before job submission."""
         if not self.dynamo.sidecar:
@@ -2239,8 +2486,11 @@ class SrtConfig:
             raise ValidationError("dynamo.sidecar: true requires frontend.type: dynamo")
         if not isinstance(self.backend, (SGLangProtocol, VLLMProtocol, TRTLLMProtocol)):
             raise ValidationError("dynamo.sidecar: true supports sglang, vllm, and trtllm backends only")
-        if isinstance(self.backend, VLLMProtocol):
-            self.backend.validate_sidecar_dp_config()
+        if isinstance(self.backend, VLLMProtocol) and self.backend.dp_launch_mode != "per_node":
+            raise ValidationError(
+                "vLLM sidecar mode requires engine.dp_launch_mode: per_node "
+                "(backend.dp_launch_mode in schema 1); per_gpu is unsupported"
+            )
 
     def _warn_dp_launch_mode(self):
         """Warn when a vLLM DP recipe selects the deprecated per-GPU layout.
@@ -2263,6 +2513,25 @@ class SrtConfig:
             "use backend.dp_launch_mode: per_node instead. per_gpu will be removed in a future release",
             ", ".join(mode_name for mode_name, _ in dp_modes),
         )
+
+    def _validate_frontend_worker_selection(self):
+        """Validate srtctl's inline Dynamo worker-selection shorthand."""
+        if self.frontend.worker_selection is None:
+            return
+        if self.frontend.type != "dynamo":
+            raise ValidationError("frontend.worker_selection is only supported with frontend.type: dynamo")
+
+        args = self.frontend.args or {}
+        env = self.frontend.env or {}
+        if (
+            "router-policy-config" in args
+            or "DYN_ROUTER_POLICY_CONFIG" in env
+            or "DYN_ROUTER_POLICY_CONFIG" in self.environment
+        ):
+            raise ValidationError(
+                "frontend.worker_selection cannot be combined with frontend.args.router-policy-config "
+                "or DYN_ROUTER_POLICY_CONFIG in frontend.env/environment"
+            )
 
     def _validate_trtllm_serve(self):
         """Catch trtllm_serve misconfigurations at load time (dry-run) instead of
@@ -2536,6 +2805,11 @@ class SrtConfig:
         mooncake_cfg = getattr(self.backend, "mooncake_kv_store", None)
         if mooncake_cfg is None:
             return
+        if isinstance(self.backend, VLLMProtocol):
+            try:
+                mooncake_cfg.validate_device_mapping(self.resources.gpus_per_node)
+            except ValueError as exc:
+                raise ValidationError(str(exc)) from exc
         if not self.resources.is_disaggregated:
             return
 
@@ -2593,6 +2867,38 @@ class SrtConfig:
                     "for you."
                 )
 
+    def _profiling_worker_ranks(self, mode: Literal["prefill", "decode", "agg"]) -> set[int]:
+        """Derive selectable physical ranks from the configured worker layout."""
+        from srtctl.core.topology import Endpoint
+
+        resources = self.resources
+        gpus_per_worker = {
+            "prefill": resources.gpus_per_prefill,
+            "decode": resources.gpus_per_decode,
+            "agg": resources.gpus_per_agg,
+        }[mode]
+        nodes_per_worker = math.ceil(gpus_per_worker / resources.gpus_per_node)
+        # Match allocate_endpoints: multi-node workers use the same full GPU
+        # index set on every node (whole-node allocation); partial-node workers
+        # use a contiguous subset. Actual placement/ports are resolved later,
+        # and _profiling_worker_endpoints checks the selector against that topology.
+        local_gpus = resources.gpus_per_node if nodes_per_worker > 1 else gpus_per_worker
+        endpoint = Endpoint(
+            mode=mode,
+            index=0,
+            nodes=tuple(f"profiling-node-{rank}" for rank in range(nodes_per_worker)),
+            gpu_indices=frozenset(range(local_gpus)),
+            gpus_per_node=resources.gpus_per_node,
+        )
+        # Validation-only expansion uses a fresh port allocator; it neither
+        # reserves live ports nor consumes the runtime topology's allocations.
+        processes = self.backend.endpoints_to_processes(
+            [endpoint],
+            frontend_type=self.frontend.type,
+            dynamo_sidecar=self.dynamo.sidecar,
+        )
+        return {process.node_rank for process in processes}
+
     def _validate_profiling(self):
         """Validate profiling configuration matches serving mode."""
         prof = self.profiling
@@ -2607,9 +2913,15 @@ class SrtConfig:
 
         # nsys-time (time-based capture via nsys --delay/--duration) is supported
         # for all backends. get_nsys_prefix() emits a time-based command for the
-        # non-TRTLLM (vllm/sglang) path too, which is the only option for
-        # vllm+dynamo where /start_profile returns 404 and cudaProfilerApi-triggered
-        # capture can't fire.
+        # non-TRTLLM (vllm/sglang) path too.
+
+        if prof.is_nsys:
+            if not prof.nsys_trace.strip():
+                raise ValidationError("profiling.nsys_trace must not be empty")
+            if not prof.capture_range_end.strip():
+                raise ValidationError("profiling.capture_range_end must not be empty")
+            if prof.nsys_library_paths is not None and any(not path for path in prof.nsys_library_paths):
+                raise ValidationError("profiling.nsys_library_paths must not contain empty paths")
 
         # nsys-time uses top-level delay/duration — no per-phase step configs needed
         if prof.is_nsys_time:
@@ -2649,6 +2961,56 @@ class SrtConfig:
                 )
             if (r.agg_workers or 0) <= 0:
                 raise ValidationError("Aggregated mode requires agg_workers to be > 0.")
+
+        if prof.is_nsys:
+            phase_workers = (
+                (("prefill", prof.prefill, r.prefill_workers), ("decode", prof.decode, r.decode_workers))
+                if is_disaggregated
+                else (("aggregated", prof.aggregated, r.agg_workers),)
+            )
+            for phase_name, phase_config, worker_count in phase_workers:
+                assert phase_config is not None
+                if phase_config.capture_scope not in ("selected", "all"):
+                    raise ValidationError(f"profiling.{phase_name}.capture_scope must be 'selected' or 'all'")
+                if backend_type == "trtllm":
+                    continue
+                if phase_config.capture_scope == "all":
+                    if phase_config.worker_index != 0 or phase_config.worker_rank != 0:
+                        logger.warning(
+                            "profiling.%s.capture_scope='all' ignores worker_index=%s and worker_rank=%s; "
+                            "all workers remain selected. Set capture_scope='selected' to use these selectors.",
+                            phase_name,
+                            phase_config.worker_index,
+                            phase_config.worker_rank,
+                        )
+                    continue
+                if phase_config.worker_index < 0:
+                    raise ValidationError(f"profiling.{phase_name}.worker_index must be non-negative")
+                if phase_config.worker_index >= (worker_count or 0):
+                    raise ValidationError(
+                        f"profiling.{phase_name}.worker_index={phase_config.worker_index} is out of range "
+                        f"for {worker_count or 0} configured workers"
+                    )
+                if phase_config.worker_rank < 0:
+                    raise ValidationError(f"profiling.{phase_name}.worker_rank must be non-negative")
+                mode = "agg" if phase_name == "aggregated" else phase_name
+                try:
+                    valid_ranks = self._profiling_worker_ranks(mode)
+                except ValueError as exc:
+                    raise ValidationError(str(exc)) from exc
+                if phase_config.worker_rank not in valid_ranks:
+                    ranks = ", ".join(str(rank) for rank in sorted(valid_ranks))
+                    raise ValidationError(
+                        f"profiling.{phase_name}.worker_rank={phase_config.worker_rank} is not a physical "
+                        f"process rank for this worker layout; valid ranks: {ranks}"
+                    )
+                if (
+                    self.frontend.type == "vllm" or (self.frontend.type == "dynamo" and self.dynamo.sidecar)
+                ) and phase_config.worker_rank != 0:
+                    raise ValidationError(
+                        f"profiling.{phase_name}.worker_rank={phase_config.worker_rank} has no independent "
+                        "control endpoint; direct vLLM and Dynamo sidecar profiling must select rank 0"
+                    )
 
         # Iteration-based nsys (type: nsys) drives the vLLM engine profiler via
         # --profiler-config, derived from the profiling: block. Forbid duplicating
@@ -2714,7 +3076,9 @@ class SrtConfig:
         if not _is_safe_relative_subpath(telemetry.storage_subdir):
             raise ValidationError("telemetry.storage_subdir must be a safe relative path below the run log directory")
 
-        supported_benchmarks = {_BENCHMARK_TYPE_SA_BENCH, "agentic", "agentx", "custom"}
+        # `manual` holds the deployment for an external load generator; like serve-only it
+        # has no load window, so telemetry captures the whole serve session, best-effort.
+        supported_benchmarks = {_BENCHMARK_TYPE_SA_BENCH, "agentic", "agentx", "custom", "manual"}
         if self.benchmark.type not in supported_benchmarks:
             supported = ", ".join(sorted(supported_benchmarks))
             raise ValidationError(f"telemetry requires benchmark.type to be one of: {supported}")
@@ -2849,9 +3213,33 @@ class SrtConfig:
                 "it names a mandatory provider for a leg that will not run"
             )
 
+    @property
+    def observability_nsys_enabled(self) -> bool:
+        """Use the automatic preset only when no explicit profiler owns the run."""
+        return self.observability.enabled and self.observability.nsys.enabled and not self.profiling.enabled
+
     def _validate_observability(self):
-        """Validate Tachometer collection under observability."""
+        """Validate automatic profiling and Tachometer collection."""
         observability = self.observability
+        if self.observability_nsys_enabled and observability.nsys.capture_window == "measured_workload":
+            # These scripts own warmup and invoke the acknowledged boundary API.
+            # Custom/manual clients receive that API but must invoke it themselves.
+            supported = {"sa-bench", "sglang-bench", "trace-replay", "mooncake-router", "custom", "manual"}
+            if self.benchmark.type not in supported:
+                raise ValidationError(
+                    f"observability.nsys.capture_window: measured_workload has no warmup hooks for "
+                    f"benchmark.type: {self.benchmark.type}; use capture_window: including_startup, "
+                    "disable observability.nsys, or use a custom client with start/stop hooks"
+                )
+            if self.benchmark.type in {"trace-replay", "mooncake-router"} and any(
+                key.replace("_", "-").startswith(("warmup-", "num-warmup-")) and value not in (0, "0", False, None)
+                for key, value in self.benchmark.aiperf_args.items()
+            ):
+                raise ValidationError(
+                    "measured_workload nsys capture uses the bundled script's separate warmup; "
+                    "additional aiperf_args warmup would occur inside capture. Remove those "
+                    "flags or use a custom client with hooks at its actual warmup boundary"
+                )
         tachometer = observability.tachometer
         if not observability.tachometer_enabled:
             return
@@ -2946,8 +3334,35 @@ class SrtConfig:
         return self.backend.get_served_model_name(default)
 
     @property
+    def pool_services(self) -> list[ServiceConfig]:
+        """Services that own nodes (``services[].nodes``), in declaration order: the job's pools."""
+        return [svc for svc in self.services if svc.nodes is not None and svc.enabled]
+
+    @property
+    def terminal_services(self) -> list[ServiceConfig]:
+        """Services marked ``terminal``: the job ends when every one of them has exited."""
+        return [svc for svc in self.services if svc.terminal and svc.enabled]
+
+    @property
+    def services_node_count(self) -> int | None:
+        """Nodes owned by services through ``services[].nodes``, summed; None when no service owns any."""
+        counts = [svc.nodes for svc in self.pool_services if svc.nodes is not None]
+        return sum(counts) if counts else None
+
+    @property
+    def engine_node_count(self) -> int:
+        """Nodes the engine roles own; zero when the recipe has no engine workers."""
+        if not self.resources.has_engine_workers:
+            return 0
+        return self._engine_total_nodes()
+
+    @property
     def total_nodes(self) -> int:
-        """Worker node count, adjusted for backend-specific packing."""
+        """Node count of the job: the engine roles' nodes plus every service pool, at least one."""
+        return (self.engine_node_count + (self.services_node_count or 0)) or 1
+
+    def _engine_total_nodes(self) -> int:
+        """Worker node count of the engine roles, adjusted for backend-specific packing."""
         if isinstance(self.backend, VLLMProtocol) and self.backend.should_colocate_prefill_decode(
             num_prefill=self.resources.num_prefill,
             num_decode=self.resources.num_decode,

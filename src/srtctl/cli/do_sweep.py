@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """
@@ -33,8 +33,9 @@ from srtctl.cli.mixins import (
     TelemetryStageMixin,
     WorkerStageMixin,
 )
-from srtctl.core.config import load_config
+from srtctl.core.config import get_srtslurm_setting, load_config
 from srtctl.core.health import wait_for_port
+from srtctl.core.launch_plan import configure_launch_plan
 from srtctl.core.lockfile import write_lockfile
 from srtctl.core.processes import (
     ProcessRegistry,
@@ -102,6 +103,7 @@ class SweepOrchestrator(
                 gpus_per_decode=r.gpus_per_decode,
                 decode_nodes=self.runtime.nodes.decode_group,
                 gpus_per_node=r.gpus_per_node,
+                pack_multinode_workers=self.backend.type == "trtllm",
             )
         return self.backend.allocate_endpoints(
             num_prefill=r.num_prefill,
@@ -153,6 +155,20 @@ class SweepOrchestrator(
         store_cfg_path = self.runtime.log_dir / MOONCAKE_STORE_CONFIG_FILENAME
         store_cfg_path.write_text(json.dumps(store_cfg, indent=2))
         logger.info("Wrote mooncake_store_config to %s: %s", store_cfg_path, store_cfg)
+        if not backend.mooncake_kv_store.device_names_by_gpu:
+            return
+        # Render only GPU subsets actually launched, rather than all 2**N subsets.
+        written: set[str] = set()
+        for process in self.backend_processes:
+            local_config = backend.build_mooncake_process_config(
+                process, self.runtime.infra_node_ip, self.runtime.gpus_per_node
+            )
+            if local_config is not None:
+                filename, payload = local_config
+                if filename not in written:
+                    (self.runtime.log_dir / filename).write_text(json.dumps(payload, indent=2))
+                    logger.info("Wrote process-local Mooncake config %s: %s", filename, payload)
+                    written.add(filename)
 
     def _print_connection_info(self) -> None:
         """Print srun commands for connecting to nodes."""
@@ -165,7 +181,8 @@ class SweepOrchestrator(
         logger.info("=" * 60)
         logger.info("Connection Commands")
         logger.info("=" * 60)
-        logger.info("Frontend URL: http://%s:%d", self._public_api_node(), FRONTEND_PUBLIC_PORT)
+        if self.config.frontend.type != "none":
+            logger.info("Frontend URL: http://%s:%d", self._public_api_node(), FRONTEND_PUBLIC_PORT)
         logger.info("")
         logger.info("To connect to head node (%s):", self.runtime.nodes.head)
         logger.info(
@@ -176,7 +193,7 @@ class SweepOrchestrator(
         )
 
         # Print worker node connection commands
-        for node in self.runtime.nodes.worker:
+        for node in self.runtime.nodes.compute:
             if node != self.runtime.nodes.head:
                 logger.info("")
                 logger.info("To connect to worker node (%s):", node)
@@ -245,7 +262,7 @@ class SweepOrchestrator(
 
     def _host_setup_nodes(self) -> list[str]:
         """Nodes targeted by host_setup, deduped and stable in allocation order."""
-        nodes = list(self.runtime.nodes.worker)
+        nodes = list(self.runtime.nodes.compute)
         if self.config.host_setup.nodes == "all":
             nodes = [self.runtime.nodes.head, self.runtime.nodes.infra, *nodes]
         return list(dict.fromkeys(nodes))
@@ -416,7 +433,7 @@ class SweepOrchestrator(
         except Exception:  # noqa: BLE001
             logger.debug("Model '%s' not fully cached, will pre-download", model_id)
 
-        download_node = self.runtime.nodes.worker[0]
+        download_node = (self.runtime.nodes.compute or (self.runtime.nodes.head,))[0]
 
         logger.info("Ensuring model '%s' is cached on %s (cache: %s)", model_id, download_node, hf_home)
 
@@ -600,15 +617,27 @@ class SweepOrchestrator(
 
     def run(self) -> int:
         """Run the complete sweep."""
+        record_launch_plan = self.config.output.record_launch_plan or bool(
+            get_srtslurm_setting("record_launch_plan", False)
+        )
+        launch_plan_dir = self.runtime.log_dir / "launch-plan" if record_launch_plan else None
+        configure_launch_plan(launch_plan_dir, job_id=self.runtime.job_id)
+
         logger.info("Sweep Orchestrator")
         logger.info("Job ID: %s", self.runtime.job_id)
         logger.info("Run name: %s", self.runtime.run_name)
         logger.info("Config: %s", self.config.name)
         logger.info("Infra node: %s", self.runtime.nodes.infra)
         logger.info("Head node: %s", self.runtime.nodes.head)
-        logger.info("Worker nodes: %s", ", ".join(self.runtime.nodes.worker))
+        logger.info("Worker nodes: %s", ", ".join(self.runtime.nodes.worker) or "(none: no engine roles)")
+        for pool, nodes in self.runtime.nodes.pools.items():
+            logger.info("Pool %s: %s", pool, ", ".join(nodes))
         if self.config.profiling.enabled:
             logger.info("Profiling: %s", self.config.profiling.type)
+        if launch_plan_dir is not None:
+            logger.info("Recording realized Slurm launch plan: %s", launch_plan_dir)
+            # Preserve submission provenance before any runtime stage can fail.
+            self._copy_config_to_logs()
 
         resource_snapshot = record_resource_snapshot(self.config, self.runtime)
 

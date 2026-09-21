@@ -61,6 +61,7 @@ Three vocabularies are specific to the 2.0 layout. They are normalized into the 
 | `engine` | str | top-level `engine` | Optional; must equal the top-level engine type. |
 | `kv_events` | bool \| mapping | `None` | `true` for the default ZMQ publisher, or a mapping with `publisher` / `topic`. |
 | `sidecar` | bool | `False` | Run the native engine with a Dynamo sidecar; every role must agree. |
+| `critical` | bool | `True` | A worker of this role exiting fails the run. `false` keeps the run alive for probes that kill workers. |
 
 ### placement
 
@@ -93,6 +94,9 @@ Resource allocation configuration.
 |---|---|---|---|
 | `gpu_type` | str \| None | `None` | GPU type (h100, gb200, ...). Cluster fact, not a topology choice. Optional: a recipe that omits it inherits `default_gpu_type` from srtslurm.yaml, and `gpus_per_node` inherits the cluster `gpus_per_node`. Both are still worth setting in a recipe so it is self-describing for result rollups. |
 | `gpus_per_node` | int | `4` |  |
+| `prefill_critical` | bool | `True` | A worker exit normally fails the run (the process monitor tears the job down). A role's flag set to False keeps the run alive when one of its workers exits, for workloads that kill workers on purpose (migration or fault-tolerance probes). The per-role spelling is ``roles.<role>.critical``. |
+| `decode_critical` | bool | `True` | A decode worker exiting fails the run. False keeps the run alive. |
+| `agg_critical` | bool | `True` | An aggregated worker exiting fails the run. False keeps the run alive. |
 | `spread_workers` | bool | `False` | If True, place each partial-node worker on its own node instead of packing multiple onto the same node. Caller must reserve enough nodes (e.g. give roles.decode as many nodes as workers when its gpus < gpus_per_node). |
 | `het_jobs` | bool \| None | `None` | SLURM heterogeneous-job opt-in. Tri-state: None defers to the cluster default `use_het_jobs` on ClusterConfig; True/False overrides per recipe. When effectively True (and we are in disaggregated mode), the prefill and decode sides are submitted as two het components each with their own `--segment`. See HetComponent above and docs/slurm-faq.md. |
 
@@ -112,7 +116,7 @@ Frontend/router configuration.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `type` | str | `'dynamo'` | Frontend type - "dynamo" (default); "sglang-router" (SGLang Model Gateway) and "vllm-router" (static routers); "sglang", "vllm", and "trtllm_serve" (direct: the single aggregate worker binds the public port, no router process). In schema 1 recipes "sglang" still means the router and loads as "sglang-router". |
+| `type` | str | `'dynamo'` | Frontend type - "dynamo" (default); "sglang-router" (SGLang Model Gateway) and "vllm-router" (static routers); "sglang", "vllm", and "trtllm_serve" (direct: the single aggregate worker binds the public port, no router process); "none" (services-only job: no router, no OpenAI endpoint, no worker-count health gate; requires no engine roles). In schema 1 recipes "sglang" still means the router and loads as "sglang-router". |
 | `enable_multiple_frontends` | bool | `True` | Scale with nginx + multiple routers. When ``True`` (default), srtctl stands up nginx and fans out to ``num_additional_frontends + 1`` router replicas. When ``False``, there is NO nginx proxy — the benchmark must target the single master router (or a worker) directly at ``http://localhost:<port>``. ``benchmark.command`` has no placeholder substitution, so write the URL out literally. |
 | `num_additional_frontends` | int | `9` | Additional routers beyond master (default: 9) |
 | `nginx_container` | str | `'nginx:1.27.4'` | Custom nginx container image (default: nginx:1.27.4) |
@@ -120,6 +124,7 @@ Frontend/router configuration.
 | `nginx_session_affinity` | bool | `False` | Consistently hash ``nginx_session_affinity_header`` to a frontend. Requests without that header use a generated request ID and stay distributed. |
 | `nginx_session_affinity_header` | str | `'X-Dynamo-Session-ID'` | Header hashed when affinity is on (default ``X-Dynamo-Session-ID``). Set ``X-Correlation-ID`` for clients (e.g. aiperf) that carry the session id in that header instead. |
 | `nginx_keepalive_timeout` | str | `'600s'` | Idle timeout for client and upstream keepalive connections in the generated nginx.conf (default "600s"). nginx's own default is 75s, which closes a session's connection during the long recorded think-time of an agentic replay; the client's next write on that pooled socket then fails with "broken pipe" / "server disconnected" and nothing is logged server-side. |
+| `worker_selection` | dict[str, Any] \| None | `None` | Inline Dynamo worker-selection policy configuration. srtctl writes this mapping under the top-level ``worker_selection`` key in a generated router policy YAML and passes it to the Dynamo frontend via ``--router-policy-config``. |
 | `args` | dict[str, Any] \| None | `None` | CLI arguments passed to the frontend/router process |
 | `env` | dict[str, str] \| None | `None` | Environment variables for frontend processes |
 | `container_image` | str \| None | `None` | Optional router-specific image. Static routers use the model/backend image when omitted. |
@@ -200,6 +205,10 @@ Profiling configuration.
 |---|---|---|---|
 | `type` | str | `'none'` | "none", "nsys", "nsys-time", or "torch" |
 | `extra_nsys_args` | list[str] \| None | `None` | Extra arguments passed to nsys profile (appended before `-o`; see get_nsys_prefix) |
+| `nsys_trace` | str | `'cuda,nvtx'` | Non-TRT-LLM Nsight activity domains. ``cuda-sw`` can be selected explicitly where software tracing is preferred over hardware tracing. |
+| `trace_fork_before_exec` | bool \| None | `None` | None preserves the existing Dynamo-specific default. Set explicitly for worker launchers that require or cannot tolerate child-process injection. |
+| `capture_range_end` | str | `'stop'` | Non-TRT-LLM behavior when cudaProfilerStop closes a capture range. |
+| `nsys_library_paths` | list[str] \| None | `None` | Optional paths prepended to LD_LIBRARY_PATH for the Nsight wrapper and profiled worker, for containers that do not discover the host libcuda. |
 | `prefill` | [ProfilingPhaseConfig](#profilingphaseconfig) \| None | `None` | Phase-specific profiling step configs (not used for nsys-time) |
 | `decode` | [ProfilingPhaseConfig](#profilingphaseconfig) \| None | `None` |  |
 | `aggregated` | [ProfilingPhaseConfig](#profilingphaseconfig) \| None | `None` |  |
@@ -209,11 +218,12 @@ Profiling configuration.
 
 ### OutputConfig
 
-Output configuration with formattable paths.
+Output paths and optional reproducibility artifacts.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `log_dir` | [FormattablePath](#formattablepath) | `<lambda>()` |  |
+| `record_launch_plan` | bool | `False` |  |
 
 ### HealthCheckConfig
 
@@ -234,6 +244,7 @@ Observability configuration for OTEL tracing.
 | `enable_otel` | bool | `False` | If True, inject OTEL environment variables into all workers and frontends. Requires otel_endpoint to be set. Default: False. |
 | `otel_endpoint` | str \| None | `None` | OTEL collector endpoint (e.g. "http://10.0.0.1:4317"). Required when enable_otel is True. |
 | `tachometer` | [TachometerConfig](#tachometerconfig) | `TachometerConfig()` | Native Tachometer capture configuration. Follows ``enabled`` unless ``tachometer.enabled`` is set explicitly (see :class:`TachometerConfig`). |
+| `nsys` | [NsysObservabilityConfig](#nsysobservabilityconfig) | `NsysObservabilityConfig()` | Automatic Nsight Systems capture, enabled with the master switch. |
 
 ### TelemetryConfig
 
@@ -287,10 +298,12 @@ One entry of the top-level ``services:`` list.
 | `source` | [SourceConfig](#sourceconfig) \| None | `None` | Optional git source to clone before ``build_command`` and ``command`` run. Single-node placements only. |
 | `build_command` | list[str] \| None | `None` | Argv run once inside the service container, from the clone, before ``command`` starts. Only meaningful with ``source``. |
 | `placement` | [ServicePlacementConfig](#serviceplacementconfig) \| None | `None` | Where the service runs. Defaults to the kind's placement (``head`` for generic services, ``infra`` for etcd/nats/mooncake-master, ``workers`` for the exporters). |
+| `nodes` | int \| None | `None` | Whole nodes this service owns: its pool. Pools add to the allocation next to the engine roles' nodes and are carved after them in declaration order, so a Ray cluster, a sandbox fleet and an engine role can each have their own nodes in one recipe. An owner is placed on its own pool (``placement.node: workers``); other services join it with ``placement.pool: <name>``. |
 | `start` | str \| None | `None` | ``after_frontend`` (default for ``generic``) or ``before_workers`` (default for ``mooncake-store``). |
 | `readiness` | [ServiceReadinessConfig](#servicereadinessconfig) \| None | `None` | Optional TCP port gate; the job waits for it on every service node before continuing. |
 | `inherit_discovery_env` | bool | `True` | Inject ``ETCD_ENDPOINTS`` / ``NATS_SERVER`` so the service can register with the job's Dynamo discovery plane. |
 | `critical` | bool \| None | `None` | When true a crash fails the run, like a worker dying. Default false for ``generic`` (a dead sidecar costs its own log, not the run) and true for ``mooncake-store``. Set true for anything in the live request path. |
+| `terminal` | bool | `False` | This service is the job's run: the job ends when every instance of every terminal service has exited, and the worst exit code becomes the job's. A recipe with a terminal service has no benchmark step (``benchmark.type`` stays ``manual``); a torchrun pool that trains to completion is the shape. |
 | `preamble` | str \| None | `None` | Shell run inside the container before ``command`` (``ulimit`` and friends). |
 | `cpus_per_task` | int \| None | `None` | Optional ``srun --cpus-per-task``. |
 | `cpu_bind` | str \| None | `None` | Optional ``srun --cpu-bind``. |
@@ -298,7 +311,8 @@ One entry of the top-level ``services:`` list.
 | `build_timeout_seconds` | int | `1800` | Kill ``build_command`` after this many seconds. |
 | `enabled` | bool | `True` | ``false`` drops the service, including an implicit one (``etcd`` / ``nats`` under the Dynamo frontend, the default exporters) declared here by name. |
 | `external` | str \| None | `None` | For discovery-plane kinds (``etcd``, ``nats``, ``mooncake-master``): use this already-running endpoint and launch nothing; the URL is what the job's processes are pointed at. |
-| `options` | dict[str, Any] | `{}` | Kind-specific settings (``nats``: ``max_payload_mb``; ``mooncake-master``: ``store_config`` for vLLM). Unknown keys are rejected by the kind. |
+| `options` | dict[str, Any] | `{}` | Kind-specific settings (``nats``: ``max_payload_mb``; ``mooncake-master``: ``store_config`` and ``device_names_by_gpu`` for vLLM). Unknown keys are rejected by the kind. |
+| `metrics` | list[[ServiceMetricsConfig](#servicemetricsconfig)] | `[]` | Prometheus endpoints this service serves: one mapping or a list of ``{port, path, nodes, name}`` (``path`` defaults to ``/metrics``, ``nodes`` to ``all``). Tachometer scrapes each on every node the service runs on, or on its first node with ``nodes: first``, as endpoint ``<name>_<node>`` where ``name`` defaults to the service name. The exporter kinds declare theirs; write it for a generic service that publishes metrics, or on a ``ray`` service whose head serves a trainer's collector and router. |
 
 ### PostEvalConfig
 
@@ -359,6 +373,9 @@ Profiling config for a single phase (prefill/decode/aggregated).
 |---|---|---|---|
 | `start_step` | int \| None | `None` | Step to start profiling |
 | `stop_step` | int \| None | `None` | Step to stop profiling |
+| `capture_scope` | one of `'selected'`, `'all'` | `'all'` |  |
+| `worker_index` | int | `0` | Logical worker within the phase |
+| `worker_rank` | int | `0` | Physical process rank within that worker |
 
 ### TachometerConfig
 
@@ -378,6 +395,17 @@ Native Tachometer collection for an observability-enabled run.
 | `dcgm_exporter` | [TelemetryExporterConfig](#telemetryexporterconfig) \| None | `None` |  |
 | `node_exporter` | [TelemetryExporterConfig](#telemetryexporterconfig) \| None | `None` |  |
 | `process_exporter` | [TelemetryExporterConfig](#telemetryexporterconfig) \| None | `None` |  |
+
+### NsysObservabilityConfig
+
+Automatic NVTX tracing and CPU sampling of workers and Dynamo frontends.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `True` | Set false to keep other observability signals without launching nsys. |
+| `capture_window` | one of `'measured_workload'`, `'including_startup'` | `'measured_workload'` | measured_workload excludes warmup; including_startup spans process launch through teardown. |
+| `report_timeout_secs` | int | `1800` | Maximum wait for a control acknowledgment or a step's report finalization. |
+| `nvtx_injection_path` | str \| None | `None` | Optional container path to libToolsInjection64.so for NVTX injection. |
 
 ### TelemetryExporterConfig
 
@@ -429,7 +457,9 @@ Where a service runs.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `node` | str | `'head'` | ``head`` or ``infra`` (one instance), ``dedicated`` (reserve the infra node exclusively; infra-class kinds only), ``prefill`` / ``decode`` / ``agg`` (one instance per distinct physical node that role's workers use), or ``workers`` (one instance per worker node). |
+| `node` | str | `'head'` | ``head`` or ``infra`` (one instance), ``dedicated`` (reserve the infra node exclusively; infra-class kinds only), ``prefill`` / ``decode`` / ``agg`` (one instance per distinct physical node that role's workers use), ``workers`` (one instance per engine worker node; on a service that owns nodes, its own pool), ``compute`` (engine worker nodes plus every pool), or ``all`` (every node of the allocation). |
+| `pool` | str \| None | `None` | Run on the nodes another service owns (``services[].nodes``), one instance per node of that pool. Replaces ``node``. |
+| `per` | str | `'node'` | ``node`` (default): one instance per placed node. ``worker``: one instance per engine worker on each placed node, attached to that worker: it runs with the worker's ``CUDA_VISIBLE_DEVICES`` and sees ``{worker_role}``, ``{worker_index}``, ``{worker_node_rank}``, ``{worker_gpus}``, ``{worker_gpu_count}``. A sidecar in the Kubernetes sense (the GPU Memory Service next to each vLLM worker). Only with ``node`` in ``prefill``, ``decode``, ``agg``, ``workers``. |
 
 ### ServiceReadinessConfig
 
@@ -443,6 +473,17 @@ Readiness gate: the launch blocks until the probe passes on every service node.
 | `log` | [LogProbe](#logprobe) \| None | `None` | Log-pattern probe against ``service_<name>.out``. |
 | `timeout_seconds` | int | `120` | How long to wait per node before failing the job. |
 | `interval_seconds` | int | `2` | Seconds between probe attempts. |
+
+### ServiceMetricsConfig
+
+One Prometheus endpoint a service serves: ``port``, ``path`` (default ``/metrics``), ``nodes``, ``name``.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `port` | int | required |  |
+| `path` | str | `'/metrics'` |  |
+| `nodes` | str | `'all'` |  |
+| `name` | str \| None | `None` |  |
 
 ### IdentityModelConfig
 
@@ -469,6 +510,7 @@ Status reporting configuration.
 |---|---|---|---|
 | `endpoint` | str \| None | `None` |  |
 | `endpoints` | list[str] \| None | `None` |  |
+| `token_env` | str \| None | `None` | Name of the environment variable holding the bearer token the reporter sends as ``Authorization: Bearer`` on every request (default SRTCTL_STATUS_TOKEN). Only the variable name belongs in a recipe: the resolved config is written to the lockfile and the log directory, so a literal token there would leak. |
 
 ### AIAnalysisConfig
 
@@ -495,6 +537,8 @@ S3 upload configuration for log artifacts.
 | `endpoint_url` | str \| None | `None` | Custom S3-compatible endpoint URL (optional) |
 | `access_key_id` | str \| None | `None` | AWS access key ID (falls back to AWS_ACCESS_KEY_ID env var) |
 | `secret_access_key` | str \| None | `None` | AWS secret access key (falls back to AWS_SECRET_ACCESS_KEY env var) |
+| `exclude` | list[str] \| None | `None` | Patterns `aws s3 sync` skips, relative to the log directory (`*` matches across directories). Omit for the defaults: aiperf's per-interval metrics scrapes and `inputs.json` under `artifacts/*/` and `sa-bench_*/*/` (tachometer already stores that series as parquet), `perf_dashboard_bundle/`, `perf_dashboard.json`. Set to `[]` to ship the whole directory. |
+| `archive` | list[str] \| None | `None` | Patterns (Python glob, `**` allowed) packed into one `bundle.tar.zst` uploaded next to the loose files and left out of the plain sync. Omit for the default, aiperf's per-request `profile_export.jsonl`; set to `[]` for no archive. |
 
 ### TcpProbe
 
@@ -564,6 +608,7 @@ vLLM protocol - implements BackendProtocol.
 | `type` | one of `'vllm'` | `'vllm'` |  |
 | `set_cuda_visible_devices` | bool | `False` | Legacy device binding for vLLM builds without --device-ids. |
 | `connector` | str \| None | `'nixl'` | Default KV connector: "nixl", "lmcache", or a raw JSON string for --kv-transfer-config. Can be overridden per role by setting "connector" in roles.<role>.args. dynamo 1.0.0+: translated to --kv-transfer-config (--connector was removed). |
+| `failover` | [VLLMFailoverConfig](#vllmfailoverconfig) \| None | `None` | Shadow engine recovery: when set, every worker runs shadow_engines standby engines on its GPUs next to an implied `gms` service that owns the weights. Dynamo frontend only. |
 | `allow_prefill_decode_colocation` | bool | `False` | Allow prefill and decode workers to share one node when the combined GPU request fits within gpus_per_node. Defaults off to preserve existing P/D node separation. |
 | `allow_prefill_decode_colocation_across_nodes` | bool | `False` | Extend P/D colocation to multi-node topologies. When enabled together with allow_prefill_decode_colocation, workers are packed contiguously across the minimum number of nodes instead of reserving separate P/D node pools. Defaults off to preserve the original one-node-only policy. |
 | `dp_launch_mode` | one of `'per_gpu'`, `'per_node'` | `'per_node'` | DP process layout. Per-node lets vLLM manage the node-local portion of a DP x TP x PP topology in one CUDA namespace and derives cross-node TP/PP rendezvous when a replica is larger than the node-local GPU allocation. Per-GPU remains available as a deprecated compatibility layout. |
@@ -594,6 +639,15 @@ Dynamo Mocker protocol - implements BackendProtocol.
 | `enable_chunked_prefill` | bool | `True` |  |
 | `preemption_mode` | str \| None | `None` |  |
 
+### VLLMFailoverConfig
+
+Shadow engine recovery for vLLM workers (Dynamo GPU Memory Service).
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `shadow_engines` | int | `1` | Standby engines per worker. |
+| `shared_dir` | str | `'/dev/shm'` | Node-local host directory that every container on a node sees. The GMS sockets and the lock file of a worker live under ``<shared_dir>/srtctl-<job_id>/<role>_<index>``. enroot bind-mounts the host's ``/dev/shm`` into every container; ``/tmp`` is a fresh tmpfs per container and does not work. |
+
 ## Cluster config
 
 Top-level keys of `srtslurm.yaml`. Recipes inherit these defaults and resolve aliases through them.
@@ -615,6 +669,7 @@ Top-level keys of `srtslurm.yaml`. Recipes inherit these defaults and resolve al
 | `default_health_check` | dict[str, int] \| None | `None` |  |
 | `srtctl_root` | str \| None | `None` |  |
 | `output_dir` | str \| None | `None` | Custom output directory for job logs |
+| `record_launch_plan` | bool | `False` | Cluster-wide default for recording exact realized srun commands. Recipes can opt in independently with output.record_launch_plan. |
 | `model_paths` | dict[str, str] \| None | `None` |  |
 | `containers` | dict[str, str] \| None | `None` |  |
 | `cloud` | dict[str, str] \| None | `None` |  |

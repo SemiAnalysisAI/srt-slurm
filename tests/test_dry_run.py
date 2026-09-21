@@ -374,6 +374,57 @@ class TestDryRunSrunOptions:
 class TestDryRunExecutionExtensions:
     """Test custom benchmark and telemetry details display."""
 
+    def test_nsys_profiling_details_shown(self, capsys):
+        config = _make_config(
+            {
+                "profiling": {
+                    "type": "nsys",
+                    "nsys_trace": "cuda-sw,nvtx",
+                    "trace_fork_before_exec": True,
+                    "capture_range_end": "repeat:1:async",
+                    "nsys_library_paths": ["/host/lib64", "/host/lib"],
+                    "prefill": {"start_step": 1, "stop_step": 3, "worker_index": 0, "worker_rank": 0},
+                    "decode": {"start_step": 2, "stop_step": 4, "capture_scope": "all"},
+                }
+            }
+        )
+
+        show_config_details(config)
+        output = capsys.readouterr().out
+        assert "cuda-sw,nvtx" in output
+        assert "repeat:1:async" in output
+        assert "/host/lib64:/host/lib" in output
+        assert "all physical processes" in output
+        assert "Execution Extensions" in output
+        assert "profiling" in output
+
+    def test_inline_worker_selection_translation_shown(self, capsys):
+        config = _make_config(
+            {
+                "frontend": {
+                    "type": "dynamo",
+                    "worker_selection": {
+                        "prefill": "max-kv-overlap",
+                        "decode": "default",
+                        "instances": [
+                            {
+                                "name": "max-kv-overlap",
+                                "type": "dynamo-two-tier-cost-fn",
+                            }
+                        ],
+                    },
+                }
+            }
+        )
+
+        show_config_details(config)
+        output = capsys.readouterr().out
+        assert "router_policy_config" in output
+        assert "/logs/router_policy_config.yaml" in output
+        assert "(auto)" in output
+        assert "worker_selection" in output
+        assert "max-kv-overlap" in output
+
     def test_custom_benchmark_details_shown(self, capsys):
         config = _make_config(
             {
@@ -389,6 +440,7 @@ class TestDryRunExecutionExtensions:
         assert "Execution Extensions" in output
         assert "container_image" in output
         assert "nvcr.io/nvidia/python:3.11" in output
+        assert "profiling" not in output
 
     def test_observability_tachometer_details_shown(self, capsys):
         config = _make_config(
@@ -626,6 +678,33 @@ class TestDryRunExecutionExtensions:
         assert "/logs/mooncake_store_config.json" in output
         assert "P2PHANDSHAKE" in output
         assert "100GB" in output
+
+    def test_vllm_process_local_mooncake_map_in_dry_run(self, capsys):
+        config = _make_config(
+            {
+                "backend": {
+                    "type": "vllm",
+                    "mooncake_kv_store": {
+                        "device_names_by_gpu": [f"mlx5_{i}" for i in range(8)],
+                        "store_config": {"global_segment_size": "150GB"},
+                    },
+                    "vllm_config": {
+                        "prefill": {
+                            "kv-transfer-config": '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_both"}'
+                        },
+                        "decode": {
+                            "kv-transfer-config": '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_both"}'
+                        },
+                    },
+                },
+            }
+        )
+        show_config_details(config)
+        output = capsys.readouterr().out
+        assert "device_names_by_gpu" in output
+        assert "mlx5_7" in output
+        assert "mooncake_store_config_gpu" in output
+        assert "process config" in output
 
 
 class TestDryRunServices:
@@ -977,3 +1056,42 @@ class TestInfmaxWorkspaceMount:
             show_config_details(config)
         output = capsys.readouterr().out
         assert "MISSING" not in output
+
+
+@pytest.mark.parametrize("nsys, expected", [({}, "enabled"), ({"enabled": False}, "disabled")])
+def test_observability_nsys_details(capsys, nsys, expected):
+    cfg = _make_config({"observability": {"enabled": True, "nsys": nsys}, "frontend": {"type": "dynamo"}})
+    show_config_details(cfg)
+    output = capsys.readouterr().out
+    assert "nsys" in output and expected in output
+    if expected == "enabled":
+        for text in (
+            "NVTX (no CUDA tracing)",
+            "nsys CPU sampling",
+            "process-tree (every target)",
+            "Dynamo frontends",
+            "measured_workload",
+            "after warmup",
+            "1800s",
+            "DYN_ENABLE_RUST_NVTX",
+        ):
+            assert text in output
+    else:
+        assert "nsys targets" not in output
+
+
+def test_explicit_profiling_explains_observability_precedence(capsys):
+    cfg = _make_config(
+        {
+            "observability": {"enabled": True},
+            "profiling": {
+                "type": "nsys-time",
+                "delay_secs": 1,
+                "duration_secs": 2,
+            },
+        }
+    )
+    show_config_details(cfg)
+    output = capsys.readouterr().out
+    assert "superseded by profiling" in output
+    assert "nsys targets" not in output

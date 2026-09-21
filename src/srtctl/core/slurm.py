@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 """
@@ -20,6 +20,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from .ip_utils import get_node_ip
+from .launch_plan import record_srun_command
 
 logger = logging.getLogger(__name__)
 
@@ -268,7 +269,9 @@ def start_srun_process(
     if cpu_bind:
         srun_cmd.append(f"--cpu-bind={cpu_bind}")
 
-    srun_cmd.extend(["--nodes", str(nodes)])
+    # Arbitrary layouts derive their node count from the repeated host list.
+    if not srun_options or srun_options.get("distribution") != "arbitrary":
+        srun_cmd.extend(["--nodes", str(nodes)])
     srun_cmd.extend(["--ntasks", str(ntasks)])
 
     if cpus_per_task:
@@ -363,6 +366,17 @@ def start_srun_process(
     # which dominates the orchestrator log. Re-enable with `--verbose` / by setting
     # the srtctl logger to DEBUG when troubleshooting srun arg construction.
     logger.debug("srun command: %s", shlex.join(srun_cmd))
+
+    record_srun_command(
+        srun_cmd,
+        label=Path(output).stem if output else Path(command[0]).name,
+        output=output,
+        nodelist=list(nodelist) if nodelist else None,
+        het_group=het_group,
+        container_image=str(container_image) if container_image else None,
+        env_to_set=env_to_set,
+        srun_export_env=srun_export_env,
+    )
 
     # Start the process
     proc = subprocess.Popen(

@@ -11,7 +11,7 @@ order, and quoting survive; keys that move between blocks carry their comments.
 
 v1 -> v2 rewrites (each is a pure re-spelling; the resolved config is identical):
 
-- ``resources.<role>_nodes/_workers``, ``gpus_per_<role>``,
+- ``resources.<role>_nodes/_workers``, ``gpus_per_<role>``, ``<role>_critical``,
   ``backend.<mode>_environment``, ``backend.<engine>_config.<mode>``, and
   ``backend.<mode>_extra_args`` fold into ``roles.<role>``.
 - ``frontend.orchestrator_placement`` / ``dedicated_node``,
@@ -194,6 +194,7 @@ def _fold_roles(variant: CommentedMap, engine_key: str, label: str) -> list[str]
                 (f"{role}_nodes", "nodes"),
                 (f"{role}_workers", "workers"),
                 (f"gpus_per_{role}", "gpus"),
+                (f"{role}_critical", "critical"),
             ):
                 if legacy in resources:
                     moves.append((resources, legacy, new))
@@ -404,6 +405,8 @@ def _fold_mooncake(variant: CommentedMap, label: str) -> list[str]:
         _move(store, "master_extra_args", entry, "args")
     if "store_config" in store:
         _move(store, "store_config", _child_map(entry, "options"), "store_config")
+    if "device_names_by_gpu" in store:
+        _move(store, "device_names_by_gpu", _child_map(entry, "options"), "device_names_by_gpu")
     if "env" in store:
         moved = store.pop("env")
         store.ca.items.pop("env", None)
@@ -725,6 +728,10 @@ def _resolved_dump(raw: dict[str, Any]) -> dict[str, Any]:
 
     effective = [entry.service for entry in effective_services(loaded)]
     dumped["services"] = schema.fields["services"]._serialize(effective, "services", loaded)
+    # An explicitly empty map and an omitted map both select the shared JSON.
+    for service in dumped["services"]:
+        if service["type"] == "mooncake-master" and service["options"].get("device_names_by_gpu") == []:
+            service["options"].pop("device_names_by_gpu")
     if not any(service.type in ("etcd", "nats") for service in effective) and isinstance(dumped.get("infra"), dict):
         # No discovery plane: the NATS payload knob never had an effect, and the migrator drops it.
         dumped["infra"]["nats_max_payload_mb"] = None

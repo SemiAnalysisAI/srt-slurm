@@ -5,11 +5,12 @@
 
 Every service kind launches the same way: resolve the nodes its ``placement``
 selects, optionally clone and build a ``source`` once, then one ``srun`` per
-node with the kind's command and environment merged around the recipe's, an
-optional readiness probe (tcp, http, or log; or the kind's default ports), and a
-``ManagedProcess`` for the shared ``ProcessRegistry`` (which provides crash
-detection and teardown). The kind (``srtctl.services.registry.ServiceKind``)
-never launches anything itself.
+instance (one per node, or under ``placement.per: worker`` one per engine worker
+on each node, pinned to that worker's GPUs) with the kind's command and
+environment merged around the recipe's, an optional readiness probe (tcp, http,
+or log; or the kind's default ports), and a ``ManagedProcess`` for the shared
+``ProcessRegistry`` (which provides crash detection and teardown). The kind
+(``srtctl.services.registry.ServiceKind``) never launches anything itself.
 
 The list launched is ``effective_services(config)``: what the recipe declares
 plus what it implies (etcd and NATS under the Dynamo frontend, the Mooncake
@@ -49,7 +50,7 @@ from srtctl.services.registry import ServiceLaunchContext, get_service_kind
 if TYPE_CHECKING:
     from srtctl.core.runtime import RuntimeContext
     from srtctl.core.schema import SrtConfig
-    from srtctl.core.topology import Endpoint
+    from srtctl.core.topology import Endpoint, Process
     from srtctl.services.config import ServiceConfig
 
 logger = logging.getLogger(__name__)
@@ -78,8 +79,14 @@ def _await_and_cd(work_dir: str) -> str:
     return f"for _i in $(seq 1 20); do [ -d {quoted} ] && break; sleep 0.5; done; cd {quoted}"
 
 
-def service_step_name(service: ServiceConfig, node: str, instances: int) -> str:
-    """Slurm step name (and log stem) for one instance of a service."""
+def service_step_name(service: ServiceConfig, node: str, instances: int, process: Process | None = None) -> str:
+    """Slurm step name (and log stem) for one instance of a service.
+
+    ``service_<name>`` alone for a single instance, ``service_<name>_<node>`` per
+    node, ``service_<name>_<role>_<index>_<node>`` for an instance attached to a worker.
+    """
+    if process is not None:
+        return f"service_{service.name}_{process.endpoint_mode}_{process.endpoint_index}_{node}"
     suffix = f"_{node}" if instances > 1 else ""
     return f"service_{service.name}{suffix}"
 
@@ -90,11 +97,29 @@ class ServiceStageMixin:
     config: SrtConfig
     runtime: RuntimeContext
     endpoints: list[Endpoint]
+    backend_processes: list[Process]
 
     # -- node resolution ---------------------------------------------------------
 
+    @property
+    def terminal_processes(self) -> dict[str, list[ManagedProcess]]:
+        """Instances of ``services[].terminal`` services by service name.
+
+        The manual loop in BenchmarkStageMixin ends the job when every one of them
+        has exited, with the worst exit code. Lazily created: mixins have no __init__.
+        """
+        procs = getattr(self, "_terminal_processes", None)
+        if procs is None:
+            procs = {}
+            self._terminal_processes = procs
+        return procs
+
     def service_nodes(self, service: ServiceConfig) -> list[str]:
         """Physical nodes a service's ``placement`` selects, in allocation order, deduplicated."""
+        pool = service.effective_pool
+        if pool is not None:
+            # A node owner runs on its own pool; a rider runs on the owner's pool.
+            return list(self.runtime.nodes.pools.get(pool, ()))
         where = service.effective_placement
         if where == "head":
             return [self.runtime.nodes.head]
@@ -103,9 +128,11 @@ class ServiceStageMixin:
             return [self.runtime.nodes.infra]
         if where == "workers":
             return list(self.runtime.nodes.worker)
+        if where == "compute":
+            return list(self.runtime.nodes.compute)
         if where == "all":
             nodes = self.runtime.nodes
-            return list(dict.fromkeys((nodes.head, nodes.infra, nodes.bench, *nodes.worker)))
+            return list(dict.fromkeys((nodes.head, nodes.infra, nodes.bench, *nodes.compute)))
         seen: dict[str, None] = {}
         for endpoint in self.endpoints:
             if endpoint.mode == where:
@@ -113,6 +140,30 @@ class ServiceStageMixin:
                     seen.setdefault(node, None)
         order = {node: i for i, node in enumerate(self.runtime.nodes.worker)}
         return sorted(seen, key=lambda n: order.get(n, len(order)))
+
+    def service_instances(self, service: ServiceConfig) -> list[tuple[str, Process | None]]:
+        """The instances a service launches: ``(node, None)`` per placed node, or under
+        ``placement.per: worker`` ``(node, process)`` per engine worker on those nodes.
+
+        A worker's instance is attached to its engine 0 process (a worker with shadow
+        engines has several processes on a node; the sidecar serves them all).
+        Ordered by node, then worker index, then rank, so instance 0 is the first
+        worker of the first node.
+        """
+        nodes = self.service_nodes(service)
+        if service.effective_per != "worker":
+            return [(node, None) for node in nodes]
+        where = service.effective_placement
+        order = {node: i for i, node in enumerate(nodes)}
+        attached = [
+            process
+            for process in self.backend_processes
+            if process.node in order
+            and getattr(process, "engine_id", 0) == 0
+            and (where == "workers" or process.endpoint_mode == where)
+        ]
+        attached.sort(key=lambda p: (order[p.node], p.endpoint_index, p.node_rank))
+        return [(process.node, process) for process in attached]
 
     @staticmethod
     def _readiness_ports(service: ServiceConfig) -> tuple[int, ...]:
@@ -260,13 +311,20 @@ class ServiceStageMixin:
             preamble_parts.append(render_placeholders(kind_preamble, template))
         if service.preamble:
             preamble_parts.append(render_placeholders(service.preamble, template).rstrip())
-        step_name = service_step_name(service, ctx.node, instances)
+        step_name = service_step_name(service, ctx.node, instances, ctx.process)
         log_file = self.runtime.log_dir / f"{step_name}.out"
 
         env = self._service_environment(service, ctx)
+        if ctx.process is not None and len(ctx.process.gpu_indices) < self.runtime.gpus_per_node:
+            # placement.per: worker means the worker's device view: the same pinning the
+            # worker stage applies to the engines, so "device k" is the same GPU in both.
+            env["CUDA_VISIBLE_DEVICES"] = ctx.process.cuda_visible_devices
         # Host-native kinds (a static Go exporter) run on the bare node: no image, no mounts.
         host_native = kind.host_native(service)
-        logger.info("Starting service %s (%s) on %s: %s", service.name, service.type, ctx.node, shlex.join(command))
+        attached = f" for {ctx.process.endpoint_mode} worker {ctx.process.endpoint_index}" if ctx.process else ""
+        logger.info(
+            "Starting service %s (%s) on %s%s: %s", service.name, service.type, ctx.node, attached, shlex.join(command)
+        )
         popen = start_srun_process(
             command=command,
             nodelist=[ctx.node],
@@ -320,12 +378,16 @@ class ServiceStageMixin:
                 f"({readiness.describe()}); see {proc.log_file}"
             )
 
-    def _wait_service_ready(self, proc: ManagedProcess, service: ServiceConfig) -> None:
-        """The recipe's ``readiness`` probe, or each default port of the kind in turn."""
+    def _wait_service_ready(self, proc: ManagedProcess, service: ServiceConfig, ctx: ServiceLaunchContext) -> None:
+        """The recipe's ``readiness`` probe, else the kind's per-instance probe, else each default port in turn."""
         if service.readiness is not None:
             self._wait_ready(proc, service, service.readiness)
             return
         kind = get_service_kind(service.type)
+        instance_probe = kind.readiness(service, ctx)
+        if instance_probe is not None:
+            self._wait_ready(proc, service, instance_probe)
+            return
         for port in kind.default_readiness_ports:
             probe = ServiceReadinessConfig(tcp=TcpProbe(port=port), timeout_seconds=kind.default_readiness_timeout)
             self._wait_ready(proc, service, probe)
@@ -345,7 +407,7 @@ class ServiceStageMixin:
             return []
         self._check_port_collisions([entry.service for entry in effective])
 
-        worker_order = {node: i for i, node in enumerate(self.runtime.nodes.worker)}
+        worker_order = {node: i for i, node in enumerate(self.runtime.nodes.compute)}
         started: list[ManagedProcess] = []
         try:
             for entry in phase:
@@ -370,21 +432,41 @@ class ServiceStageMixin:
                 if work_dir is not None:
                     self._build_service_source(service, nodes[0], work_dir, registry)
 
-                for index, node in enumerate(nodes):
+                node_ips = tuple(get_hostname_ip(node, self.runtime.network_interface) for node in nodes)
+                ip_of = dict(zip(nodes, node_ips, strict=True))
+                placed = self.service_instances(service)
+                if not placed:
+                    logger.warning(
+                        "services[%s]: placement selects no %s in this allocation; skipping",
+                        service.name,
+                        "workers" if service.effective_per == "worker" else "nodes",
+                    )
+                    continue
+                instances: list[ManagedProcess] = []
+                for index, (node, process) in enumerate(placed):
                     ctx = ServiceLaunchContext(
                         runtime=self.runtime,
                         node=node,
-                        node_ip=get_hostname_ip(node, self.runtime.network_interface),
+                        node_ip=ip_of[node],
                         node_id=worker_order.get(node, index),
                         index=index,
                         role=service.effective_placement,
+                        nodes=tuple(nodes),
+                        node_ips=node_ips,
+                        process=process,
+                        config=self.config,
                     )
-                    proc = self._launch_service_instance(service, ctx, work_dir, len(nodes))
+                    proc = self._launch_service_instance(service, ctx, work_dir, len(placed))
                     started.append(proc)
+                    instances.append(proc)
                     if registry is not None:
                         registry.add_process(proc)
-                    self._wait_service_ready(proc, service)
-                logger.info("Service %s ready on %d node(s)", service.name, len(nodes))
+                    self._wait_service_ready(proc, service, ctx)
+                    if service.terminal:
+                        # The manual loop in BenchmarkStageMixin ends the job when these exit.
+                        self.terminal_processes.setdefault(service.name, []).append(proc)
+                kind.wait_fleet_ready(service, self.runtime, instances)
+                logger.info("Service %s ready: %d instance(s) on %d node(s)", service.name, len(placed), len(nodes))
         except BaseException:
             # Belt and braces: the registry already tracks these, but terminate
             # here too so a failure inside this stage never depends on the caller.

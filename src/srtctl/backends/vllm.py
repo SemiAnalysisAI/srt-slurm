@@ -32,6 +32,8 @@ from srtctl.ports import (
     MOONCAKE_HTTP_METADATA_PORT,
     MOONCAKE_MASTER_PORT,
     VLLM_DATA_PARALLEL_RPC_PORT,
+    VLLM_MASTER_PORT_BASE,
+    VLLM_MASTER_PORT_STRIDE,
     VLLM_PORT_BASE,
     VLLM_PORT_STRIDE,
 )
@@ -204,8 +206,80 @@ class VLLMMooncakeKVStoreConfig:
     # (e.g. ``"4GB"``). Type as ``dict[str, Any]`` to avoid forcing users to
     # quote numeric values.
     store_config: dict[str, Any] | None = None
+    # Optional physical-GPU-indexed HCA names. Each launched process receives
+    # a JSON config restricted to the devices assigned to its physical GPUs.
+    # This does not assign different configs to nested vLLM TP ranks.
+    device_names_by_gpu: list[str] = field(default_factory=list)
 
     Schema: ClassVar[builtins.type[Schema]] = Schema
+
+    def validate_device_mapping(self, gpus_per_node: int) -> None:
+        """Validate an opt-in physical GPU map before allocation and at launch."""
+        devices = self.device_names_by_gpu
+        if not devices:
+            return
+        if len(devices) != gpus_per_node:
+            raise ValueError("mooncake device_names_by_gpu must have one entry per physical GPU on each node")
+        if any(not isinstance(d, str) or not d or any(c.isspace() for c in d) or "," in d for d in devices):
+            raise ValueError(
+                "mooncake device_names_by_gpu entries must be single nonempty device names without whitespace"
+            )
+
+
+# Name of the flock file the engines of one worker elect the serving engine with.
+FAILOVER_LOCK_FILENAME = "failover.lock"
+
+
+@dataclass(frozen=True)
+class VLLMFailoverConfig:
+    """Shadow engine recovery for vLLM workers (Dynamo GPU Memory Service).
+
+    Every worker runs ``1 + shadow_engines`` ``dynamo.vllm`` engines on the same
+    GPUs next to a GPU Memory Service (GMS) that owns the weights (the implied
+    ``gms`` service, one instance per worker), so a shadow maps the one copy
+    already in HBM instead of loading its own. The engines elect the serving one
+    with a ``flock`` on a shared file: when the active engine dies the kernel
+    drops the lock, a shadow acquires it, materializes its KV cache and registers
+    with the frontend within seconds. ``roles.<role>.restart`` relaunches the dead
+    engine in place as the new shadow. This is the Kubernetes intra-pod failover
+    layout (``experimental.failover``) without DRA: on SLURM the steps of one
+    worker share the node's GPUs natively. See ``docs/shadow-engine-recovery.md``.
+
+    Attributes:
+        shadow_engines: Standby engines per worker.
+        shared_dir: Node-local host directory that every container on a node sees.
+            The GMS sockets and the lock file of a worker live under
+            ``<shared_dir>/srtctl-<job_id>/<role>_<index>``. enroot bind-mounts the
+            host's ``/dev/shm`` into every container; ``/tmp`` is a fresh tmpfs per
+            container and does not work.
+    """
+
+    shadow_engines: int = 1
+    shared_dir: str = "/dev/shm"
+
+    Schema: ClassVar[builtins.type[Schema]] = Schema
+
+    def __post_init__(self) -> None:
+        if self.shadow_engines < 1:
+            raise ValidationError(f"engine.failover.shadow_engines must be at least 1, got {self.shadow_engines}")
+        if not self.shared_dir.startswith("/") or self.shared_dir == "/":
+            raise ValidationError(
+                f"engine.failover.shared_dir must be an absolute directory below /, got {self.shared_dir!r}"
+            )
+
+    @property
+    def engines_per_worker(self) -> int:
+        return 1 + self.shadow_engines
+
+
+def failover_root(shared_dir: str, job_id: str) -> str:
+    """Per-job directory under ``shared_dir`` holding every worker's sockets and lock file."""
+    return f"{shared_dir.rstrip('/')}/srtctl-{job_id}"
+
+
+def failover_worker_dir(shared_dir: str, job_id: str, process: Process) -> str:
+    """The directory one worker's engines and GMS sidecar share on a node (the same path on every node)."""
+    return f"{failover_root(shared_dir, job_id)}/{process.endpoint_mode}_{process.endpoint_index}"
 
 
 @dataclass(frozen=True)
@@ -275,6 +349,10 @@ class VLLMProtocol:
     # infra node and auto-injects MOONCAKE_MASTER / MOONCAKE_TE_META_DATA_SERVER
     # / MOONCAKE_LOCAL_HOSTNAME on every vLLM worker.
     mooncake_kv_store: VLLMMooncakeKVStoreConfig | None = None
+
+    # Shadow engine recovery: when set, every worker runs shadow_engines standby engines
+    # on its GPUs next to an implied `gms` service that owns the weights. Dynamo frontend only.
+    failover: VLLMFailoverConfig | None = None
 
     # KV events config - enables --kv-events-config with auto-allocated ports.
     # Required for Dynamo's event-driven KV-aware routing.
@@ -350,21 +428,6 @@ class VLLMProtocol:
         if not dp_mode_configs or self.dp_launch_mode == "per_gpu":
             return
 
-        self._validate_per_node_dp_config(dp_mode_configs, sidecar=False)
-
-    def validate_sidecar_dp_config(self) -> None:
-        """Validate DP flags when Dynamo sidecar mode forces the per-node layout."""
-        if self.dp_launch_mode == "per_node":
-            # __post_init__ already validated this configuration.
-            return
-        self._validate_per_node_dp_config(self.find_dp_modes(), sidecar=True)
-
-    def _validate_per_node_dp_config(
-        self,
-        dp_mode_configs: list[tuple[str, dict[str, Any]]],
-        *,
-        sidecar: bool,
-    ) -> None:
         hybrid_lb_modes: list[str] = []
         headless_modes: list[str] = []
         for mode_name, mode_config in dp_mode_configs:
@@ -383,14 +446,11 @@ class VLLMProtocol:
 
         if hybrid_lb_modes:
             fields = ", ".join(f"vllm_config.{mode}.data-parallel-hybrid-lb" for mode in hybrid_lb_modes)
-            if sidecar:
-                logger.warning("%s is not used by vLLM sidecar mode and will be ignored", fields)
-            else:
-                logger.warning(
-                    "%s is unnecessary when dp_launch_mode=per_node; "
-                    "srtslurm derives --data-parallel-hybrid-lb from the topology and ignores the configured value",
-                    fields,
-                )
+            logger.warning(
+                "%s is unnecessary when dp_launch_mode=per_node; "
+                "srtslurm derives --data-parallel-hybrid-lb from the topology and ignores the configured value",
+                fields,
+            )
 
     # =========================================================================
     # BackendProtocol Implementation
@@ -535,6 +595,30 @@ class VLLMProtocol:
             result.update(self.mooncake_kv_store.store_config)
         result["master_server_address"] = f"{infra_node_ip}:{MOONCAKE_MASTER_PORT}"
         return result
+
+    def build_mooncake_process_config(
+        self, process: Process, infra_node_ip: str, gpus_per_node: int
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Return an opt-in process-local filename/payload, using physical GPU IDs.
+
+        GPU numbering restarts on each node; filenames are reusable across nodes
+        with the same mapping. Multi-GPU processes receive the HCA subset, not a
+        per-nested-rank binding. The shared-config default is unchanged.
+        """
+        if self.mooncake_kv_store is None or not self.mooncake_kv_store.device_names_by_gpu:
+            return None
+        self.mooncake_kv_store.validate_device_mapping(gpus_per_node)
+        devices = self.mooncake_kv_store.device_names_by_gpu
+        gpu_ids = sorted(process.gpu_indices)
+        if not gpu_ids or any(gpu < 0 or gpu >= len(devices) for gpu in gpu_ids):
+            raise ValueError(f"mooncake device_names_by_gpu does not cover physical GPUs {gpu_ids}")
+        # Sharing an HCA between physical GPUs is legal. Avoid duplicating its
+        # name when a process spans multiple GPUs mapped to the same HCA.
+        process_devices = list(dict.fromkeys(devices[gpu] for gpu in gpu_ids))
+        payload = self.build_mooncake_store_config(infra_node_ip)
+        payload["device_name"] = ",".join(process_devices)
+        filename = "mooncake_store_config_gpu" + "-".join(map(str, gpu_ids)) + ".json"
+        return filename, payload
 
     def get_served_model_name(self, default: str) -> str:
         """Get served model name from vLLM config, or return default."""
@@ -745,6 +829,59 @@ class VLLMProtocol:
             for offset in range(0, len(sorted_gpus), gpus_per_rank)
         ]
 
+    # =========================================================================
+    # Shadow engine recovery (backend.failover)
+    # =========================================================================
+
+    @property
+    def engines_per_process(self) -> int:
+        """Engines launched per (worker, node): 1, or ``1 + shadow_engines`` under ``failover``."""
+        return self.failover.engines_per_worker if self.failover is not None else 1
+
+    def failover_worker_dir(self, job_id: str, process: Process) -> str:
+        """Node-local directory this worker's engines and GMS sidecar share; see ``VLLMFailoverConfig.shared_dir``."""
+        assert self.failover is not None
+        return failover_worker_dir(self.failover.shared_dir, job_id, process)
+
+    def get_failover_environment(self, process: Process, job_id: str) -> dict[str, str]:
+        """Environment one engine of a failover worker needs (the same names the Dynamo operator injects).
+
+        ``ENGINE_ID`` 0 is the engine that loads the weights into GMS (it takes a
+        read-write GMS session, or read-only when the weights are already there
+        after a relaunch); every other engine imports them read-only. The lock file
+        is per worker, so only that worker's engines contend for it.
+        """
+        worker_dir = self.failover_worker_dir(job_id, process)
+        return {
+            "ENGINE_ID": str(process.engine_id),
+            "GMS_SOCKET_DIR": worker_dir,
+            "FAILOVER_LOCK_PATH": f"{worker_dir}/{FAILOVER_LOCK_FILENAME}",
+            "DYN_VLLM_GMS_SHADOW_MODE": "true",
+            # /health answers "notready" until the engine holds the lock and serves; a
+            # parked shadow then reports healthy so nothing restarts it while it waits.
+            "DYN_SYSTEM_STARTING_HEALTH_STATUS": "notready",
+        }
+
+    def _failover_flags(self, config: dict[str, Any], process: Process, is_multi_node: bool) -> list[str]:
+        """``dynamo.vllm`` flags every engine of a failover worker gets; pops the keys it owns from ``config``."""
+        owned = {"load-format", "gms-shadow-mode"}
+        master_port: int | None = None
+        for key in list(config):
+            normalized = normalize_vllm_config_key(key)
+            if normalized in owned:
+                config.pop(key)
+            elif normalized == "master-port":
+                master_port = int(config.pop(key))
+        # Weights come from the worker's GMS sidecar; the engine parks after
+        # initialization and waits for the lock before it registers.
+        flags = ["--load-format", "gms", "--gms-shadow-mode"]
+        if is_multi_node:
+            # Every engine of a multi-node worker is its own torch.distributed job and
+            # needs its own TCPStore port on the leader node.
+            base = master_port if master_port is not None else VLLM_MASTER_PORT_BASE
+            flags.extend(["--master-port", str(base + process.engine_id * VLLM_MASTER_PORT_STRIDE)])
+        return flags
+
     def should_set_cuda_visible_devices(self, process: Process) -> bool:
         """Whether worker_stage should set CUDA_VISIBLE_DEVICES.
 
@@ -778,10 +915,16 @@ class VLLMProtocol:
         has_dp_mode = any(self._is_dp_mode(ep.mode) for ep in endpoints)
 
         if not has_dp_mode:
-            # Standard TP mode: one process per node
-            return endpoints_to_processes(endpoints, base_sys_port=base_sys_port, port_allocator=port_allocator)
+            # Standard TP mode: one process per node, or one per engine of the
+            # worker under backend.failover (engine 0 plus its shadows).
+            return endpoints_to_processes(
+                endpoints,
+                base_sys_port=base_sys_port,
+                port_allocator=port_allocator,
+                engines_per_process=self.engines_per_process,
+            )
 
-        if dynamo_sidecar or self.dp_launch_mode == "per_node":
+        if self.dp_launch_mode == "per_node":
             return self._dp_per_node_endpoints_to_processes(
                 endpoints,
                 base_sys_port=base_sys_port,
@@ -988,10 +1131,9 @@ class VLLMProtocol:
         endpoint_nodes = list(dict.fromkeys(p.node for p in endpoint_processes))
         is_multi_node = len(endpoint_nodes) > 1
 
-        # Direct vLLM rendezvous must use the configured interface. Keep the
-        # existing Dynamo resolution path unchanged to avoid affecting jobs
-        # outside the scope of the direct-vLLM frontend.
-        if frontend_type in {"vllm", "vllm-router"}:
+        # Native vLLM rendezvous must use the configured interface, including
+        # native engines behind a Dynamo sidecar.
+        if frontend_type in {"vllm", "vllm-router"} or get_dynamo_sidecar_config(runtime) is not None:
             leader_ip = get_hostname_ip(endpoint_nodes[0], runtime.network_interface)
         else:
             leader_ip = get_hostname_ip(endpoint_nodes[0])
@@ -1180,7 +1322,10 @@ class VLLMProtocol:
             kv_transfer_cfg = _connector_to_kv_transfer_config(connector)
             cmd.extend(["--kv-transfer-config", kv_transfer_cfg])
 
-        if not self.set_cuda_visible_devices:
+        # Under failover the worker stage pins CUDA_VISIBLE_DEVICES instead: the
+        # engines and their GMS sidecar must see the same device list so that
+        # "device k" means the same GPU (and the same socket) in all of them.
+        if not self.set_cuda_visible_devices and self.failover is None:
             device_ids = ",".join(str(i) for i in sorted(process.gpu_indices))
             if device_ids:
                 cmd.extend(["--device-ids", device_ids])
@@ -1287,6 +1432,9 @@ class VLLMProtocol:
             if node_rank > 0:
                 cmd.append("--headless")
 
+        if self.failover is not None:
+            cmd.extend(self._failover_flags(config, process, is_multi_node))
+
         # Add request plane
         cmd.extend(["--request-plane", runtime.request_plane])
 
@@ -1317,12 +1465,48 @@ class VLLMProtocol:
         nsys_prefix: list[str] | None,
         sidecar_config: DynamoConfig,
     ) -> list[str]:
-        """Build a lifecycle-coupled vllm-rs native-gRPC and sidecar launch."""
+        """Expose local DP frontends or one frontend for a cross-node replica."""
         mode = process.endpoint_mode
         is_dp_mode = self._is_dp_mode(mode)
-        is_multi_node = len({candidate.node for candidate in endpoint_processes}) > 1
-        if is_multi_node and not is_dp_mode:
-            raise ValueError("vLLM sidecar mode does not support multi-node tensor-parallel endpoints; use DP")
+        endpoint_nodes = list(dict.fromkeys(candidate.node for candidate in endpoint_processes))
+        is_multi_node = len(endpoint_nodes) > 1
+        multi_node_replica = is_multi_node and (
+            not is_dp_mode or self._get_model_parallel_size(mode) > len(process.gpu_indices)
+        )
+        if multi_node_replica and is_dp_mode:
+            raise ValueError(
+                "vLLM sidecar mode supports one cross-node TP/PP replica per endpoint; "
+                "use data-parallel-size: 1 and separate endpoints for additional replicas"
+            )
+        if multi_node_replica:
+            gpu_counts = {len(candidate.gpu_indices) for candidate in endpoint_processes}
+            total_gpus = sum(len(candidate.gpu_indices) for candidate in endpoint_processes)
+            if len(gpu_counts) != 1 or total_gpus != self._get_model_parallel_size(mode):
+                raise ValueError("vLLM sidecar TP*PP*PCP must match the evenly distributed endpoint GPU allocation")
+        node_rank = endpoint_nodes.index(process.node)
+        headless = multi_node_replica and node_rank > 0
+        hybrid_lb = is_dp_mode and is_multi_node and not multi_node_replica
+        if hybrid_lb or multi_node_replica:
+            normalized = {key.replace("_", "-"): value for key, value in config.items()}
+            layout = "hybrid" if hybrid_lb else "multi-node"
+            if any(
+                normalized.get(flag)
+                for flag in ("grpc", "data-parallel-external-lb", "data-parallel-multi-port-external-lb")
+            ):
+                raise ValueError(
+                    f"vLLM sidecar {layout} mode requires the Rust frontend; "
+                    "remove grpc and external load-balancing flags"
+                )
+            if not headless and normalized.get("api-server-count") not in (None, 1, "1"):
+                raise ValueError(f"vLLM sidecar {layout} mode requires api-server-count: 1 on frontend nodes")
+        if multi_node_replica:
+            executor = _pop_flags(config, frozenset({"distributed-executor-backend"}))
+            if executor.get("distributed-executor-backend", "mp") != "mp":
+                raise ValueError("vLLM multi-node sidecar requires distributed-executor-backend: mp")
+            pop_vllm_orchestration_flags(config)
+            _pop_flags(config, frozenset({"master-port", "grpc"}))
+            if headless:
+                pop_vllm_api_server_flags(config)
         grpc_port = sidecar_grpc_port(sidecar_config.sidecar_port, process)
 
         for key in (
@@ -1346,21 +1530,51 @@ class VLLMProtocol:
             config.pop(key, None)
 
         command: list[str] = list(nsys_prefix or [])
-        command.extend(
-            [
-                "vllm-rs",
-                "serve",
-                model_arg,
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(process.http_port or grpc_port + 1),
-                "--grpc-port",
-                str(grpc_port),
-                "--served-model-name",
-                served_model_name,
-            ]
-        )
+        if hybrid_lb or multi_node_replica:
+            # Python coordinates distributed workers and starts Rust only on
+            # frontend nodes. Headless followers take its native executor path.
+            # The current `vllm-rs serve` launcher does not implement hybrid
+            # startup; requests still use the Rust frontend in this path.
+            # VLLM_RUST_FRONTEND_PATH, when configured, is inherited unchanged.
+            command.extend(["env", "VLLM_USE_RUST_FRONTEND=1", "python3", "-m", "vllm.entrypoints.cli.main"])
+        else:
+            command.append("vllm-rs")
+        command.extend(["serve", model_arg, "--served-model-name", served_model_name])
+        if not headless:
+            command.extend(
+                [
+                    "--host",
+                    "127.0.0.1",
+                    "--port",
+                    str(process.http_port or grpc_port + 1),
+                    "--grpc-port",
+                    str(grpc_port),
+                ]
+            )
+        if multi_node_replica:
+            leader = next(candidate for candidate in endpoint_processes if candidate.node == endpoint_nodes[0])
+            # Use the leader's reserved vLLM port range for this endpoint.
+            # worker_stage unsets VLLM_PORT for multi-node groups, leaving this
+            # port free for rendezvous, including colocated P/D endpoints.
+            master_port = VLLM_PORT_BASE + (leader.sys_port - DYN_SYSTEM_PORT_BASE) * VLLM_PORT_STRIDE
+            if not 1 <= master_port <= 65535:
+                raise ValueError(f"vLLM rendezvous port out of range: {master_port}")
+            command.extend(
+                [
+                    "--distributed-executor-backend",
+                    "mp",
+                    "--nnodes",
+                    str(len(endpoint_nodes)),
+                    "--node-rank",
+                    str(node_rank),
+                    "--master-addr",
+                    leader_ip,
+                    "--master-port",
+                    str(master_port),
+                ]
+            )
+            if headless:
+                command.append("--headless")
 
         max_model_len = config.pop("max-model-len", None)
         if max_model_len is None:
@@ -1390,8 +1604,8 @@ class VLLMProtocol:
                     str(dp_rpc_port),
                 ]
             )
-            if not process.is_leader:
-                command.append("--headless")
+            if hybrid_lb:
+                command.extend(["--data-parallel-start-rank", str(process.node_rank), "--data-parallel-hybrid-lb"])
 
         mode_connector = config.pop("connector", None)
         connector = mode_connector if mode_connector is not None else self.connector
@@ -1405,11 +1619,14 @@ class VLLMProtocol:
             command.extend(["--kv-events-config", json.dumps(kv_cfg)])
 
         command.extend(_config_to_cli_args(config))
-        if is_dp_mode and not process.is_leader:
-            command.extend(["--data-parallel-start-rank", str(process.node_rank)])
-        if not process.is_leader:
-            return command
-
+        if headless:
+            return build_sidecar_launch_command(
+                engine=command,
+                sidecar=None,
+                grpc_port=grpc_port,
+                engine_name="vLLM headless follower",
+                startup_timeout=sidecar_config.sidecar_startup_timeout,
+            )
         sidecar = (
             [sidecar_config.sidecar_binary]
             if sidecar_config.sidecar_binary is not None

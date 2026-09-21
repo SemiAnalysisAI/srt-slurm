@@ -54,8 +54,10 @@ telemetry:
 not require the top-level `container_image` or a `node_exporter`, because the
 collector runs inside srtctl. Config loading validates the block and rejects
 inconsistent values with actionable messages; in particular
-`collect_interval_ms` must not exceed the 3-second max sample gap the validator
-accepts, or every window would fail `sample_gap_exceeded`. Telemetry stays
+`collect_interval_ms` must not exceed the 3-second max sample gap the audit
+interpolates across (a window boundary farther than that from a sample is not
+integrated). Gaps inside a window are reported per device as
+`per_device_max_sample_gap_seconds` and never invalidate it. Telemetry stays
 disabled by default and existing `provider: scraper` recipes are unchanged.
 The collector join timeout must exceed two complete request-cycle budgets
 (`2 * (2 * request_timeout_seconds + 1 second)`), covering a scrape already in

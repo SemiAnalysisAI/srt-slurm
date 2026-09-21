@@ -19,9 +19,6 @@ from pathlib import Path
 
 from srtctl.core.power.contract import (
     CLOCK_SOURCE,
-    MAX_OVERLONG_GAP_FRACTION,
-    MAX_SAMPLE_GAP_HARD_SECONDS,
-    MAX_SAMPLE_GAP_SECONDS,
     SCHEMA_VERSION,
     WINDOWS_DIRNAME,
     Reason,
@@ -347,7 +344,13 @@ def _check_coverage(
     expected_device_keys: set[DeviceKey],
     observed_devices: Sequence[ObservedDevice],
 ) -> tuple[dict[str, float], list[str]]:
-    """Every expected device must bracket the window with small enough gaps."""
+    """Every expected device must bracket the window; gaps inside it are reported, not judged.
+
+    The largest gap per device goes into the audit row so a consumer can weigh
+    interpolated coverage itself. A collector that stopped for good has no sample
+    at or after the window end and fails bracketing, which is the failure this
+    check exists to catch.
+    """
     by_key = {device.key: device for device in observed_devices}
     gaps: dict[str, float] = {}
     reasons: list[str] = []
@@ -365,13 +368,9 @@ def _check_coverage(
         if sequence is None:
             reasons.append(Reason.MEASUREMENT_WINDOW_NOT_BRACKETED)
             continue
-        observed = [later - earlier for earlier, later in itertools.pairwise(sequence)]
-        largest = max(observed, default=0.0)
-        gaps[f"{device.hostname}/{device.gpu_uuids[0]}"] = largest
-        overlong = sum(gap for gap in observed if gap > MAX_SAMPLE_GAP_SECONDS)
-        budget = MAX_OVERLONG_GAP_FRACTION * (end - start)
-        if largest > MAX_SAMPLE_GAP_HARD_SECONDS or overlong > budget:
-            reasons.append(Reason.SAMPLE_GAP_EXCEEDED)
+        gaps[f"{device.hostname}/{device.gpu_uuids[0]}"] = max(
+            (later - earlier for earlier, later in itertools.pairwise(sequence)), default=0.0
+        )
 
     return gaps, reasons
 

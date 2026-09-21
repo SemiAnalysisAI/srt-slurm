@@ -1030,10 +1030,8 @@ class TestMeasurementWindowArtifacts:
         )
 
         assert row.power_coverage_valid is False
-        assert row.reason_codes == (
-            Reason.SAMPLE_GAP_EXCEEDED,
-            Reason.MEASUREMENT_WINDOW_NOT_BRACKETED,
-        )
+        assert row.reason_codes == (Reason.MEASUREMENT_WINDOW_NOT_BRACKETED,)
+        # node-a's 6 s gap is reported, not a reason: gaps never invalidate a window.
         assert row.per_device_max_sample_gap_seconds == {"node-a/GPU-a": 6.0}
 
     def test_window_coverage_does_not_depend_on_sample_time_order(self, tmp_path):

@@ -281,22 +281,24 @@ class TestIndependenceFromTheManifestBooleans:
         assert report.ok is False
         assert any("samples_sha256 is not a lowercase SHA-256 digest" in failure for failure in report.failures)
 
-    def test_gap_beyond_the_threshold_is_rejected(self, package):
+    def test_gaps_beyond_the_threshold_are_reported_not_rejected(self, package):
         expected = build_expected_devices(_processes())
         log_dir, power_dir = package(rows=_rows(expected, step=4.0))
 
         report = _validate(power_dir, log_dir)
 
-        assert report.ok is False
-        assert any("sample_gap_exceeded" in failure for failure in report.failures)
+        assert report.ok is True
+        assert report.failures == ()
+        assert report.summary["max_sample_gap_seconds"] == pytest.approx(4.0)
 
-    def test_isolated_overlong_gaps_are_absorbed_by_a_long_window(self, package):
+    def test_one_late_exporter_reply_keeps_the_window_valid(self, package):
         """An hour of measurement is not discarded over two scrapes running late.
 
-        H200 Kimi-K3 run 35532102407 lost the TP16 lane this way: one node's
-        exporter answered in 3.26 s and 3.10 s during a 3640 s window, 0.175% of
-        it, and every point on 32 GPUs was voided. The energy those two gaps can
-        misstate is bounded by the dynamic range times the gap, under 0.04%.
+        H200 Kimi-K3 run 35532102407 lost its TP16 lane this way: one node's
+        exporter answered after the 2 s request timeout twice in a 3640 s
+        window, which at a 1 s cadence is a 3.1-3.3 s gap on that node, and
+        every point on 32 GPUs was voided. The gap is now reported for the
+        consumer to weigh; the energy it can misstate is under 0.04%.
         """
         expected = build_expected_devices(_processes())
         end = START + 3600.0
@@ -309,39 +311,24 @@ class TestIndependenceFromTheManifestBooleans:
         assert report.failures == ()
         assert report.summary["max_sample_gap_seconds"] == pytest.approx(3.26)
 
-    def test_one_gap_past_the_hard_ceiling_is_rejected(self, package):
-        """A collector that stopped is not a late scrape, however short the outage.
+    def test_a_long_pause_is_reported_but_never_a_verdict(self, package):
+        """Gap size is metadata: a 60 s pause is surfaced, not judged here.
 
-        11 s is 0.3% of this window, well inside the over-long budget, so only
-        the hard ceiling can catch it.
+        The producer cannot tell a stalled exporter from a stalled head node,
+        so it records the largest gap and leaves the call to the consumer. A
+        collector that never resumed is still caught: it leaves no sample at or
+        after the window end, so the window is not bracketed.
         """
         expected = build_expected_devices(_processes())
         end = START + 3600.0
-        rows = _rows(expected, end=end, pauses=[(600.0, 11.0)])
+        rows = _rows(expected, end=end, pauses=[(600.0, 60.0)])
 
         log_dir, power_dir = package(rows=rows, end=end)
         report = _validate(power_dir, log_dir)
 
-        assert report.ok is False
-        assert any("sample_gap_exceeded" in failure for failure in report.failures)
-
-    def test_overlong_gaps_are_rejected_once_they_leave_the_budget(self, package):
-        """Individually tolerable gaps still add up to lost coverage.
-
-        Six 3.5 s gaps is 21 s of a 3600 s window, past the 0.5% budget, while
-        no single one reaches the hard ceiling.
-        """
-        expected = build_expected_devices(_processes())
-        end = START + 3600.0
-        rows = _rows(expected, end=end, pauses=[(300.0 * n, 3.5) for n in range(1, 7)])
-
-        log_dir, power_dir = package(rows=rows, end=end)
-        report = _validate(power_dir, log_dir)
-
-        assert report.ok is False
-        assert any("sample_gap_exceeded" in failure for failure in report.failures)
-        # No single gap reaches the hard ceiling: only the budget can reject this.
-        assert report.summary["max_sample_gap_seconds"] == pytest.approx(3.5)
+        assert report.ok is True
+        assert report.failures == ()
+        assert report.summary["max_sample_gap_seconds"] == pytest.approx(60.0)
 
     def test_reversed_short_window_is_rejected_end_to_end(self, package):
         log_dir, power_dir = package()
@@ -760,8 +747,10 @@ class TestEvidenceReconciliation:
         assert any("disk-derived reason_codes mismatch" in failure for failure in report.failures)
 
     def test_a_missing_disk_derived_reason_is_rejected(self, package):
+        # Samples stop before the window ends, so the disk implies
+        # measurement_window_not_bracketed while the manifest recorded no reason.
         expected = build_expected_devices(_processes())
-        log_dir, power_dir = package(rows=_rows(expected, step=4.0), publication_valid=False)
+        log_dir, power_dir = package(rows=_rows(expected, end=END - 5.0), publication_valid=False)
 
         report = _validate(power_dir, log_dir)
 

@@ -3068,9 +3068,9 @@ class SrtConfig:
         if telemetry.collect_interval_ms > _DCGM_POWER_MAX_SAMPLE_GAP_SECONDS * 1000:
             raise ValidationError(
                 f"telemetry.collect_interval_ms={telemetry.collect_interval_ms} exceeds the "
-                f"{_DCGM_POWER_MAX_SAMPLE_GAP_SECONDS}s max sample gap the power validator accepts; "
-                "every window would fail sample_gap_exceeded. Set it to the intended collector "
-                "period (e.g. 1000)."
+                f"{_DCGM_POWER_MAX_SAMPLE_GAP_SECONDS}s max sample gap the power audit interpolates "
+                "across; window boundaries farther than that from a sample are not integrated. "
+                "Set it to the intended collector period (e.g. 1000)."
             )
 
         if not _is_safe_relative_subpath(telemetry.storage_subdir):
@@ -3189,7 +3189,7 @@ class SrtConfig:
         if cpu_power.sample_interval_seconds > _CPU_POWER_MAX_SAMPLE_GAP_SECONDS:
             raise ValidationError(
                 f"telemetry.cpu_power.sample_interval_seconds={cpu_power.sample_interval_seconds} exceeds the "
-                f"{_CPU_POWER_MAX_SAMPLE_GAP_SECONDS}s max sample gap; every window would fail sample_gap_exceeded"
+                f"{_CPU_POWER_MAX_SAMPLE_GAP_SECONDS}s max sample gap the power audit interpolates across"
             )
 
         if not _is_safe_relative_subpath(cpu_power.storage_subdir):

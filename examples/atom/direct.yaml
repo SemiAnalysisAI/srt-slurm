@@ -1,0 +1,25 @@
+# One ATOM aggregate worker owns the public endpoint; no router is launched.
+# Configure visible_devices_env: ROCR_VISIBLE_DEVICES in srtslurm.yaml.
+schema: 2
+name: qwen3-0.6b-atom-direct
+model:
+  path: hf:Qwen/Qwen3-0.6B
+  container: rocm/atom:latest
+  precision: bf16
+resources:
+  gpu_type: mi300x
+  gpus_per_node: 8
+engine: atom
+frontend:
+  type: atom
+  enable_multiple_frontends: false
+roles:
+  agg:
+    nodes: 1
+    workers: 1
+    gpus: 1
+benchmark:
+  type: sa-bench
+  isl: 128
+  osl: 128
+  concurrencies: "4"

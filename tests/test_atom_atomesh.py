@@ -66,10 +66,10 @@ def test_atomesh_frontend_requires_atom_backend() -> None:
         _load(data)
 
 
-def test_atom_worker_requires_atomesh_frontend() -> None:
+def test_atom_worker_rejects_incompatible_frontend() -> None:
     process = Process("node0", frozenset(range(8)), 7500, 6100, "agg", 0)
 
-    with pytest.raises(ValueError, match="requires frontend.type: atomesh"):
+    with pytest.raises(ValueError, match="requires an ATOM frontend"):
         AtomProtocol().build_worker_command(process, [process], _runtime(), frontend_type="dynamo")
 
 

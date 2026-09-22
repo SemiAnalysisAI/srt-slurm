@@ -77,10 +77,10 @@ class TestProfilingConfig:
         assert "profile" in prefix
         assert "/output/test" in prefix
 
-        # Dynamo frontend requires trace-fork-before-exec, sglangrouter does not.
+        # Dynamo frontend requires trace-fork-before-exec, sglang-router does not.
         prefix_dynamo = profiling.get_nsys_prefix("/output/test", frontend_type="dynamo")
         assert "--trace-fork-before-exec=true" in prefix_dynamo
-        prefix_router = profiling.get_nsys_prefix("/output/test", frontend_type="sglangrouter")
+        prefix_router = profiling.get_nsys_prefix("/output/test", frontend_type="sglang-router")
         assert "--trace-fork-before-exec=true" not in prefix_router
 
     def test_nsys_profiling_with_extra_args(self):
@@ -194,8 +194,8 @@ class TestProfilingConfig:
         # Output file is the last token (-o <output>).
         assert prefix[-1] == "/out/w0"
 
-        # sglangrouter / non-dynamo frontend omits the fork flag.
-        prefix_router = profiling.get_nsys_prefix("/out/w0", frontend_type="sglangrouter", backend_type="vllm")
+        # sglang-router / non-dynamo frontend omits the fork flag.
+        prefix_router = profiling.get_nsys_prefix("/out/w0", frontend_type="sglang-router", backend_type="vllm")
         assert "--trace-fork-before-exec=true" not in prefix_router
 
     def test_nsys_binary_override(self, monkeypatch):
@@ -762,6 +762,7 @@ class TestProfilingTargetSelection:
     )
     def test_default_scope_captures_allocated_workers_and_ranks(self, monkeypatch, launch_mode, expected_ranks):
         """Legacy phase configs wrap every process and use every allocated system port."""
+        from pathlib import Path
         from types import SimpleNamespace
 
         from srtctl.backends.vllm import VLLMProtocol, VLLMServerConfig
@@ -802,7 +803,10 @@ class TestProfilingTargetSelection:
         stage.config = config
         stage._processes = backend.endpoints_to_processes(endpoints, base_sys_port=7500)
         stage.runtime = SimpleNamespace(
-            frontend_port=8000, network_interface="eth0", nodes=SimpleNamespace(head="head")
+            frontend_port=8000,
+            network_interface="eth0",
+            nodes=SimpleNamespace(head="head"),
+            container_log_dir=Path("/logs"),
         )
         monkeypatch.setattr(benchmark_stage, "get_hostname_ip", lambda node, _interface: f"{node}.test")
 
@@ -875,6 +879,7 @@ class TestProfilingTargetSelection:
         assert stage._profiling_selects_process(other)
 
     def test_dynamo_control_uses_selected_system_port(self, monkeypatch):
+        from pathlib import Path
         from types import SimpleNamespace
 
         from srtctl.cli.mixins import benchmark_stage
@@ -925,6 +930,7 @@ class TestProfilingTargetSelection:
             frontend_port=9000,
             network_interface="eth0",
             nodes=SimpleNamespace(head="head"),
+            container_log_dir=Path("/logs"),
         )
         monkeypatch.setattr(benchmark_stage, "get_hostname_ip", lambda node, _interface: f"{node}.test")
 

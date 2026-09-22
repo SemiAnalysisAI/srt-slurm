@@ -11,6 +11,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from srtctl.cli.mixins.worker_stage import WorkerStageMixin
+from srtctl.core.power.contract import CONTAINER_LOG_DIR
+from srtctl.core.runtime import Nodes, RuntimeContext
 from srtctl.core.schema import ObservabilityConfig, ResourceConfig
 from srtctl.core.slurm import get_slurm_het_nodelists, start_srun_process
 
@@ -179,12 +181,14 @@ def test_worker_stage_wraps_nonfatal_fingerprint_hook(tmp_path: Path) -> None:
     backend.get_environment_for_mode.return_value = {}
     backend.get_process_environment.return_value = {}
     backend.type = "vllm"
+    backend.failover = None
+    backend.mooncake_kv_store = None
 
     mixin = WorkerStageMixin()
     mixin.config = SimpleNamespace(
         setup_script="setup.sh",
         frontend=SimpleNamespace(type="sglang"),
-        dynamo=SimpleNamespace(install=False, request_plane="nats", event_plane="zmq"),
+        dynamo=SimpleNamespace(install=False, sidecar=False, request_plane="nats", event_plane="zmq"),
         observability=ObservabilityConfig(),
         profiling=SimpleNamespace(enabled=False, is_nsys=False),
         resources=ResourceConfig(),
@@ -200,6 +204,7 @@ def test_worker_stage_wraps_nonfatal_fingerprint_hook(tmp_path: Path) -> None:
         environment={},
         container_image=Path("/container.sqsh"),
         container_mounts={},
+        container_log_dir=Path("/logs"),
         srun_options=[],
     )
     process = SimpleNamespace(
@@ -210,6 +215,8 @@ def test_worker_stage_wraps_nonfatal_fingerprint_hook(tmp_path: Path) -> None:
         gpu_indices=list(range(8)),
         cuda_visible_devices="0,1,2,3,4,5,6,7",
         het_group=None,
+        trtllm_dist_init_port=29500,
+        sidecar_grpc_port=50051,
     )
 
     with (
@@ -235,6 +242,8 @@ def _remap_worker_mixin(tmp_path: Path, *, frontend_type: str, dynamo_install: b
     backend.build_worker_command.return_value = ["python3", "-m", "worker"]
     backend.get_environment_for_mode.return_value = {}
     backend.get_process_environment.return_value = {}
+    backend.failover = None
+    backend.mooncake_kv_store = None
 
     mixin = WorkerStageMixin()
     mixin.config = SimpleNamespace(
@@ -242,6 +251,7 @@ def _remap_worker_mixin(tmp_path: Path, *, frontend_type: str, dynamo_install: b
         frontend=SimpleNamespace(type=frontend_type),
         dynamo=SimpleNamespace(
             install=dynamo_install,
+            sidecar=False,
             get_install_commands=lambda: "echo install-dynamo",
             request_plane="nats",
             event_plane="zmq",
@@ -261,6 +271,7 @@ def _remap_worker_mixin(tmp_path: Path, *, frontend_type: str, dynamo_install: b
         environment={},
         container_image=Path("/container.sqsh"),
         container_mounts={},
+        container_log_dir=Path("/logs"),
         srun_options=[],
     )
     process = SimpleNamespace(
@@ -271,8 +282,83 @@ def _remap_worker_mixin(tmp_path: Path, *, frontend_type: str, dynamo_install: b
         gpu_indices=list(range(8)),
         cuda_visible_devices="0,1,2,3,4,5,6,7",
         het_group=None,
+        trtllm_dist_init_port=29500,
+        sidecar_grpc_port=50051,
     )
     return mixin, process
+
+
+@pytest.mark.parametrize("launch_method", ["start_worker", "start_endpoint_worker"])
+def test_worker_config_dump_uses_container_log_mount(tmp_path: Path, launch_method: str) -> None:
+    """Backend config dumps must use a path visible inside the worker container."""
+    mixin, process = _remap_worker_mixin(tmp_path, frontend_type="sglang", dynamo_install=False)
+    with (
+        patch("srtctl.cli.mixins.worker_stage.generate_capture_script", return_value="fingerprint || true"),
+        patch("srtctl.cli.mixins.worker_stage.start_srun_process", return_value=MagicMock()),
+    ):
+        if launch_method == "start_worker":
+            mixin.start_worker(process, [process])
+        else:
+            mixin.start_endpoint_worker([process])
+
+    assert mixin.backend.build_worker_command.call_args.kwargs["dump_config_path"] == Path("/logs/node-a_config.json")
+
+
+def test_runtime_container_log_dir_follows_the_log_mount(tmp_path: Path) -> None:
+    """The container-side log directory is the log mount, /logs by default."""
+
+    def runtime(mounts: dict[Path, Path]) -> RuntimeContext:
+        return RuntimeContext(
+            job_id="12345",
+            run_name="test-run",
+            nodes=Nodes(head="node0", bench="node0", infra="node0", worker=("node1",)),
+            head_node_ip="10.0.0.1",
+            infra_node_ip="10.0.0.1",
+            log_dir=tmp_path,
+            model_path=Path("/models/test"),
+            container_image=Path("/img.sqsh"),
+            gpus_per_node=8,
+            network_interface=None,
+            container_mounts=mounts,
+            environment={},
+        )
+
+    assert Path(CONTAINER_LOG_DIR) == Path("/logs")
+    assert runtime({tmp_path: Path("/logs")}).container_log_dir == Path("/logs")
+    assert runtime({tmp_path: Path("/run/logs")}).container_log_dir == Path("/run/logs")
+    assert runtime({}).container_log_dir == Path(CONTAINER_LOG_DIR)
+
+
+@pytest.mark.parametrize("launch_method", ["start_worker", "start_endpoint_worker"])
+def test_worker_container_paths_follow_a_remapped_log_mount(tmp_path: Path, launch_method: str) -> None:
+    """Config dump, profiler dir, and fingerprint paths all derive from runtime.container_log_dir."""
+    mixin, process = _remap_worker_mixin(tmp_path, frontend_type="sglang", dynamo_install=False)
+    mixin.runtime.container_log_dir = Path("/run/logs")
+    mixin.config.profiling = SimpleNamespace(
+        enabled=True,
+        is_nsys=False,
+        is_nsys_time=False,
+        type="torch",
+        get_env_vars=lambda mode, profile_dir: {"SGLANG_TORCH_PROFILER_DIR": f"{profile_dir}/{mode}"},
+    )
+    with (
+        patch(
+            "srtctl.cli.mixins.worker_stage.generate_capture_script",
+            side_effect=lambda path: f"fingerprint {path}",
+        ) as capture,
+        patch("srtctl.cli.mixins.worker_stage.start_srun_process", return_value=MagicMock()) as srun,
+    ):
+        if launch_method == "start_worker":
+            mixin.start_worker(process, [process])
+        else:
+            mixin.start_endpoint_worker([process])
+
+    dump_path = mixin.backend.build_worker_command.call_args.kwargs["dump_config_path"]
+    assert dump_path == Path("/run/logs/node-a_config.json")
+    assert srun.call_args.kwargs["env_to_set"]["SGLANG_TORCH_PROFILER_DIR"] == "/run/logs/profiles/prefill"
+    assert capture.call_args.args[0] == "/run/logs/fingerprint_prefill_w0.json"
+    # srtctl still creates the profile directory on the host side of the mount.
+    assert (tmp_path / "profiles" / "prefill").is_dir()
 
 
 def test_worker_stage_injects_remap_root_for_dynamo_install(tmp_path: Path) -> None:
@@ -581,12 +667,14 @@ def test_worker_stage_unsets_vllm_port_for_multinode_endpoint(tmp_path: Path) ->
     backend.build_worker_command.return_value = ["python3", "-m", "worker"]
     backend.get_environment_for_mode.return_value = {}
     backend.get_process_environment.return_value = {}
+    backend.failover = None
+    backend.mooncake_kv_store = None
 
     mixin = WorkerStageMixin()
     mixin.config = SimpleNamespace(
         setup_script=None,
         frontend=SimpleNamespace(type="sglang"),
-        dynamo=SimpleNamespace(install=False, request_plane="nats", event_plane=None),
+        dynamo=SimpleNamespace(install=False, sidecar=False, request_plane="nats", event_plane=None),
         observability=ObservabilityConfig(),
         profiling=SimpleNamespace(enabled=False, is_nsys=False),
         resources=ResourceConfig(),
@@ -602,6 +690,7 @@ def test_worker_stage_unsets_vllm_port_for_multinode_endpoint(tmp_path: Path) ->
         environment={},
         container_image=Path("/container.sqsh"),
         container_mounts={},
+        container_log_dir=Path("/logs"),
         srun_options=[],
     )
     process = SimpleNamespace(
@@ -612,6 +701,8 @@ def test_worker_stage_unsets_vllm_port_for_multinode_endpoint(tmp_path: Path) ->
         gpu_indices=list(range(8)),
         cuda_visible_devices="0,1,2,3,4,5,6,7",
         het_group=None,
+        trtllm_dist_init_port=29500,
+        sidecar_grpc_port=50051,
     )
     peer_process = SimpleNamespace(node="node-b")
 
@@ -630,7 +721,6 @@ def test_endpoint_launch_partial_nodes(tmp_path: Path, worker: int) -> None:
     import os
 
     from srtctl.backends.trtllm import TRTLLMProtocol
-    from srtctl.core.topology import endpoints_to_processes
 
     mixin, _ = _remap_worker_mixin(tmp_path, frontend_type="trtllm_serve", dynamo_install=False)
     mixin.runtime.gpus_per_node = 4
@@ -652,7 +742,7 @@ def test_endpoint_launch_partial_nodes(tmp_path: Path, worker: int) -> None:
         gpus_per_node=4,
         available_nodes=("node0", "node1", "node2"),
     )
-    processes = endpoints_to_processes([endpoints[worker]])
+    processes = TRTLLMProtocol().endpoints_to_processes([endpoints[worker]])
     with (
         patch.dict("os.environ", {"SLURM_NTASKS_PER_NODE": "4"}),
         patch("srtctl.cli.mixins.worker_stage.generate_capture_script", return_value="true"),
@@ -691,7 +781,6 @@ def test_endpoint_launch_partial_nodes(tmp_path: Path, worker: int) -> None:
 @pytest.mark.parametrize("override", [False, True])
 def test_trtllm_endpoint_rendezvous_is_unique_and_preserves_overrides(tmp_path: Path, override: bool) -> None:
     from srtctl.backends.trtllm import TRTLLMProtocol
-    from srtctl.core.topology import endpoints_to_processes
 
     mixin, _ = _remap_worker_mixin(tmp_path, frontend_type="trtllm_serve", dynamo_install=False)
     mixin.backend.type = "trtllm"
@@ -707,7 +796,7 @@ def test_trtllm_endpoint_rendezvous_is_unique_and_preserves_overrides(tmp_path: 
         gpus_per_node=4,
         available_nodes=("node0",),
     )
-    processes = endpoints_to_processes(endpoints)
+    processes = TRTLLMProtocol().endpoints_to_processes(endpoints)
     with (
         patch("srtctl.cli.mixins.worker_stage.generate_capture_script", return_value="true"),
         patch("srtctl.cli.mixins.worker_stage.get_hostname_ip", return_value="10.0.0.1"),

@@ -20,7 +20,6 @@ from srtctl.core.observability_nsys import wrap_observability_nsys
 from srtctl.core.processes import ManagedProcess, NamedProcesses
 from srtctl.core.schema import build_otel_env, installs_dynamo
 from srtctl.core.slurm import CONTAINER_REMAP_ROOT_EXPORT, get_hostname_ip, start_srun_process
-from srtctl.ports import DYN_SYSTEM_PORT_BASE, KV_EVENTS_PORT_BASE, KVBM_ZMQ_PORT_BASE, TRTLLM_DIST_INIT_PORT_BASE
 from srtctl.services.implicit import discovery_env
 
 if TYPE_CHECKING:
@@ -77,7 +76,7 @@ class WorkerStageMixin:
         )
         if local_config is not None:
             filename, payload = local_config
-            environment["MOONCAKE_CONFIG_PATH"] = f"/logs/{filename}"
+            environment["MOONCAKE_CONFIG_PATH"] = str(self.runtime.container_log_dir / filename)
             logger.info(
                 "Mooncake process config: node=%s physical_gpus=%s device_name=%s path=%s",
                 process.node,
@@ -93,9 +92,8 @@ class WorkerStageMixin:
 
     @property
     def failover(self) -> "VLLMFailoverConfig | None":
-        """``backend.failover`` when this is a vLLM job with shadow engine recovery, else None."""
-        backend = self.backend
-        return backend.failover if isinstance(backend, VLLMProtocol) else None
+        """``backend.failover`` when the engine runs shadow engine recovery, else None."""
+        return self.backend.failover
 
     @property
     def backend_processes(self) -> list["Process"]:
@@ -159,24 +157,20 @@ class WorkerStageMixin:
             leader_host = get_hostname_ip(leader.node, self.runtime.network_interface)
             env_to_set.setdefault("DYN_KVBM_LEADER_ZMQ_HOST", leader_host)
 
-        if leader.kv_events_port is None:
+        if leader.kvbm_zmq_port is None:
             return
 
-        port_offset = max(0, leader.kv_events_port - KV_EVENTS_PORT_BASE)
-        pub_port = KVBM_ZMQ_PORT_BASE + (port_offset * 2)
-        ack_port = pub_port + 1
-        if ack_port <= 65535:
-            env_to_set.setdefault("DYN_KVBM_LEADER_ZMQ_PUB_PORT", str(pub_port))
-            env_to_set.setdefault("DYN_KVBM_LEADER_ZMQ_ACK_PORT", str(ack_port))
+        env_to_set.setdefault("DYN_KVBM_LEADER_ZMQ_PUB_PORT", str(leader.kvbm_zmq_port))
+        env_to_set.setdefault("DYN_KVBM_LEADER_ZMQ_ACK_PORT", str(leader.kvbm_zmq_port + 1))
 
     def _get_worker_environment_for_mode(self, mode: str) -> dict[str, str]:
         """Return mode environment with engine-specific defaults the recipe can override."""
         environment = self.backend.get_environment_for_mode(mode)
-        if getattr(self.config.dynamo, "sidecar", False) is True and self.backend.type == "vllm":
+        if self.config.dynamo.sidecar and self.backend.type == "vllm":
             # Installed plugins may replace native engine output types and
             # break the fixed Rust/Python MessagePack contract used by vllm-rs.
             environment.setdefault("VLLM_PLUGINS", "")
-        if getattr(self.config.dynamo, "sidecar", False) is True and self.backend.type == "sglang":
+        if self.config.dynamo.sidecar and self.backend.type == "sglang":
             # The sidecar talks to SGLang's native gRPC server, a prebuilt Rust extension. In
             # images that run SGLang from a source checkout (the nightlies), the extension
             # loader's default "auto" mode ignores the bundled .so and tries to rebuild it
@@ -229,7 +223,7 @@ class WorkerStageMixin:
 
         # Log and config files
         worker_log = self.runtime.log_dir / f"{process.node}_{mode}_w{index}{suffix}.out"
-        config_dump = self.runtime.log_dir / f"{process.node}_config{suffix}.json"
+        config_dump = self.runtime.container_log_dir / f"{process.node}_config{suffix}.json"
 
         # Profiling setup
         profiling = self.config.profiling
@@ -239,7 +233,10 @@ class WorkerStageMixin:
             (self.runtime.log_dir / "profiles" / mode).mkdir(parents=True, exist_ok=True)
         if profiling.is_nsys and profiling_selects_process:
             gpu_label = process.cuda_visible_devices.replace(",", "-")
-            nsys_output = f"/logs/profiles/{mode}/{process.node}_{mode}_w{index}{suffix}_profile_gpu{gpu_label}"
+            nsys_output = (
+                f"{self.runtime.container_log_dir}/profiles/{mode}/"
+                f"{process.node}_{mode}_w{index}{suffix}_profile_gpu{gpu_label}"
+            )
             nsys_prefix = profiling.get_nsys_prefix(
                 nsys_output, frontend_type=self.config.frontend.type, backend_type=self.config.backend_type
             )
@@ -303,8 +300,8 @@ class WorkerStageMixin:
             formatted_value = value.format_map(SafeDict(template_vars))
             env_to_set[key] = formatted_value
 
-        should_set_cvd = getattr(self.backend, "should_set_cuda_visible_devices", lambda _process: True)
-        force_cvd = getattr(self.config.dynamo, "sidecar", False) is True and self.backend.type == "vllm"
+        should_set_cvd = self.backend.should_set_cuda_visible_devices
+        force_cvd = self.config.dynamo.sidecar and self.backend.type == "vllm"
         # Failover engines share their device list with the GMS sidecar (see start_gms_sidecar).
         force_cvd = force_cvd or failover is not None
         if (force_cvd or should_set_cvd(process)) and len(process.gpu_indices) < self.runtime.gpus_per_node:
@@ -315,10 +312,10 @@ class WorkerStageMixin:
         if failover is not None:
             env_to_set.update(self.backend.get_failover_environment(process, self.runtime.job_id))
 
-        # Add mooncake worker env vars if configured (SGLang only). Resolve the
-        # worker's own IP so MOONCAKE_LOCAL_HOSTNAME is correct for multi-node
-        # peer-to-peer transfers (defaulting to "localhost" silently breaks them).
-        if hasattr(self.backend, "get_mooncake_worker_env"):
+        # Add mooncake worker env vars if configured. Resolve the worker's own IP
+        # so MOONCAKE_LOCAL_HOSTNAME is correct for multi-node peer-to-peer
+        # transfers (defaulting to "localhost" silently breaks them).
+        if self.backend.mooncake_kv_store is not None:
             # A MOONCAKE_LOCAL_HOSTNAME already in the worker env (roles.*.env) pins a NIC; otherwise the node IP.
             local_hostname = env_to_set.get("MOONCAKE_LOCAL_HOSTNAME") or get_hostname_ip(
                 process.node, self.runtime.network_interface
@@ -329,7 +326,7 @@ class WorkerStageMixin:
 
         # Add profiling environment variables last.
         if profiling.enabled and profiling_selects_process:
-            profile_dir = str(self.runtime.log_dir / "profiles")
+            profile_dir = str(self.runtime.container_log_dir / "profiles")
             env_to_set.update(profiling.get_env_vars(mode, profile_dir))
 
         self._apply_kvbm_endpoint_env(env_to_set, endpoint_processes)
@@ -349,7 +346,7 @@ class WorkerStageMixin:
                 bash_preamble,
                 _nsys_library_path_preamble(profiling.nsys_library_paths),
             )
-        fp_cmd = generate_capture_script(f"/logs/fingerprint_{mode}_w{index}{suffix}.json")
+        fp_cmd = generate_capture_script(f"{self.runtime.container_log_dir}/fingerprint_{mode}_w{index}{suffix}.json")
         # Keep fingerprint failures non-fatal, but do not let its `|| true`
         # mask failures from setup/dynamo install commands before it.
         fp_cmd = f"( {fp_cmd} )"
@@ -441,7 +438,7 @@ class WorkerStageMixin:
 
         # Log and config files (use leader node in name)
         worker_log = self.runtime.log_dir / f"{leader.node}_{mode}_w{index}.out"
-        config_dump = self.runtime.log_dir / f"{leader.node}_config.json"
+        config_dump = self.runtime.container_log_dir / f"{leader.node}_config.json"
 
         # Profiling setup
         profiling = self.config.profiling
@@ -450,7 +447,10 @@ class WorkerStageMixin:
         if profiling.enabled:
             (self.runtime.log_dir / "profiles" / mode).mkdir(parents=True, exist_ok=True)
         if profiling.is_nsys and profiling_selects_process:
-            nsys_output = f"/logs/profiles/{mode}/{leader.node}_{mode}_w{index}_profile_rank%q{{SLURM_PROCID}}"
+            nsys_output = (
+                f"{self.runtime.container_log_dir}/profiles/{mode}/"
+                f"{leader.node}_{mode}_w{index}_profile_rank%q{{SLURM_PROCID}}"
+            )
             nsys_prefix = profiling.get_nsys_prefix(
                 nsys_output, frontend_type=self.config.frontend.type, backend_type=self.config.backend_type
             )
@@ -500,13 +500,11 @@ class WorkerStageMixin:
         # Add config environment variables
         env_to_set.update(self.runtime.environment)
 
-        if self.backend.type == "trtllm":
+        if self.backend.type == "trtllm" and leader.trtllm_dist_init_port is not None:
             # Enroot may infer rank 0 from the sorted step nodelist, which
             # differs from our rank order for workers sharing a partial node.
             env_to_set.setdefault("MASTER_ADDR", get_hostname_ip(leader.node, self.runtime.network_interface))
-            env_to_set.setdefault(
-                "MASTER_PORT", str(TRTLLM_DIST_INIT_PORT_BASE + leader.sys_port - DYN_SYSTEM_PORT_BASE)
-            )
+            env_to_set.setdefault("MASTER_PORT", str(leader.trtllm_dist_init_port))
 
         # Native TRT-LLM KV-event subscribers need routable publisher hosts for
         # multi-node endpoints.  Dynamo can otherwise fall back to
@@ -520,8 +518,8 @@ class WorkerStageMixin:
         ):
             env_to_set.setdefault("DYN_TRTLLM_KV_EVENT_HOSTS", ",".join(endpoint_nodes))
 
-        should_set_cvd = getattr(self.backend, "should_set_cuda_visible_devices", lambda _process: True)
-        force_cvd = getattr(self.config.dynamo, "sidecar", False) is True and self.backend.type == "vllm"
+        should_set_cvd = self.backend.should_set_cuda_visible_devices
+        force_cvd = self.config.dynamo.sidecar and self.backend.type == "vllm"
         node_gpu_setup = ""
         if force_cvd or should_set_cvd(leader):
             if any(p.gpu_indices != leader.gpu_indices for p in endpoint_processes):
@@ -533,11 +531,11 @@ class WorkerStageMixin:
             elif len(leader.gpu_indices) < self.runtime.gpus_per_node:
                 env_to_set["CUDA_VISIBLE_DEVICES"] = leader.cuda_visible_devices
 
-        # Add mooncake worker env vars if configured (SGLang only). For MPI-style
-        # endpoint launching we use the leader node's IP — mooncake's per-worker
-        # hostname is fundamentally per-process, but TRTLLM-style launching uses
-        # one srun for the whole endpoint, so leader IP is the best we can do.
-        if hasattr(self.backend, "get_mooncake_worker_env"):
+        # Add mooncake worker env vars if configured. For MPI-style endpoint
+        # launching we use the leader node's IP: mooncake's per-worker hostname
+        # is fundamentally per-process, but TRTLLM-style launching uses one srun
+        # for the whole endpoint, so leader IP is the best we can do.
+        if self.backend.mooncake_kv_store is not None:
             local_hostname = env_to_set.get("MOONCAKE_LOCAL_HOSTNAME") or get_hostname_ip(
                 leader.node, self.runtime.network_interface
             )
@@ -545,7 +543,7 @@ class WorkerStageMixin:
 
         # Add profiling environment variables after the worker environment.
         if profiling.enabled and profiling_selects_process:
-            profile_dir = str(self.runtime.log_dir / "profiles")
+            profile_dir = str(self.runtime.container_log_dir / "profiles")
             env_to_set.update(profiling.get_env_vars(mode, profile_dir))
 
         self._apply_kvbm_endpoint_env(env_to_set, endpoint_processes)
@@ -565,7 +563,7 @@ class WorkerStageMixin:
                 bash_preamble,
                 _nsys_library_path_preamble(profiling.nsys_library_paths),
             )
-        fp_cmd = generate_capture_script(f"/logs/fingerprint_{mode}_w{index}.json")
+        fp_cmd = generate_capture_script(f"{self.runtime.container_log_dir}/fingerprint_{mode}_w{index}.json")
         # Keep fingerprint failures non-fatal, but do not let its `|| true`
         # mask failures from setup/dynamo install commands before it.
         fp_cmd = f"( {fp_cmd} )"
@@ -585,7 +583,7 @@ class WorkerStageMixin:
 
         # Get srun config from backend
         srun_config = self.backend.get_srun_config()
-        if self.backend.type == "trtllm" and getattr(self.config.dynamo, "sidecar", False) is True:
+        if self.backend.type == "trtllm" and self.config.dynamo.sidecar:
             # The sidecar runs only on rank zero. Make any follower-rank exit
             # terminate the full endpoint step instead of leaving rank zero up.
             srun_options["kill-on-bad-exit"] = "1"
@@ -637,12 +635,13 @@ class WorkerStageMixin:
         and exposes GET /health → 200 {"status":"ready"} once the model is loaded and the
         NATS/TCP request endpoint is registered.
         """
-        health_cfg = self.config.health_check
-        frontend_type = self.config.frontend.type
+        from srtctl.frontends import get_frontend
 
-        # dynamo.trtllm: DYN_SYSTEM_PORT is set to sys_port in start_endpoint_worker,
-        # which enables the per-worker axum HTTP server on that same port.
-        port = leader.http_port if frontend_type == "trtllm_serve" else leader.sys_port
+        health_cfg = self.config.health_check
+        # The frontend knows which port a worker reports its own health on:
+        # trtllm-serve's OpenAI port, or DYN_SYSTEM_PORT (set to sys_port in
+        # start_endpoint_worker) where the Dynamo runtime serves /health.
+        port = get_frontend(self.config.frontend.type).worker_ready_port(leader)
 
         logger.info(
             "Sequential node start: waiting for worker %s:%d to be ready",
@@ -674,7 +673,7 @@ class WorkerStageMixin:
 
         if launch_per_endpoint:
             # MPI-style: one srun per endpoint (TRTLLM)
-            concurrency = int(getattr(self.backend, "sequential_node_start", 0))
+            concurrency = srun_config.sequential_node_start
             if concurrency:
                 # Group endpoints by leader node; start in batches within each node
                 # so that model loading on a shared node doesn't cause resource contention.

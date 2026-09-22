@@ -14,21 +14,24 @@ the context (prefill) and generation (decode) server URLs.
 import logging
 import shlex
 import threading
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
 import yaml
 
-from srtctl.core.health import WorkerHealthResult, check_trtllm_serve_health, wait_for_health
+from srtctl.core.health import WorkerHealthResult, probe_http_ok, wait_for_health
 from srtctl.core.slurm import get_hostname_ip, start_srun_process
+from srtctl.frontends.base import frontend_args_to_cli, logical_health_expectations, register_frontend
 
 if TYPE_CHECKING:
     from srtctl.core.processes import ManagedProcess
     from srtctl.core.runtime import RuntimeContext
     from srtctl.core.topology import Process
+    from srtctl.services.implicit import EffectiveService
 
 logger = logging.getLogger(__name__)
 
 
+@register_frontend("trtllm_serve")
 class TRTLLMServeFrontend:
     """Direct aggregate or disaggregated trtllm-serve frontend.
 
@@ -37,22 +40,67 @@ class TRTLLMServeFrontend:
     ser.yaml` on the head node. Health is exposed at /health in both modes.
     """
 
+    required_backend: ClassVar[str | None] = "trtllm"
+    worker_launch: ClassVar[Literal["dynamo", "direct"]] = "direct"
+    expands_node_local_dp: ClassVar[bool] = False
+
     @property
     def type(self) -> str:
         return "trtllm_serve"
 
-    @property
-    def health_endpoint(self) -> str:
-        return "/health"
+    def worker_api_port(self, mode: str) -> Literal["public", "allocated"]:
+        """The aggregate worker is the endpoint; P/D workers sit behind the disaggregated orchestrator."""
+        return "public" if mode == "agg" else "allocated"
 
-    def parse_health(
-        self,
-        response_json: dict,
-        expected_prefill: int,
-        expected_decode: int,
+    # trtllm-serve (worker and disaggregated orchestrator alike) serves Prometheus
+    # text at /prometheus/metrics; GET /metrics on a worker is JSON iteration stats.
+    metrics_path: ClassVar[str] = "/prometheus/metrics"
+
+    def worker_metrics_port(self, process: "Process", runtime: "RuntimeContext") -> int | None:
+        """P/D leaders serve Prometheus on their OpenAI port; followers bind nothing. Aggregate is out of scope."""
+        if process.endpoint_mode == "agg" or process.http_port <= 0:
+            return None
+        return process.http_port
+
+    def worker_endpoint_port(self, process: "Process", config: Any, runtime: "RuntimeContext") -> int | None:
+        if not process.is_leader:
+            return None
+        port = runtime.frontend_port if self.worker_api_port(process.endpoint_mode) == "public" else process.http_port
+        return port if port > 0 else None
+
+    def profiling_control_port(self, process: "Process", config: Any, runtime: "RuntimeContext") -> int | None:
+        return self.worker_endpoint_port(process, config, runtime)
+
+    def profiling_control_is_leader_only(self, config: Any) -> bool:
+        return False
+
+    def direct_endpoint_nodes(self, processes: list["Process"]) -> list[str]:
+        return []
+
+    def worker_ready_port(self, process: "Process") -> int:
+        """A trtllm-serve worker reports /health on its own OpenAI port."""
+        return process.http_port
+
+    def probe_ready(
+        self, host: str, port: int, expected_prefill: int, expected_decode: int, config: Any
     ) -> WorkerHealthResult:
-        """Parse trtllm-serve /health response (200 => ready)."""
-        return check_trtllm_serve_health(response_json, expected_prefill, expected_decode)
+        """A 200 from /health is ready: the body may be empty, and every worker was gated before the orchestrator started."""
+        return probe_http_ok(host, port, "/health", f"trtllm-serve frontend healthy at http://{host}:{port}/health")
+
+    def health_expectations(self, config: Any, processes: list["Process"] | None) -> tuple[int, int, str]:
+        return logical_health_expectations(config)
+
+    def validate(self, config: Any) -> None:
+        """One direct aggregate worker or one disaggregated orchestrator; either way one public endpoint."""
+        if config.frontend.enable_multiple_frontends:
+            raise ValueError(
+                "frontend.type: trtllm_serve uses one public endpoint; set frontend.enable_multiple_frontends: false"
+            )
+        if not config.resources.is_disaggregated and config.resources.num_agg != 1:
+            raise ValueError(
+                "frontend.type: trtllm_serve aggregate mode requires exactly one "
+                "aggregate worker (set resources.agg_workers: 1)"
+            )
 
     def get_backend_health_urls(
         self,
@@ -60,20 +108,13 @@ class TRTLLMServeFrontend:
         backend_processes: list["Process"],
         network_interface: str | None = None,
     ) -> list[str]:
-        del backend, backend_processes, network_interface
         return []
 
-    def get_frontend_args_list(self, args: dict[str, Any] | None) -> list[str]:
-        """Convert frontend args dict to CLI arguments."""
-        if not args:
-            return []
-        result = []
-        for key, value in args.items():
-            if value is True:
-                result.append(f"--{key}")
-            elif value is not False and value is not None:
-                result.extend([f"--{key}", str(value)])
-        return result
+    def implied_services(self, config: Any) -> list["EffectiveService"]:
+        return []
+
+    def frontend_metrics_port(self, frontend_args: dict[str, Any] | None) -> int | None:
+        return None
 
     @staticmethod
     def _build_ser(config: Any, prefill_urls: list[str], decode_urls: list[str], port: int) -> dict[str, Any]:
@@ -180,7 +221,7 @@ class TRTLLMServeFrontend:
         container_ser_path = "/logs/ser.yaml"
 
         cmd = ["trtllm-serve", "disaggregated", "--config", container_ser_path]
-        cmd.extend(self.get_frontend_args_list(config.frontend.args))
+        cmd.extend(frontend_args_to_cli(config.frontend.args))
         logger.info("Orchestrator command: %s", shlex.join(cmd))
 
         env_to_set: dict[str, str] = {}

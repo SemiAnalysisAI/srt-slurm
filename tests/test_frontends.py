@@ -12,7 +12,15 @@ import pytest
 import yaml
 
 from srtctl.core.schema import ObservabilityConfig
-from srtctl.frontends import DynamoFrontend, SGLangFrontend, SGLangRouterFrontend, VLLMFrontend, get_frontend
+from srtctl.frontends import (
+    DynamoFrontend,
+    SGLangFrontend,
+    SGLangRouterFrontend,
+    VLLMFrontend,
+    get_frontend,
+    list_frontend_types,
+    register_frontend,
+)
 
 # ============================================================================
 # get_frontend() Tests
@@ -53,6 +61,180 @@ class TestGetFrontend:
             get_frontend("invalid")
 
 
+class TestFrontendRegistry:
+    """frontend.type resolves through the registry and nowhere else."""
+
+    def test_registry_lists_every_frontend_type(self):
+        assert list_frontend_types() == [
+            "dynamo",
+            "none",
+            "sglang",
+            "sglang-router",
+            "trtllm_serve",
+            "vllm",
+            "vllm-router",
+        ]
+        for name in list_frontend_types():
+            if name == "none":
+                continue
+            frontend = get_frontend(name)
+            assert frontend.type == name
+            assert hasattr(frontend, "required_backend")
+            assert callable(frontend.validate)
+
+    @pytest.mark.parametrize(
+        ("frontend_type", "launch", "agg_port", "pd_port", "expands"),
+        [
+            ("dynamo", "dynamo", "allocated", "allocated", False),
+            ("sglang", "direct", "public", "public", False),
+            ("sglang-router", "direct", "allocated", "allocated", False),
+            ("trtllm_serve", "direct", "public", "allocated", False),
+            ("vllm", "direct", "public", "public", False),
+            ("vllm-router", "direct", "allocated", "allocated", True),
+        ],
+    )
+    def test_worker_shape_contract(self, frontend_type, launch, agg_port, pd_port, expands):
+        """Backends read these instead of comparing frontend names."""
+        frontend = get_frontend(frontend_type)
+        assert frontend.worker_launch == launch
+        assert frontend.worker_api_port("agg") == agg_port
+        assert frontend.worker_api_port("prefill") == pd_port
+        assert frontend.worker_api_port("decode") == pd_port
+        assert frontend.expands_node_local_dp is expands
+
+    @pytest.mark.parametrize(
+        ("frontend_type", "metrics_path", "metrics", "endpoint", "direct_nodes", "ready"),
+        [
+            # metrics/endpoint: ports for (agg leader, agg follower, routed decode pool, prefill leader)
+            ("dynamo", "/metrics", (7500, 7501, 7501, 7502), (7500, None, None, 7502), [], 7500),
+            ("vllm", "/metrics", (8000, None, None, None), (8000, None, None, 8000), ["n0"], 7500),
+            ("sglang", "/metrics", (8000, None, None, None), (8000, None, None, 8000), ["n0"], 7500),
+            ("sglang-router", "/metrics", (6100, None, None, 6100), (6100, None, None, 6100), [], 7500),
+            ("vllm-router", "/metrics", (6100, None, 6132, 6100), (6100, None, 6132, 6100), [], 7500),
+            ("trtllm_serve", "/prometheus/metrics", (None, None, 6132, 6100), (8000, None, None, 6100), [], 6100),
+        ],
+    )
+    def test_worker_port_contract(self, frontend_type, metrics_path, metrics, endpoint, direct_nodes, ready):
+        """Telemetry, the benchmark env, and sequential start read these instead of comparing names."""
+        from srtctl.core.topology import Process
+
+        agg_leader = Process("n0", frozenset({0}), 7500, 6100, "agg", 0, node_rank=0)
+        agg_follower = Process("n1", frozenset({0}), 7501, 0, "agg", 0, node_rank=1)
+        routed_pool = Process("n1", frozenset({0}), 7501, 6132, "decode", 0, node_rank=1)
+        prefill_leader = Process("n2", frozenset({0}), 7502, 6100, "prefill", 0, node_rank=0)
+        processes = [agg_leader, agg_follower, routed_pool, prefill_leader]
+        runtime = SimpleNamespace(frontend_port=8000, network_interface=None)
+        config = SimpleNamespace(dynamo=SimpleNamespace(sidecar=False))
+
+        frontend = get_frontend(frontend_type)
+        assert frontend.metrics_path == metrics_path
+        assert tuple(frontend.worker_metrics_port(p, runtime) for p in processes) == metrics
+        assert tuple(frontend.worker_endpoint_port(p, config, runtime) for p in processes) == endpoint
+        assert frontend.direct_endpoint_nodes(processes) == direct_nodes
+        assert frontend.worker_ready_port(agg_leader) == ready
+        assert isinstance(frontend.profiling_control_is_leader_only(config), bool)
+
+    def test_dynamo_sidecar_moves_the_endpoint_to_the_engine_port(self):
+        from srtctl.core.topology import Process
+
+        leader = Process("n0", frozenset({0}), 7500, 6100, "agg", 0, node_rank=0)
+        runtime = SimpleNamespace(frontend_port=8000, network_interface=None)
+        dynamo = get_frontend("dynamo")
+        assert (
+            dynamo.worker_endpoint_port(leader, SimpleNamespace(dynamo=SimpleNamespace(sidecar=True)), runtime) == 6100
+        )
+        assert dynamo.profiling_control_is_leader_only(SimpleNamespace(dynamo=SimpleNamespace(sidecar=True))) is True
+        assert dynamo.profiling_control_is_leader_only(SimpleNamespace(dynamo=SimpleNamespace(sidecar=False))) is False
+
+    def test_dynamic_frontend_base_carries_the_registration_defaults(self, monkeypatch):
+        """Dynamo is a DynamicFrontend; a future registration-based frontend inherits the same defaults."""
+        from srtctl.frontends import DynamicFrontend, base
+
+        assert isinstance(get_frontend("dynamo"), DynamicFrontend)
+        monkeypatch.setattr(base, "_FRONTENDS", dict(base._FRONTENDS))
+
+        @register_frontend("toy-discovery")
+        class ToyDiscovery(DynamicFrontend):
+            type = "toy-discovery"
+            worker_launch = "direct"
+
+        toy = get_frontend("toy-discovery")
+        assert isinstance(toy, ToyDiscovery)
+        assert toy.required_backend is None
+        assert toy.health_endpoint == "/health"
+        assert toy.metrics_path == "/metrics"
+        assert toy.expands_node_local_dp is False
+        assert toy.worker_api_port("prefill") == "allocated"
+        assert toy.get_backend_health_urls(None, [], None) == []
+        assert toy.direct_endpoint_nodes([]) == []
+        assert toy.get_frontend_args_list({"router_mode": "kv", "flag": True, "off": False}) == [
+            "--router_mode",
+            "kv",
+            "--flag",
+        ]
+        toy.validate(SimpleNamespace())
+
+    def test_register_frontend_makes_a_type_resolvable(self, monkeypatch):
+        from srtctl.frontends import base
+
+        monkeypatch.setattr(base, "_FRONTENDS", dict(base._FRONTENDS))
+
+        @register_frontend("toy-router")
+        class ToyRouter:
+            required_backend = "vllm"
+            worker_launch = "direct"
+            expands_node_local_dp = False
+
+            @property
+            def type(self) -> str:
+                return "toy-router"
+
+            def validate(self, config) -> None:
+                del config
+
+            def worker_api_port(self, mode: str) -> str:
+                del mode
+                return "allocated"
+
+        assert isinstance(get_frontend("toy-router"), ToyRouter)
+        assert "toy-router" in list_frontend_types()
+
+    def test_schema_rejects_unknown_type_at_load(self):
+        from marshmallow import ValidationError
+
+        from srtctl.backends import SGLangProtocol
+        from srtctl.core.schema import FrontendConfig, ResourceConfig, SrtConfig
+
+        with pytest.raises(ValidationError, match="Unknown frontend.type 'toy-router'.*Available: dynamo, none"):
+            SrtConfig(
+                name="toy",
+                model={"path": "model", "container": "image", "precision": "fp8"},
+                resources=ResourceConfig(gpu_type="h100", gpus_per_node=8, agg_nodes=1, agg_workers=1),
+                frontend=FrontendConfig(type="toy-router", enable_multiple_frontends=False),
+                backend=SGLangProtocol(),
+            )
+
+    @pytest.mark.parametrize(
+        ("frontend_type", "required"),
+        [("sglang", "sglang"), ("sglang-router", "sglang"), ("vllm", "vllm"), ("vllm-router", "vllm")],
+    )
+    def test_schema_enforces_required_backend_generically(self, frontend_type, required):
+        from marshmallow import ValidationError
+
+        from srtctl.backends import TRTLLMProtocol
+        from srtctl.core.schema import FrontendConfig, ResourceConfig, SrtConfig
+
+        assert get_frontend(frontend_type).required_backend == required
+        with pytest.raises(ValidationError, match=f"frontend.type: {frontend_type} requires backend.type: {required}"):
+            SrtConfig(
+                name="pairing",
+                model={"path": "model", "container": "image", "precision": "fp8"},
+                resources=ResourceConfig(gpu_type="h100", gpus_per_node=8, agg_nodes=1, agg_workers=1),
+                frontend=FrontendConfig(type=frontend_type, enable_multiple_frontends=False),
+                backend=TRTLLMProtocol(),
+            )
+
+
 # ============================================================================
 # Frontend Properties Tests
 # ============================================================================
@@ -86,10 +268,30 @@ class TestFrontendProperties:
         frontend = SGLangRouterFrontend()
         assert frontend.health_endpoint == "/workers"
 
-    def test_vllm_health_endpoint(self):
-        """VLLMFrontend uses /health endpoint."""
-        frontend = VLLMFrontend()
-        assert frontend.health_endpoint == "/health"
+    def test_frontend_metrics_port_and_implied_services(self):
+        """Only the SGLang gateway runs a separate metrics listener; only Dynamo brings a discovery plane."""
+        from types import SimpleNamespace
+
+        from srtctl.ports import SGLANG_ROUTER_METRICS_PORT
+
+        gateway = SGLangRouterFrontend()
+        assert gateway.frontend_metrics_port(None) == SGLANG_ROUTER_METRICS_PORT
+        assert gateway.frontend_metrics_port({"prometheus-port": 31000}) == 31000
+        for frontend_type in ("dynamo", "vllm", "sglang", "trtllm_serve", "vllm-router"):
+            assert get_frontend(frontend_type).frontend_metrics_port({"prometheus-port": 31000}) is None
+
+        dynamo_config = SimpleNamespace(
+            frontend=SimpleNamespace(type="dynamo"),
+            dynamo=SimpleNamespace(request_plane="nats", event_plane="zmq"),
+            infra=SimpleNamespace(etcd_nats_dedicated_node=False, nats_max_payload_mb=None),
+        )
+        implied = get_frontend("dynamo").implied_services(dynamo_config)
+        assert [(entry.service.name, entry.service.type, entry.reason) for entry in implied] == [
+            ("etcd", "etcd", "frontend.type dynamo"),
+            ("nats", "nats", "dynamo.request_plane nats"),
+        ]
+        for frontend_type in ("vllm", "sglang", "sglang-router", "trtllm_serve", "vllm-router"):
+            assert get_frontend(frontend_type).implied_services(dynamo_config) == []
 
 
 # ============================================================================

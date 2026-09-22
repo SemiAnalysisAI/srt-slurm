@@ -63,6 +63,9 @@ srtctl apply -f config.yaml --tags experiment,baseline
 # Dry-run (validate without submitting)
 srtctl dry-run -f config.yaml
 
+# Export a single-node aggregate SGLang/vLLM server as copyable Docker commands
+srtctl render-docker -f config.yaml --to server.txt
+
 # Rewrite a v1 recipe into the 2.0 layout
 srtctl migrate -f config.yaml
 

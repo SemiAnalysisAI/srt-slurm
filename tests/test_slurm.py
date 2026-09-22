@@ -180,6 +180,7 @@ def test_worker_stage_wraps_nonfatal_fingerprint_hook(tmp_path: Path) -> None:
     backend.build_worker_command.return_value = ["python3", "-m", "worker"]
     backend.get_environment_for_mode.return_value = {}
     backend.get_process_environment.return_value = {}
+    backend.get_frontend_integration_environment.return_value = {}
     backend.type = "vllm"
     backend.failover = None
     backend.mooncake_kv_store = None
@@ -187,7 +188,7 @@ def test_worker_stage_wraps_nonfatal_fingerprint_hook(tmp_path: Path) -> None:
     mixin = WorkerStageMixin()
     mixin.config = SimpleNamespace(
         setup_script="setup.sh",
-        frontend=SimpleNamespace(type="sglang"),
+        frontend=SimpleNamespace(type="sglang", args={}),
         dynamo=SimpleNamespace(install=False, sidecar=False, request_plane="nats", event_plane="zmq"),
         observability=ObservabilityConfig(),
         profiling=SimpleNamespace(enabled=False, is_nsys=False),
@@ -243,13 +244,14 @@ def _remap_worker_mixin(tmp_path: Path, *, frontend_type: str, dynamo_install: b
     backend.build_worker_command.return_value = ["python3", "-m", "worker"]
     backend.get_environment_for_mode.return_value = {}
     backend.get_process_environment.return_value = {}
+    backend.get_frontend_integration_environment.return_value = {}
     backend.failover = None
     backend.mooncake_kv_store = None
 
     mixin = WorkerStageMixin()
     mixin.config = SimpleNamespace(
         setup_script=None,
-        frontend=SimpleNamespace(type=frontend_type),
+        frontend=SimpleNamespace(type=frontend_type, args={}),
         dynamo=SimpleNamespace(
             install=dynamo_install,
             sidecar=False,
@@ -426,6 +428,29 @@ def test_worker_stage_no_remap_root_when_dynamo_install_false(tmp_path: Path) ->
         mixin.start_worker(process, [process])
 
     assert mock_srun.call_args.kwargs["srun_export_env"] is None
+
+
+@pytest.mark.parametrize(("recipe_value", "expected"), [(None, "1"), ("0", "0")])
+def test_worker_stage_applies_frontend_integration_environment(
+    tmp_path: Path,
+    recipe_value: str | None,
+    expected: str,
+) -> None:
+    mixin, process = _remap_worker_mixin(tmp_path, frontend_type="sglang", dynamo_install=False)
+    mixin.config.frontend.args = {"dp-aware": True}
+    integration_key = "SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK"
+    mixin.backend.get_frontend_integration_environment.return_value = {integration_key: "1"}
+    mixin.backend.get_environment_for_mode.return_value = (
+        {} if recipe_value is None else {integration_key: recipe_value}
+    )
+
+    with (
+        patch("srtctl.cli.mixins.worker_stage.generate_capture_script", return_value="fingerprint || true"),
+        patch("srtctl.cli.mixins.worker_stage.start_srun_process", return_value=MagicMock()) as mock_srun,
+    ):
+        mixin.start_worker(process, [process])
+
+    assert mock_srun.call_args.kwargs["env_to_set"][integration_key] == expected
 
 
 # ---- Event-plane propagation (DYN_EVENT_PLANE) ----
@@ -678,13 +703,14 @@ def test_worker_stage_unsets_vllm_port_for_multinode_endpoint(tmp_path: Path) ->
     backend.build_worker_command.return_value = ["python3", "-m", "worker"]
     backend.get_environment_for_mode.return_value = {}
     backend.get_process_environment.return_value = {}
+    backend.get_frontend_integration_environment.return_value = {}
     backend.failover = None
     backend.mooncake_kv_store = None
 
     mixin = WorkerStageMixin()
     mixin.config = SimpleNamespace(
         setup_script=None,
-        frontend=SimpleNamespace(type="sglang"),
+        frontend=SimpleNamespace(type="sglang", args={}),
         dynamo=SimpleNamespace(install=False, sidecar=False, request_plane="nats", event_plane=None),
         observability=ObservabilityConfig(),
         profiling=SimpleNamespace(enabled=False, is_nsys=False),

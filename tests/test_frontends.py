@@ -67,6 +67,7 @@ class TestFrontendRegistry:
 
     def test_registry_lists_every_frontend_type(self):
         assert list_frontend_types() == [
+            "atomesh",
             "dynamo",
             "none",
             "sglang",
@@ -206,7 +207,7 @@ class TestFrontendRegistry:
         from srtctl.backends import SGLangProtocol
         from srtctl.core.schema import FrontendConfig, ResourceConfig, SrtConfig
 
-        with pytest.raises(ValidationError, match="Unknown frontend.type 'toy-router'.*Available: dynamo, none"):
+        with pytest.raises(ValidationError, match="Unknown frontend.type 'toy-router'.*Available: atomesh, dynamo, none"):
             SrtConfig(
                 name="toy",
                 model={"path": "model", "container": "image", "precision": "fp8"},
@@ -595,7 +596,9 @@ class TestSGLangGrpcScheme:
     @patch("srtctl.frontends.sglang.get_hostname_ip")
     def test_disaggregated_mode_command(self, mock_get_ip, mock_srun):
         """Disaggregated mode uses --pd-disaggregation with --prefill and --decode."""
-        mock_get_ip.side_effect = lambda node, interface=None: f"10.0.0.{node[-1]}"
+        mock_get_ip.side_effect = lambda node, interface=None: (
+            f"10.0.0.{node[-1]}" if interface == "eth0" else f"192.168.0.{node[-1]}"
+        )
         mock_srun.return_value = MagicMock()
 
         frontend = SGLangRouterFrontend()
@@ -609,6 +612,7 @@ class TestSGLangGrpcScheme:
         backend.is_grpc_mode.return_value = False
 
         runtime = MagicMock()
+        runtime.network_interface = "eth0"
         runtime.log_dir = MagicMock()
         runtime.log_dir.__truediv__ = lambda self, x: f"/logs/{x}"
         runtime.container_image = "/container.sqsh"
@@ -631,6 +635,8 @@ class TestSGLangGrpcScheme:
         assert "--decode" in cmd
         # Bootstrap port should be included
         assert "30001" in cmd
+        assert "http://10.0.0.1:30000" in cmd
+        assert "http://10.0.0.2:30000" in cmd
 
     @patch("srtctl.frontends.sglang.start_srun_process")
     @patch("srtctl.frontends.sglang.get_hostname_ip")

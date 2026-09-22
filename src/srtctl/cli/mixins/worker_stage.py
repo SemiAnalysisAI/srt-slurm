@@ -222,6 +222,16 @@ class WorkerStageMixin:
             process.node_rank,
         )
 
+    def _apply_frontend_integration_env(self, env_to_set: dict[str, str], mode: str) -> None:
+        """Add backend/frontend integration defaults without overriding recipes."""
+        integration_env = self.backend.get_frontend_integration_environment(
+            mode,
+            self.config.frontend.type,
+            dict(self.config.frontend.args or {}),
+        )
+        for key, value in integration_env.items():
+            env_to_set.setdefault(key, value)
+
     def start_worker(self, process: "Process", endpoint_processes: list["Process"]) -> ManagedProcess:
         """Start a single worker process (one srun per node, used by SGLang)."""
         mode = process.endpoint_mode
@@ -315,6 +325,7 @@ class WorkerStageMixin:
             formatted_value = value.format_map(SafeDict(template_vars))
             env_to_set[key] = formatted_value
 
+        self._apply_frontend_integration_env(env_to_set, mode)
         env_to_set.update(self._visible_device_environment(process))
 
         # Add backend-specific process environment variables (e.g., unique ports)
@@ -527,6 +538,8 @@ class WorkerStageMixin:
             and env_to_set.get("DYN_TRTLLM_PUBLISH_KV_EVENTS", "").lower() == "true"
         ):
             env_to_set.setdefault("DYN_TRTLLM_KV_EVENT_HOSTS", ",".join(endpoint_nodes))
+
+        self._apply_frontend_integration_env(env_to_set, mode)
 
         force_mask = self.config.dynamo.sidecar and self.backend.type == "vllm"
         node_gpu_setup = ""

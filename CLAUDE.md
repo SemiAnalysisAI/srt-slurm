@@ -369,6 +369,7 @@ with patch.dict(os.environ, H100Rack.slurm_env()):
    - `endpoints_to_processes()` - Physical process mapping; every port through `NodePortAllocator`
    - `build_worker_command(process, runtime)` - Command construction
    - `get_process_environment(process)` - Per-process env derived from `Process` ports (side channels, scan bases)
+   - `get_frontend_integration_environment(mode, frontend_type, frontend_args)` - frontend integration defaults, or `{}`
    - `mooncake_kv_store` / `get_mooncake_worker_env(...)` - the Mooncake block and its worker env; `None` / `{}` without one
    - `failover` / `get_failover_environment(...)` - shadow engine recovery; `None` / `{}` without it
    - `should_set_visible_devices()` - `True` unless the engine takes its devices on the command line; the variable is the cluster's `visible_devices_env`
@@ -377,6 +378,7 @@ with patch.dict(os.environ, H100Rack.slurm_env()):
 4. Add polymorphic deserialization in `BackendConfigField` in `schema.py`
 
 **Current backends:**
+- **ATOM**: Native ROCm servers behind AToMesh, with one Slurm node per logical worker and allocator-owned Mooncake handshake ports
 - **SGLang**: Per-process srun launching, supports prefill/decode/aggregated modes
 - **TRTLLM**: MPI-style launching (one srun per endpoint with all nodes), prefill/decode only
 - **vLLM**: Per-process srun launching, prefill/decode/aggregated, `per_node` DP; `frontend_type` selects Dynamo registration or a direct `vllm serve` server, and `_CONNECTOR_MAP` owns the KV connector table

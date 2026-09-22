@@ -29,6 +29,7 @@ class BackendType(str, Enum):
     TRTLLM = "trtllm"
     VLLM = "vllm"
     MOCKER = "mocker"
+    ATOM = "atom"
 
 
 @dataclass
@@ -153,6 +154,12 @@ class BackendProtocol(Protocol):
         profiling: "ProfilingConfig | None" = None,
     ) -> list[str]:
         """Build command to start a worker process."""
+        ...
+
+    def get_frontend_integration_environment(
+        self, mode: str, frontend_type: str, frontend_args: dict[str, Any]
+    ) -> dict[str, str]:
+        """Worker environment defaults required by the selected frontend integration."""
         ...
 
     def get_process_environment(self, process: "Process") -> dict[str, str]:

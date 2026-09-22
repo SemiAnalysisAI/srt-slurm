@@ -566,6 +566,41 @@ class TestSGLangProtocol:
         assert config.get_environment_for_mode("decode") == {"DECODE_VAR": "1"}
         assert config.get_environment_for_mode("agg") == {}
 
+    @pytest.mark.parametrize(
+        ("mode", "frontend_type", "frontend_args", "dp_size", "expected"),
+        [
+            ("prefill", "sglang-router", {"dp-aware": True}, 8, True),
+            ("decode", "sglang-router", {"dp_aware": True}, 8, True),
+            ("prefill", "sglang-router", {"dp-aware": True}, 1, False),
+            ("prefill", "sglang-router", {}, 8, False),
+            ("prefill", "dynamo", {"dp-aware": True}, 8, False),
+            ("agg", "sglang-router", {"dp-aware": True}, 8, False),
+        ],
+    )
+    def test_dp_aware_router_bootstrap_rank_environment(
+        self,
+        mode,
+        frontend_type,
+        frontend_args,
+        dp_size,
+        expected,
+    ):
+        config = SGLangProtocol(
+            sglang_config=SGLangServerConfig(
+                prefill={"dp-size": dp_size},
+                decode={"dp-size": dp_size},
+                aggregated={"dp-size": dp_size},
+            )
+        )
+
+        environment = config.get_frontend_integration_environment(
+            mode,
+            frontend_type,
+            frontend_args,
+        )
+
+        assert (environment.get("SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK") == "1") is expected
+
     def test_kv_events_config_global_bool(self):
         """Test kv_events_config=True enables prefill+decode+aggregated with defaults."""
         config = SGLangProtocol(kv_events_config=True)
@@ -678,9 +713,11 @@ class TestSGLangProtocol:
         runtime = MagicMock()
         runtime.model_path = Path("/model")
         runtime.is_hf_model = False
-        with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):
+        runtime.network_interface = "management0"
+        with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1") as resolve_ip:
             command = backend.build_worker_command(processes[1], [processes[1]], runtime)
 
+        resolve_ip.assert_called_once_with("node0", "management0")
         assert command[command.index("--nccl-port") + 1] == str(SGLANG_NCCL_PORT_BASE + 1)
 
 
@@ -3014,7 +3051,7 @@ class TestVLLMDataParallelMode:
         assert "dynamo.vllm" not in cmd
 
     def test_vllm_router_can_use_environment_device_binding(self):
-        """Stable vLLM builds can avoid the newer --device-ids CLI."""
+        """set_visible_devices swaps --device-ids for the worker-stage environment mask."""
         from pathlib import Path
         from unittest.mock import MagicMock, patch
 
@@ -3049,7 +3086,6 @@ class TestVLLMDataParallelMode:
 
         assert cmd[:3] == ["vllm", "serve", "/model"]
         assert "--device-ids" not in cmd
-        assert backend.should_set_visible_devices()
 
     @pytest.mark.parametrize(
         ("mode", "role"),

@@ -237,6 +237,12 @@ class TRTLLMProtocol:
             env["TLLM_NUMA_AWARE_WORKER_AFFINITY"] = "0"
         return env
 
+    def get_frontend_integration_environment(
+        self, mode: str, frontend_type: str, frontend_args: dict[str, Any]
+    ) -> dict[str, str]:
+        """Worker environment defaults required by the selected frontend integration."""
+        return {}
+
     def get_process_environment(self, process: "Process") -> dict[str, str]:
         """Get process-specific environment variables.
 

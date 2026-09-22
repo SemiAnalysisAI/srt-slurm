@@ -5,6 +5,7 @@
 
 import hashlib
 import json
+import socket
 import subprocess
 import threading
 import time
@@ -185,6 +186,10 @@ def _exited_exporter(name, returncode):
 
 def _manifest(session):
     return json.loads((session.power_dir / MANIFEST_FILENAME).read_text())
+
+
+def _scrape_timings(session):
+    return [json.loads(line) for line in (session.power_dir / "scrape-timings.jsonl").read_text().splitlines()]
 
 
 class TestDaemonWorkers:
@@ -374,6 +379,22 @@ class TestCollection:
         assert {row.hostname for row in rows} == {"node-a"}
         assert Reason.ENDPOINT_TIMEOUT in _manifest(session)["reason_codes"]
 
+        missing = next(
+            endpoint for endpoint in _scrape_timings(session)[0]["endpoints"] if endpoint["hostname"] == "node-b"
+        )
+        assert missing["settled"] is False
+        assert missing["reason_codes"] == [Reason.ENDPOINT_TIMEOUT]
+        assert missing["row_count"] == 0
+        for field in (
+            "http_status",
+            "request_started_at_unix",
+            "request_finished_at_unix",
+            "request_start_delay_seconds",
+            "request_duration_seconds",
+            "sample_timestamp_unix",
+        ):
+            assert missing[field] is None
+
     def test_endpoint_recovers_on_a_later_cycle(self, tmp_path, exporters):
         a = exporters(_body("a"))
         b = exporters(_body("b"), fail_requests=1)
@@ -387,6 +408,242 @@ class TestCollection:
         assert first == GPUS_PER_NODE
         assert second == 2 * GPUS_PER_NODE
         assert Reason.ENDPOINT_HTTP_ERROR in _manifest(session)["reason_codes"]
+
+
+class TestScrapeTiming:
+    def test_request_latency_and_sample_identity_are_preserved(self, tmp_path, exporters):
+        fast = exporters(_body("a"))
+        slow = exporters(_body("b"), delay=0.12)
+        session = _session(tmp_path, _endpoints(("node-a", fast.url), ("node-b", slow.url)), windows=[])
+        session.initialize()
+
+        assert (session.power_dir / "scrape-timings.jsonl").exists()
+        session.collect_once()
+        session.collect_once()
+        outcome = session.stop_and_finalize()
+
+        timings = _scrape_timings(session)
+        rows, reasons = read_samples(session.samples_path)
+        assert outcome.status == "complete"
+        assert reasons == ()
+        assert [cycle["scrape_seq"] for cycle in timings] == [0, 1]
+        assert timings[0]["previous_timing_write_seconds"] is None
+        assert timings[1]["previous_timing_write_seconds"] >= 0
+        for cycle in timings:
+            assert cycle["schema_version"] == 1
+            assert cycle["job_id"] == "12345"
+            assert cycle["run_name"] == "recipe_12345"
+            assert cycle["collector_hostname"] == socket.gethostname()
+            assert cycle["scheduled_monotonic"] is None
+            assert cycle["schedule_lag_seconds"] is None
+            assert cycle["sample_write_completed"] is True
+            assert cycle["cycle_wall_seconds"] >= cycle["poll_wall_seconds"] >= 0.1
+            assert cycle["sample_write_seconds"] < 0.1
+            assert cycle["writer_lock_wait_seconds"] >= 0
+            assert {endpoint["hostname"] for endpoint in cycle["endpoints"]} == {"node-a", "node-b"}
+            for endpoint in cycle["endpoints"]:
+                samples = [
+                    row
+                    for row in rows
+                    if row.scrape_seq == cycle["scrape_seq"] and row.hostname == endpoint["hostname"]
+                ]
+                assert endpoint["settled"] is True
+                assert endpoint["http_status"] == 200
+                assert endpoint["reason_codes"] == []
+                assert endpoint["row_count"] == len(samples) == GPUS_PER_NODE
+                assert endpoint["request_start_delay_seconds"] >= 0
+                assert endpoint["request_started_at_unix"] >= cycle["cycle_started_at_unix"]
+                assert endpoint["request_finished_at_unix"] >= endpoint["request_started_at_unix"]
+                midpoint = (endpoint["request_started_at_unix"] + endpoint["request_finished_at_unix"]) / 2
+                assert endpoint["sample_timestamp_unix"] == midpoint
+                assert {row.timestamp_unix for row in samples} == {midpoint}
+                if endpoint["hostname"] == "node-b":
+                    assert endpoint["request_duration_seconds"] >= 0.1
+
+    @pytest.mark.parametrize("failure", ["timeout", "http_error"])
+    def test_failed_requests_have_timing_and_recovery_has_new_samples(self, tmp_path, exporters, failure):
+        endpoint = exporters(
+            _body("a"), delay=0.2 if failure == "timeout" else 0, fail_requests=failure == "http_error"
+        )
+        session = _session(
+            tmp_path,
+            _endpoints(("node-a", endpoint.url)),
+            processes=_processes()[:1],
+            windows=[],
+            request_timeout_seconds=0.05,
+        )
+        session.initialize()
+
+        assert session.collect_once() == 0
+        endpoint.delay = 0
+        assert session.collect_once() == GPUS_PER_NODE
+        session.stop_and_finalize()
+
+        timings = _scrape_timings(session)
+        failed, recovered = [cycle["endpoints"][0] for cycle in timings]
+        assert failed["settled"] is True
+        assert failed["reason_codes"] == [
+            Reason.ENDPOINT_TIMEOUT if failure == "timeout" else Reason.ENDPOINT_HTTP_ERROR
+        ]
+        assert failed["row_count"] == 0
+        assert failed["sample_timestamp_unix"] is None
+        assert failed["http_status"] == (None if failure == "timeout" else 503)
+        assert failed["request_finished_at_unix"] >= failed["request_started_at_unix"]
+        assert failed["request_duration_seconds"] > 0
+        if failure == "timeout":
+            assert failed["request_duration_seconds"] >= 0.04
+        assert recovered["http_status"] == 200
+        assert recovered["row_count"] == GPUS_PER_NODE
+        rows, reasons = read_samples(session.samples_path)
+        assert reasons == ()
+        assert {row.scrape_seq for row in rows} == {1}
+        assert _manifest(session)["max_scrape_duration_seconds"] == recovered["request_duration_seconds"]
+
+    def test_delayed_sample_flush_is_distinct_from_request_latency(self, tmp_path, exporters, monkeypatch):
+        endpoint = exporters(_body("a"))
+        session = _session(tmp_path, _endpoints(("node-a", endpoint.url)), processes=_processes()[:1], windows=[])
+        session.initialize()
+        real_flush = session._writer.flush
+
+        def delayed_flush():
+            time.sleep(0.12)
+            real_flush()
+
+        monkeypatch.setattr(session._writer, "flush", delayed_flush)
+        session.collect_once()
+        session.stop_and_finalize()
+
+        cycle = _scrape_timings(session)[0]
+        assert cycle["sample_write_completed"] is True
+        assert cycle["sample_write_seconds"] >= 0.1
+        assert cycle["cycle_wall_seconds"] >= cycle["sample_write_seconds"]
+        assert cycle["endpoints"][0]["request_duration_seconds"] < cycle["sample_write_seconds"]
+        assert cycle["writer_lock_wait_seconds"] < cycle["sample_write_seconds"]
+        assert len(read_samples(session.samples_path)[0]) == GPUS_PER_NODE
+
+    def test_run_reports_late_wakeup_separately_from_poll_and_final_scrape(self, tmp_path, exporters, monkeypatch):
+        endpoint = exporters(_body("a"))
+        session = _session(
+            tmp_path,
+            _endpoints(("node-a", endpoint.url)),
+            processes=_processes()[:1],
+            windows=[],
+            sample_interval_seconds=0.2,
+        )
+        session.initialize()
+        waits = 0
+
+        def delayed_wait(timeout):
+            nonlocal waits
+            waits += 1
+            if waits == 1:
+                time.sleep(timeout + 0.12)
+            else:
+                session._stop.set()
+            return session._stop.is_set()
+
+        monkeypatch.setattr(session._stop, "wait", delayed_wait)
+        session._run()
+        outcome = session.stop_and_finalize()
+
+        first, late, final = _scrape_timings(session)
+        assert outcome.status == "complete"
+        assert late["scheduled_monotonic"] - first["scheduled_monotonic"] == pytest.approx(0.2)
+        assert late["schedule_lag_seconds"] >= 0.1
+        assert late["cycle_started_monotonic"] - late["scheduled_monotonic"] == late["schedule_lag_seconds"]
+        assert late["poll_wall_seconds"] < late["schedule_lag_seconds"]
+        assert final["scheduled_monotonic"] is None
+        assert final["schedule_lag_seconds"] is None
+        assert [row["scrape_seq"] for row in (first, late, final)] == [0, 1, 2]
+
+    @pytest.mark.parametrize("failure", ["open", "write"])
+    def test_diagnostic_io_failure_preserves_samples_and_terminal_state(
+        self, tmp_path, exporters, monkeypatch, failure
+    ):
+        endpoint = exporters(_body("a"))
+        control_dir = tmp_path / "control"
+        control_dir.mkdir()
+        control = _session(control_dir, _endpoints(("node-a", endpoint.url)), processes=_processes()[:1], windows=[])
+        control.initialize()
+        control.collect_once()
+        control.collect_once()
+        expected_outcome = control.stop_and_finalize()
+
+        session = _session(tmp_path, _endpoints(("node-a", endpoint.url)), processes=_processes()[:1], windows=[])
+        real_open = Path.open
+        attempted = []
+
+        def timing_open(path, *args, **kwargs):
+            if path.name != "scrape-timings.jsonl":
+                return real_open(path, *args, **kwargs)
+            attempted.append(path)
+            if failure == "open":
+                raise OSError("sidecar unavailable")
+            handle = real_open(path, *args, **kwargs)
+            monkeypatch.setattr(handle, "write", MagicMock(side_effect=OSError("sidecar write failed")))
+            return handle
+
+        monkeypatch.setattr(Path, "open", timing_open)
+        session.initialize()
+        assert session.collect_once() == GPUS_PER_NODE
+        assert session.collect_once() == GPUS_PER_NODE
+        outcome = session.stop_and_finalize()
+
+        assert attempted
+        assert outcome == expected_outcome
+        assert outcome.status == "complete"
+        assert outcome.reason_codes == ()
+        rows, reasons = read_samples(session.samples_path)
+        assert reasons == ()
+        assert len(rows) == 2 * GPUS_PER_NODE
+        assert {row.scrape_seq for row in rows} == {0, 1}
+
+    @pytest.mark.parametrize("blocked_operation", ["write", "close"])
+    def test_blocked_diagnostic_io_preserves_readiness_and_bounded_shutdown(
+        self, tmp_path, exporters, monkeypatch, blocked_operation
+    ):
+        endpoint = exporters(_body("a"))
+        session = _session(
+            tmp_path,
+            _endpoints(("node-a", endpoint.url)),
+            processes=_processes()[:1],
+            windows=[],
+            startup_timeout_seconds=0.2,
+            collector_join_timeout_seconds=0.05,
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        real_open = Path.open
+
+        def timing_open(path, *args, **kwargs):
+            handle = real_open(path, *args, **kwargs)
+            if path.name == "scrape-timings.jsonl" and args[0] == "a":
+                real_operation = getattr(handle, blocked_operation)
+
+                def blocked(*operation_args):
+                    entered.set()
+                    assert release.wait(5)
+                    return real_operation(*operation_args)
+
+                monkeypatch.setattr(handle, blocked_operation, blocked)
+            return handle
+
+        monkeypatch.setattr(Path, "open", timing_open)
+        session.initialize()
+        try:
+            assert session.start_and_wait_for_readiness() is True
+            assert entered.wait(1)
+            started = time.monotonic()
+            outcome = session.stop_and_finalize()
+            assert time.monotonic() - started < 0.5
+            assert Reason.COLLECTOR_JOIN_TIMEOUT in outcome.reason_codes
+            assert Reason.EXPORTER_STARTUP_TIMEOUT not in outcome.reason_codes
+            assert session.collector_alive
+        finally:
+            release.set()
+            if session._thread is not None:
+                session._thread.join(timeout=1)
+        assert not session.collector_alive
 
 
 class TestReadiness:

@@ -69,6 +69,7 @@ flight when shutdown starts plus the final bracketing scrape.
 <log_dir>/<storage_subdir>/
 ├── manifest.json
 ├── samples.csv
+├── scrape-timings.jsonl
 └── windows/
     └── <benchmark-result-stem>.json
 ```
@@ -105,6 +106,53 @@ tears processes down before the collector finalizes, so the final scrape sees
 dead endpoints. The manifest fails closed (`exporter_exited` /
 `collector_interrupted` force `publication_valid=false`); the cost is that a
 job that was simply cancelled can record `exporter_exited`.
+
+## Diagnosing missed scrapes
+
+The collector also writes `scrape-timings.jsonl`, one compact JSON record per
+completed cycle (including the final bracketing cycle). This diagnostic sidecar
+does not change the sample schema, cadence, timeouts, or publication policy.
+Its `schema_version` is independent of the sample schema. Retain it alongside
+the manifest and samples; join by `job_id`, `run_name`, `scrape_seq`, and endpoint
+`hostname`. `collector_hostname` identifies the host running the collector.
+Endpoint `sample_timestamp_unix` is the exact timestamp written to the CSV.
+
+| Field | Meaning |
+| --- | --- |
+| `cycle_started_at_unix` | Head-host wall clock for correlation with other logs |
+| `scheduled_monotonic`, `cycle_started_monotonic`, `schedule_lag_seconds` | Planned and actual cycle start on one monotonic clock; schedule/lag are null for manual and final scrapes |
+| `endpoints[].request_start_delay_seconds` | Delay from cycle start to that worker entering the request, including dispatch and scheduling |
+| `endpoints[].request_started_at_unix`, `request_finished_at_unix`, `request_duration_seconds` | Client-observed HTTP start/end and monotonic duration, including timeouts and HTTP errors |
+| `endpoints[].http_status`, `reason_codes`, `row_count`, `settled` | Response status when available, parse/request outcome, parsed rows, and whether the worker returned before the cycle deadline |
+| `poll_wall_seconds` | Wall time waiting for all endpoint workers, including request, parsing, and worker scheduling |
+| `writer_lock_wait_seconds`, `sample_write_seconds`, `sample_write_completed` | Wait for the CSV writer lock, then append plus flush time and completion; flush is not fsync |
+| `cycle_wall_seconds` | Time from cycle entry through CSV append/flush, excluding this cycle's diagnostic output |
+| `previous_timing_write_seconds` | Previous cycle's JSON serialization/open/write/flush/close cost (null on the first cycle) |
+
+A worker abandoned at the cycle deadline has `settled=false` and null request
+timings/status, rather than an invented request duration. Request errors have
+zero rows; no previous readings are reused. The manifest's
+`max_scrape_duration_seconds` retains its historical population of successful
+HTTP requests; use the sidecar to inspect failed requests.
+
+Compare adjacent cycles: a long request versus a long CSV write identifies
+where time was spent; an overdue cycle following either is not, by itself,
+evidence of OS scheduling contention. A long client request can include network,
+exporter, or collector-thread delays, so exporter/host evidence is still needed
+to assign a root cause. Wall-clock adjustments can affect CSV timestamps; use
+monotonic durations for elapsed-time comparisons.
+
+The sidecar adds one open/write/flush/close per cycle under the existing writer lock,
+after persisted samples have signalled readiness.
+Inspect its measured cost on the actual storage before claiming negligible
+overhead. Open/write/close I/O errors log a warning and disable diagnostics,
+without changing collection validity. Blocked cycle diagnostic I/O uses the existing
+bounded collector shutdown path. Initial creation is synchronous, like the existing
+sample and manifest initialization; it has no separate I/O deadline.
+A killed process, unhandled worker failure,
+or still-blocked CSV write can leave the last cycle absent or the last JSON line
+incomplete; absence is not proof that a request never started. No new monitoring
+service or configuration is required.
 
 ## Re-validating a retained run
 

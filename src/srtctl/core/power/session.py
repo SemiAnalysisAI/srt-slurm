@@ -111,6 +111,9 @@ class _EndpointResult:
     request_started_monotonic: float
     request_finished_monotonic: float
     http_status: int | None
+    # Exception class name for a failed request (ConnectTimeout, ReadTimeout,
+    # ConnectionError, HTTPError); separates connect-phase from response-phase stalls.
+    error_type: str | None
 
 
 class PowerTelemetrySession:
@@ -356,6 +359,7 @@ class PowerTelemetrySession:
                             "reason_codes": result.reason_codes if result else [Reason.ENDPOINT_TIMEOUT],
                             "row_count": len(result.rows) if result else 0,
                             "http_status": result.http_status if result else None,
+                            "error_type": result.error_type if result else None,
                             "request_started_at_unix": result.request_started_at_unix if result else None,
                             "request_finished_at_unix": result.request_finished_at_unix if result else None,
                             "request_start_delay_seconds": (
@@ -418,15 +422,18 @@ class PowerTelemetrySession:
         body = None
         reasons: list[str] = []
         http_status = None
+        error_type = None
         try:
             response = requests.get(endpoint.url, timeout=self._settings.request_timeout_seconds)
             http_status = response.status_code
             response.raise_for_status()
             body = response.text
-        except requests.Timeout:
+        except requests.Timeout as exc:
             reasons.append(Reason.ENDPOINT_TIMEOUT)
-        except requests.RequestException:
+            error_type = type(exc).__name__
+        except requests.RequestException as exc:
             reasons.append(Reason.ENDPOINT_HTTP_ERROR)
+            error_type = type(exc).__name__
         settled_monotonic = time.monotonic()
         settled_unix = time.time()
 
@@ -456,6 +463,7 @@ class PowerTelemetrySession:
             request_started_monotonic=started_monotonic,
             request_finished_monotonic=settled_monotonic,
             http_status=http_status,
+            error_type=error_type,
         )
 
     def _run(self) -> None:

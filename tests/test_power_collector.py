@@ -488,16 +488,40 @@ class TestScrapeTiming:
         assert failed["row_count"] == 0
         assert failed["sample_timestamp_unix"] is None
         assert failed["http_status"] == (None if failure == "timeout" else 503)
+        assert failed["error_type"] == ("ReadTimeout" if failure == "timeout" else "HTTPError")
         assert failed["request_finished_at_unix"] >= failed["request_started_at_unix"]
         assert failed["request_duration_seconds"] > 0
         if failure == "timeout":
             assert failed["request_duration_seconds"] >= 0.04
         assert recovered["http_status"] == 200
+        assert recovered["error_type"] is None
         assert recovered["row_count"] == GPUS_PER_NODE
         rows, reasons = read_samples(session.samples_path)
         assert reasons == ()
         assert {row.scrape_seq for row in rows} == {1}
         assert _manifest(session)["max_scrape_duration_seconds"] == recovered["request_duration_seconds"]
+
+    def test_refused_connection_is_classified_by_exception_type(self, tmp_path):
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        session = _session(
+            tmp_path,
+            _endpoints(("node-a", f"http://127.0.0.1:{port}/metrics")),
+            processes=_processes()[:1],
+            windows=[],
+            request_timeout_seconds=0.5,
+        )
+        session.initialize()
+
+        assert session.collect_once() == 0
+        session.stop_and_finalize()
+
+        (endpoint,) = _scrape_timings(session)[0]["endpoints"]
+        assert endpoint["reason_codes"] == [Reason.ENDPOINT_HTTP_ERROR]
+        assert endpoint["error_type"] == "ConnectionError"
+        assert endpoint["http_status"] is None
+        assert endpoint["row_count"] == 0
 
     def test_delayed_sample_flush_is_distinct_from_request_latency(self, tmp_path, exporters, monkeypatch):
         endpoint = exporters(_body("a"))

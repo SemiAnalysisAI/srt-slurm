@@ -124,6 +124,7 @@ Endpoint `sample_timestamp_unix` is the exact timestamp written to the CSV.
 | `endpoints[].request_start_delay_seconds` | Delay from cycle start to that worker entering the request, including dispatch and scheduling |
 | `endpoints[].request_started_at_unix`, `request_finished_at_unix`, `request_duration_seconds` | Client-observed HTTP start/end and monotonic duration, including timeouts and HTTP errors |
 | `endpoints[].http_status`, `reason_codes`, `row_count`, `settled` | Response status when available, parse/request outcome, parsed rows, and whether the worker returned before the cycle deadline |
+| `endpoints[].error_type` | Exception class of a failed request (`ConnectTimeout`, `ReadTimeout`, `ConnectionError`, `HTTPError`); null on success. `ConnectTimeout` points at TCP connect (every scrape opens a new connection), `ReadTimeout` at the exporter's response |
 | `poll_wall_seconds` | Wall time waiting for all endpoint workers, including request, parsing, and worker scheduling |
 | `writer_lock_wait_seconds`, `sample_write_seconds`, `sample_write_completed` | Wait for the CSV writer lock, then append plus flush time and completion; flush is not fsync |
 | `cycle_wall_seconds` | Time from cycle entry through CSV append/flush, excluding this cycle's diagnostic output |

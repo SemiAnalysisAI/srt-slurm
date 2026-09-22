@@ -43,7 +43,13 @@ This page is the prose guide: what each block means, how the pieces interact, an
 
 ## Overview
 
-### ATOM with AToMesh
+### ATOM direct serving and AToMesh
+
+For one aggregate worker, use `engine: atom` with `frontend.type: atom` and
+`frontend.enable_multiple_frontends: false`. The ATOM worker binds the public
+port directly; no router container or AToMesh installation is needed. Readiness
+requires `/health` to succeed and `/v1/models` to list a model. See the
+[direct ATOM recipe](../examples/atom/direct.yaml).
 
 Use `engine: atom` with `frontend.type: atomesh` to launch native
 `atom.entrypoints.openai_server` workers and the official AToMesh router. Both

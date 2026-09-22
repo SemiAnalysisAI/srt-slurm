@@ -168,8 +168,13 @@ class AtomProtocol:
         dump_config_path: Path | None = None,
         profiling: ProfilingConfig | None = None,
     ) -> list[str]:
-        if frontend_type != "atomesh":
-            raise ValueError(f"backend.type: atom requires frontend.type: atomesh (got {frontend_type!r})")
+        from srtctl.frontends import get_frontend
+
+        frontend = get_frontend(frontend_type)
+        if frontend.required_backend != self.type:
+            raise ValueError(f"backend.type: atom requires an ATOM frontend (got {frontend_type!r})")
+        public_endpoint = frontend.worker_api_port(process.endpoint_mode) == "public"
+        port = runtime.frontend_port if public_endpoint else process.http_port
         if len({item.node for item in endpoint_processes}) != 1:
             raise ValueError("ATOM currently requires each logical endpoint to fit on one Slurm node")
 
@@ -193,7 +198,7 @@ class AtomProtocol:
                 "--host",
                 "0.0.0.0",
                 "--server-port",
-                str(process.http_port),
+                str(port),
                 "-tp",
                 str(len(process.gpu_indices)),
             ]

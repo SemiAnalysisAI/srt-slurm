@@ -27,6 +27,7 @@ Every example is written in the 2.0 layout: `engine:` names the engine (a string
 | `features/sweep.yaml` | `sweep:` plus `{placeholder}` substitution; one job per combination |
 | `features/override.yaml` | `base` plus `override_*` and `zip_override_*` variants in one file |
 | `features/profiling.yaml` | `profiling:` torch capture on an aggregated worker |
+| `features/power-profiling-isolation.yaml` | Opt-in DCGM exporter image that keeps fresh power available during profiling recovery; requires a configured image alias, uses four GB200 GPUs. See [the build and validation guide](../docs/dcgm-profiling-isolation.md) |
 | `features/services.yaml` | `services:` sidecar (an HTTP log browser on the head node) with a `readiness:` port gate |
 | `features/mlperf-client.yaml` | `benchmark.type: custom` driving the MLPerf inference-endpoint client in its own image; placeholder paths, a reference rather than a runnable example |
 | `features/infra-services.yaml` | etcd and NATS as declared services on a dedicated node with a NATS payload limit; the implied exporters overridden or switched off |

@@ -1,0 +1,27 @@
+# syntax=docker/dockerfile:1
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Build natively for the requested platform; do not copy an amd64 binary into
+# the ARM64 image used by Grace Blackwell runners.
+FROM golang:1.26.4-bookworm AS builder
+WORKDIR /src/dcgm-exporter
+RUN git init . \
+    && git remote add origin https://github.com/NVIDIA/dcgm-exporter.git \
+    && git fetch --depth=1 origin 181290c399d46a9b905e083d0204348be63cb436 \
+    && git checkout --detach FETCH_HEAD
+COPY docker/dcgm-exporter-profiling-isolation.patch /tmp/profiling-isolation.patch
+RUN git apply --check /tmp/profiling-isolation.patch \
+    && git apply /tmp/profiling-isolation.patch
+ENV CGO_ENABLED=1 GOMAXPROCS=2
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    go test -p 2 -short ./internal/pkg/collector ./internal/pkg/devicewatchlistmanager ./internal/pkg/server \
+    && go build -p 2 -trimpath \
+       -ldflags '-X main.BuildVersion=4.6.0-4.8.3-power-isolation' \
+       -o /out/dcgm-exporter ./cmd/dcgm-exporter
+
+# Keep the DCGM runtime paired with the source version used by the existing
+# PowerX exporter. Only the exporter executable changes.
+FROM nvcr.io/nvidia/k8s/dcgm-exporter:4.6.0-4.8.3-distroless
+COPY --from=builder /out/dcgm-exporter /usr/bin/dcgm-exporter

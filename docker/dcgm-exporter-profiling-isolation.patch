@@ -1,0 +1,753 @@
+diff --git a/internal/pkg/collector/gpu_collector.go b/internal/pkg/collector/gpu_collector.go
+index c1fea6a..1698649 100644
+--- a/internal/pkg/collector/gpu_collector.go
++++ b/internal/pkg/collector/gpu_collector.go
+@@ -54,6 +54,10 @@ type DCGMCollector struct {
+ 	profilingSamples      map[profilingSampleKey]profilingSample
+ 	nextProfilingRepair   time.Time
+ 	now                   func() time.Time
++	profilingWatchList    *devicewatchlistmanager.WatchList
++	profilingCleanups     []func()
++	profilingRepairDone   chan error
++	closed                bool
+ }
+ 
+ // profilingSampleKey identifies one profiling stream within a collector.
+@@ -128,15 +132,40 @@ func NewDCGMCollector(
+ 	collector.profilingStaleWindows = profilingStaleWindows
+ 	if len(profilingStaleWindows) > 0 {
+ 		collector.profilingSamples = make(map[profilingSampleKey]profilingSample)
++		var regularFields, profilingFields []dcgm.Short
++		for _, field := range deviceWatchList.DeviceFields() {
++			if _, profiling := profilingStaleWindows[field]; profiling {
++				profilingFields = append(profilingFields, field)
++			} else {
++				regularFields = append(regularFields, field)
++			}
++		}
++		// Label watches belong to the regular lane. A profiling repair must not
++		// tear them down, even when no regular metric counters are configured.
++		regularFields = dedupeFieldIDs(append(regularFields, deviceWatchList.LabelDeviceFields()...))
++		collector.deviceWatchList.SetDeviceFields(regularFields)
++		profilingWatchList := deviceWatchList
++		profilingWatchList.SetDeviceFieldsWithoutLabelWatches(profilingFields)
++		collector.profilingWatchList = &profilingWatchList
+ 	}
+ 
+-	cleanups, err := collector.deviceWatchList.Watch()
+-	if err != nil {
+-		runCleanups(cleanups)
+-		return nil, err
++	if !collector.deviceWatchList.IsEmpty() {
++		cleanups, err := collector.deviceWatchList.Watch()
++		if err != nil {
++			runCleanups(cleanups)
++			return nil, err
++		}
++		collector.cleanups = cleanups
++	}
++	if collector.profilingWatchList != nil {
++		cleanups, err := collector.profilingWatchList.Watch()
++		if err != nil {
++			runCleanups(cleanups)
++			collector.cleanupWatches()
++			return nil, err
++		}
++		collector.profilingCleanups = cleanups
+ 	}
+-
+-	collector.cleanups = cleanups
+ 
+ 	return collector, nil
+ }
+@@ -146,6 +175,14 @@ func (c *DCGMCollector) Cleanup() {
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
+ 
++	c.closed = true
++	// Join before releasing resources or allowing the DCGM provider to shut down.
++	if c.profilingRepairDone != nil {
++		<-c.profilingRepairDone
++		c.profilingRepairDone = nil
++	}
++	runCleanups(c.profilingCleanups)
++	c.profilingCleanups = nil
+ 	c.cleanupWatches()
+ }
+ 
+@@ -154,6 +191,21 @@ func (c *DCGMCollector) GetMetrics() (MetricsByCounter, error) {
+ 	c.mu.Lock()
+ 	defer c.mu.Unlock()
+ 
++	if c.closed {
++		return nil, errors.New("DCGM collector is closed")
++	}
++	if c.profilingRepairDone != nil {
++		select {
++		case err := <-c.profilingRepairDone:
++			c.profilingRepairDone = nil
++			if err != nil {
++				slog.Error("Failed to repair DCGM profiling watch", slog.String("error", err.Error()))
++			} else {
++				slog.Info("Rearmed DCGM profiling watch; waiting for fresh samples")
++			}
++		default:
++		}
++	}
+ 	metrics, reason, err := c.getMetricsOnce()
+ 	if err != nil {
+ 		return nil, err
+@@ -165,7 +217,6 @@ func (c *DCGMCollector) GetMetrics() (MetricsByCounter, error) {
+ 	return c.repairProfilingWatch(reason, nonProfilingMetrics(metrics))
+ }
+ 
+-// repairProfilingWatch rearms a stale watch and retries the discarded scrape once.
+ func (c *DCGMCollector) repairProfilingWatch(
+ 	reason *profilingRepairReason,
+ 	fallback MetricsByCounter,
+@@ -182,33 +233,17 @@ func (c *DCGMCollector) repairProfilingWatch(
+ 	}
+ 	c.nextProfilingRepair = now.Add(reason.backoff)
+ 
+-	// Rewatch before retrying so stale values are never returned to Prometheus.
++	// Repair owns only profiling resources and never holds the scrape mutex.
++	// Until it completes, subsequent scrapes continue reading regular DCGM fields.
+ 	slog.Warn(
+ 		"Repairing stale DCGM profiling watch",
+ 		slog.String("reason", reason.String()),
+ 		slog.Duration("repairBackoff", reason.backoff),
+ 	)
+-	if err := c.rearmProfilingWatch(); err != nil {
+-		slog.Error("Failed to repair DCGM profiling watch", slog.String("error", err.Error()))
+-		return fallback, nil
+-	}
+-
+-	// The retry records fresh status/timestamp state but cannot trigger another repair.
+-	metrics, retryReason, err := c.getMetricsOnce()
+-	if err != nil {
+-		slog.Error("Failed to collect metrics after repairing DCGM profiling watch", slog.String("error", err.Error()))
+-		return fallback, nil
+-	}
+-	if retryReason != nil {
+-		slog.Error("DCGM profiling watch remains stale after repair", slog.String("reason", retryReason.String()))
+-		if retryFallback := nonProfilingMetrics(metrics); len(retryFallback) > 0 {
+-			fallback = retryFallback
+-		}
+-		return fallback, nil
+-	}
+-
+-	slog.Info("Repaired stale DCGM profiling watch")
+-	return metrics, nil
++	done := make(chan error, 1)
++	c.profilingRepairDone = done
++	go func() { done <- c.rearmProfilingWatch() }()
++	return fallback, nil
+ }
+ 
+ // getMetricsOnce performs one scrape and reports stale profiling state separately from API errors.
+@@ -220,12 +255,27 @@ func (c *DCGMCollector) getMetricsOnce() (MetricsByCounter, *profilingRepairReas
+ 	for _, mi := range monitoringInfo {
+ 		vals, err := c.latestValues(mi)
+ 		if err != nil {
+-			if reason := c.repairReasonForError(err); reason != nil {
++			if reason := c.repairReasonForError(err); reason != nil && c.profilingWatchList == nil {
+ 				return metrics, reason, nil
+ 			}
+ 			handleScrapeError(err)
+ 			return nil, nil, err
+ 		}
++		if c.profilingWatchList != nil && c.profilingRepairDone == nil {
++			profileValues, profileErr := c.latestFieldValues(mi, c.profilingWatchList.DeviceFields())
++			if profileErr != nil {
++				if reason := c.repairReasonForError(profileErr); reason != nil {
++					if firstReason == nil {
++						firstReason = reason
++					}
++				} else {
++					handleScrapeError(profileErr)
++					slog.Error("Failed to collect DCGM profiling fields", slog.String("error", profileErr.Error()))
++				}
++			} else {
++				vals = append(vals, profileValues...)
++			}
++		}
+ 
+ 		if reason := c.observeProfilingSamples(mi.Entity, vals); reason != nil && firstReason == nil {
+ 			firstReason = reason
+@@ -249,8 +299,13 @@ func nonProfilingMetrics(metrics MetricsByCounter) MetricsByCounter {
+ 
+ // latestValues reads one monitored entity through the DCGM API appropriate for its type.
+ func (c *DCGMCollector) latestValues(mi devicemonitoring.Info) ([]dcgm.FieldValue_v1, error) {
+-	fields := fieldsToScrape(c.deviceWatchList)
++	if c.deviceWatchList.IsEmpty() {
++		return nil, nil
++	}
++	return c.latestFieldValues(mi, fieldsToScrape(c.deviceWatchList))
++}
+ 
++func (c *DCGMCollector) latestFieldValues(mi devicemonitoring.Info, fields []dcgm.Short) ([]dcgm.FieldValue_v1, error) {
+ 	if mi.Entity.EntityGroupId == dcgm.FE_LINK {
+ 		return dcgmprovider.Client().LinkGetLatestValues(
+ 			mi.Entity.EntityId,
+@@ -313,22 +368,21 @@ func runCleanups(cleanups []func()) {
+ 	}
+ }
+ 
+-// rearmProfilingWatch replaces the current watches and refreshes their first samples.
+ func (c *DCGMCollector) rearmProfilingWatch() error {
+ 	// Tear down first because DCGM watch identity is connection-scoped; cleaning an
+ 	// old watch after replacement can remove the replacement too.
+-	c.cleanupWatches()
++	runCleanups(c.profilingCleanups)
++	c.profilingCleanups = nil
+ 
+-	cleanups, err := c.deviceWatchList.Watch()
++	cleanups, err := c.profilingWatchList.Watch()
+ 	if err != nil {
+ 		runCleanups(cleanups)
+ 		return fmt.Errorf("failed to recreate DCGM field watches: %w", err)
+ 	}
+-	c.cleanups = cleanups
+-
+-	if err := dcgmprovider.Client().UpdateAllFields(); err != nil {
+-		return fmt.Errorf("failed to update fields after recreating DCGM field watches: %w", err)
+-	}
++	c.profilingCleanups = cleanups
++	// Do not synchronously UpdateAllFields: it waits on every watched field,
++	// including profiling. The normal DCGM watch cadence supplies new samples;
++	// unchanged profiling timestamps remain rejected on the next scrape.
+ 
+ 	return nil
+ }
+diff --git a/internal/pkg/collector/gpu_collector_test.go b/internal/pkg/collector/gpu_collector_test.go
+index 6d6fcf5..19cbf0b 100644
+--- a/internal/pkg/collector/gpu_collector_test.go
++++ b/internal/pkg/collector/gpu_collector_test.go
+@@ -692,7 +692,6 @@ func TestDCGMCollectorRearmCleansOldWatchBeforeReplacement(t *testing.T) {
+ 	deviceInfo := testGPUDeviceInfo(ctrl)
+ 	watcher := mockdevicewatcher.NewMockWatcher(ctrl)
+ 
+-	// Record teardown, replacement, refresh, and final cleanup in execution order.
+ 	var steps []string
+ 	initialWatch := watcher.EXPECT().
+ 		WatchDeviceFieldGroups(gomock.Any(), deviceInfo).
+@@ -705,18 +704,14 @@ func TestDCGMCollectorRearmCleansOldWatchBeforeReplacement(t *testing.T) {
+ 			steps = append(steps, "replacement watch")
+ 			return nil, nil, []func(){func() { steps = append(steps, "new cleanup") }}, nil
+ 		})
+-	update := mockDCGM.EXPECT().UpdateAllFields().DoAndReturn(func() error {
+-		steps = append(steps, "field update")
+-		return nil
+-	})
+-	gomock.InOrder(initialWatch, replacementWatch, update)
++	gomock.InOrder(initialWatch, replacementWatch)
+ 
+ 	collector := newTestProfilingCollector(t, deviceInfo, watcher, time.Second)
+ 	require.NoError(t, collector.rearmProfilingWatch())
+ 	collector.Cleanup()
+ 	collector.Cleanup()
+ 
+-	assert.Equal(t, []string{"old cleanup", "replacement watch", "field update", "new cleanup"}, steps)
++	assert.Equal(t, []string{"old cleanup", "replacement watch", "new cleanup"}, steps)
+ }
+ 
+ // TestDCGMCollectorRearmCleansPartialWatchOnFailure verifies failed rewatch cleanup ownership.
+@@ -747,8 +742,7 @@ func TestDCGMCollectorRearmCleansPartialWatchOnFailure(t *testing.T) {
+ 	assert.Equal(t, 1, partialCleanupCalls)
+ }
+ 
+-// TestDCGMCollectorRearmRetainsReplacementCleanupWhenUpdateFails verifies post-watch failure cleanup.
+-func TestDCGMCollectorRearmRetainsReplacementCleanupWhenUpdateFails(t *testing.T) {
++func TestDCGMCollectorRearmDoesNotForceGlobalFieldUpdate(t *testing.T) {
+ 	realDCGM := dcgmprovider.Client()
+ 	t.Cleanup(func() { dcgmprovider.SetClient(realDCGM) })
+ 
+@@ -765,11 +759,10 @@ func TestDCGMCollectorRearmRetainsReplacementCleanupWhenUpdateFails(t *testing.T
+ 	watcher.EXPECT().
+ 		WatchDeviceFieldGroups(gomock.Any(), deviceInfo).
+ 		Return(nil, nil, []func(){func() { newCleanupCalls++ }}, nil)
+-	mockDCGM.EXPECT().UpdateAllFields().Return(assert.AnError)
+ 
+ 	collector := newTestProfilingCollector(t, deviceInfo, watcher, time.Second)
+ 	err := collector.rearmProfilingWatch()
+-	require.ErrorIs(t, err, assert.AnError)
++	require.NoError(t, err)
+ 	collector.Cleanup()
+ 
+ 	assert.Equal(t, 1, oldCleanupCalls)
+@@ -804,7 +797,6 @@ func TestDCGMCollectorRepairsFrozenProfilingTimestampAndRetries(t *testing.T) {
+ 	_, err := collector.GetMetrics()
+ 	require.NoError(t, err)
+ 
+-	// At the stale threshold, rewatch and return only the retry's fresh sample.
+ 	now = now.Add(2 * time.Second)
+ 	staleRead := mockDCGM.EXPECT().
+ 		EntityGetLatestValues(dcgm.FE_GPU, uint(0), []dcgm.Short{counter.FieldID}).
+@@ -817,11 +809,15 @@ func TestDCGMCollectorRepairsFrozenProfilingTimestampAndRetries(t *testing.T) {
+ 			assert.Equal(t, 1, cleanupCalls)
+ 			return nil, nil, []func(){func() { cleanupCalls++ }}, nil
+ 		})
+-	update := mockDCGM.EXPECT().UpdateAllFields().Return(nil)
+ 	freshRead := mockDCGM.EXPECT().
+ 		EntityGetLatestValues(dcgm.FE_GPU, uint(0), []dcgm.Short{counter.FieldID}).
+ 		Return([]dcgm.FieldValue_v1{profilingFieldValue(counter.FieldID, dcgm.DCGM_ST_OK, 11, 0)}, nil)
+-	gomock.InOrder(staleRead, rewatch, update, freshRead)
++	gomock.InOrder(staleRead, rewatch, freshRead)
++
++	first, firstErr := collector.GetMetrics()
++	require.NoError(t, firstErr)
++	assert.Empty(t, first)
++	finishTestProfilingRepair(t, collector)
+ 
+ 	got, err := collector.GetMetrics()
+ 	require.NoError(t, err)
+@@ -861,11 +857,15 @@ func TestDCGMCollectorRejectsSameTimestampAfterRepair(t *testing.T) {
+ 		EntityGetLatestValues(dcgm.FE_GPU, uint(0), []dcgm.Short{counter.FieldID}).
+ 		Return(staleValue, nil)
+ 	rewatch := watcher.EXPECT().WatchDeviceFieldGroups(gomock.Any(), deviceInfo).Return(nil, nil, nil, nil)
+-	update := mockDCGM.EXPECT().UpdateAllFields().Return(nil)
+ 	retrySameTimestamp := mockDCGM.EXPECT().
+ 		EntityGetLatestValues(dcgm.FE_GPU, uint(0), []dcgm.Short{counter.FieldID}).
+ 		Return(staleValue, nil)
+-	gomock.InOrder(firstStaleRead, rewatch, update, retrySameTimestamp)
++	gomock.InOrder(firstStaleRead, rewatch, retrySameTimestamp)
++
++	first, firstErr := collector.GetMetrics()
++	require.NoError(t, firstErr)
++	assert.Empty(t, first)
++	finishTestProfilingRepair(t, collector)
+ 
+ 	got, err := collector.GetMetrics()
+ 	require.NoError(t, err)
+@@ -898,7 +898,7 @@ func TestDCGMCollectorPreservesHealthyMetricsWhenRepairFails(t *testing.T) {
+ 		1000,
+ 	)
+ 
+-	watcher.EXPECT().WatchDeviceFieldGroups(gomock.Any(), deviceInfo).Return(nil, nil, nil, nil)
++	watcher.EXPECT().WatchDeviceFieldGroups(gomock.Any(), deviceInfo).Return(nil, nil, nil, nil).Times(2)
+ 	collector, err := NewDCGMCollector(
+ 		[]counters.Counter{profilingCounter, temperatureCounter},
+ 		"host-a",
+@@ -907,10 +907,8 @@ func TestDCGMCollectorPreservesHealthyMetricsWhenRepairFails(t *testing.T) {
+ 	)
+ 	require.NoError(t, err)
+ 
+-	mockDCGM.EXPECT().EntityGetLatestValues(dcgm.FE_GPU, uint(0), fields).Return([]dcgm.FieldValue_v1{
+-		profilingFieldValue(profilingCounter.FieldID, dcgm.DCGM_ST_NOT_WATCHED, 10, 0),
+-		int64FieldValue(temperatureCounter.FieldID, 42),
+-	}, nil)
++	mockDCGM.EXPECT().EntityGetLatestValues(dcgm.FE_GPU, uint(0), []dcgm.Short{temperatureCounter.FieldID}).Return([]dcgm.FieldValue_v1{int64FieldValue(temperatureCounter.FieldID, 42)}, nil)
++	mockDCGM.EXPECT().EntityGetLatestValues(dcgm.FE_GPU, uint(0), []dcgm.Short{profilingCounter.FieldID}).Return([]dcgm.FieldValue_v1{profilingFieldValue(profilingCounter.FieldID, dcgm.DCGM_ST_NOT_WATCHED, 10, 0)}, nil)
+ 	watcher.EXPECT().
+ 		WatchDeviceFieldGroups(gomock.Any(), deviceInfo).
+ 		Return(nil, nil, nil, assert.AnError)
+@@ -941,16 +939,19 @@ func TestDCGMCollectorRepairsProfilingLifecycleStatuses(t *testing.T) {
+ 			collector := newTestProfilingCollector(t, deviceInfo, watcher, time.Second)
+ 			collector.now = func() time.Time { return time.Unix(100, 0) }
+ 
+-			// A lifecycle status triggers teardown, rewatch, refresh, and one retry.
+ 			firstRead := mockDCGM.EXPECT().
+ 				EntityGetLatestValues(dcgm.FE_GPU, uint(0), []dcgm.Short{counter.FieldID}).
+ 				Return([]dcgm.FieldValue_v1{profilingFieldValue(counter.FieldID, status, 10, 0)}, nil)
+ 			rewatch := watcher.EXPECT().WatchDeviceFieldGroups(gomock.Any(), deviceInfo).Return(nil, nil, nil, nil)
+-			update := mockDCGM.EXPECT().UpdateAllFields().Return(nil)
+ 			retry := mockDCGM.EXPECT().
+ 				EntityGetLatestValues(dcgm.FE_GPU, uint(0), []dcgm.Short{counter.FieldID}).
+ 				Return([]dcgm.FieldValue_v1{profilingFieldValue(counter.FieldID, dcgm.DCGM_ST_OK, 11, 5)}, nil)
+-			gomock.InOrder(firstRead, rewatch, update, retry)
++			gomock.InOrder(firstRead, rewatch, retry)
++
++			first, firstErr := collector.GetMetrics()
++			require.NoError(t, firstErr)
++			assert.Empty(t, first)
++			finishTestProfilingRepair(t, collector)
+ 
+ 			got, err := collector.GetMetrics()
+ 			require.NoError(t, err)
+@@ -1052,11 +1053,13 @@ func TestDCGMCollectorFallsBackAfterRetryFailure(t *testing.T) {
+ 					profilingFieldValue(counter.FieldID, dcgm.DCGM_ST_NOT_WATCHED, 10, 0),
+ 				}, nil)
+ 			watcher.EXPECT().WatchDeviceFieldGroups(gomock.Any(), deviceInfo).Return(nil, nil, nil, nil)
+-			mockDCGM.EXPECT().UpdateAllFields().Return(nil)
+ 			mockDCGM.EXPECT().
+ 				EntityGetLatestValues(dcgm.FE_GPU, uint(0), []dcgm.Short{counter.FieldID}).
+ 				Return(tt.retryVals, tt.retryErr)
+ 
++			_, err := collector.GetMetrics()
++			require.NoError(t, err)
++			finishTestProfilingRepair(t, collector)
+ 			got, err := collector.GetMetrics()
+ 			require.NoError(t, err)
+ 			assert.Empty(t, got)
+@@ -1096,6 +1099,9 @@ func TestDCGMCollectorRateLimitsFailedRepair(t *testing.T) {
+ 	require.NoError(t, err)
+ 	assert.Empty(t, got)
+ 
++	finishTestProfilingRepair(t, collector)
++	defer collector.Cleanup()
++
+ 	// The same stale status cannot trigger another watch operation during backoff.
+ 	mockDCGM.EXPECT().
+ 		EntityGetLatestValues(dcgm.FE_GPU, uint(0), []dcgm.Short{counter.FieldID}).
+@@ -1169,19 +1175,14 @@ func TestDCGMCollectorConcurrentScrapesPerformOneRepair(t *testing.T) {
+ 	require.NoError(t, err)
+ 	now = now.Add(2 * time.Second)
+ 
+-	// The first scrape repairs and retries; the serialized second scrape sees fresh data.
+ 	firstStaleRead := mockDCGM.EXPECT().
+ 		EntityGetLatestValues(dcgm.FE_GPU, uint(0), []dcgm.Short{counter.FieldID}).
+ 		Return(staleValue, nil)
+ 	rewatch := watcher.EXPECT().WatchDeviceFieldGroups(gomock.Any(), deviceInfo).Return(nil, nil, nil, nil)
+-	update := mockDCGM.EXPECT().UpdateAllFields().Return(nil)
+ 	retryRead := mockDCGM.EXPECT().
+ 		EntityGetLatestValues(dcgm.FE_GPU, uint(0), []dcgm.Short{counter.FieldID}).
+-		Return(freshValue, nil)
+-	secondScrapeRead := mockDCGM.EXPECT().
+-		EntityGetLatestValues(dcgm.FE_GPU, uint(0), []dcgm.Short{counter.FieldID}).
+-		Return(freshValue, nil)
+-	gomock.InOrder(firstStaleRead, rewatch, update, retryRead, secondScrapeRead)
++		Return(freshValue, nil).AnyTimes()
++	gomock.InOrder(firstStaleRead, rewatch, retryRead)
+ 
+ 	// Release both callers together to exercise the collector mutex.
+ 	start := make(chan struct{})
+@@ -1641,3 +1642,17 @@ func TestToMetricSuppressesCollectedHostnameLabelsWhenNoHostnameIsEnabled(t *tes
+ func TestToStringUnsupportedFieldType(t *testing.T) {
+ 	assert.Equal(t, skipDCGMValue, toString(dcgm.FieldValue_v1{FieldType: dcgm.DCGM_FT_BINARY}))
+ }
++
++// finishTestProfilingRepair makes follow-up reads deterministic without sleeps.
++func finishTestProfilingRepair(t *testing.T, c *DCGMCollector) {
++	t.Helper()
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	require.NotNil(t, c.profilingRepairDone)
++	select {
++	case <-c.profilingRepairDone:
++		c.profilingRepairDone = nil
++	case <-time.After(time.Second):
++		t.Fatal("profiling repair did not complete")
++	}
++}
+diff --git a/internal/pkg/collector/profiling_isolation_test.go b/internal/pkg/collector/profiling_isolation_test.go
+new file mode 100644
+index 0000000..6799cd6
+--- /dev/null
++++ b/internal/pkg/collector/profiling_isolation_test.go
+@@ -0,0 +1,140 @@
++/*
++ * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package collector
++
++import (
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/NVIDIA/go-dcgm/pkg/dcgm"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"go.uber.org/mock/gomock"
++
++	mockdcgm "github.com/NVIDIA/dcgm-exporter/internal/mocks/pkg/dcgmprovider"
++	mockdevicewatcher "github.com/NVIDIA/dcgm-exporter/internal/mocks/pkg/devicewatcher"
++	"github.com/NVIDIA/dcgm-exporter/internal/pkg/appconfig"
++	"github.com/NVIDIA/dcgm-exporter/internal/pkg/counters"
++	"github.com/NVIDIA/dcgm-exporter/internal/pkg/dcgmprovider"
++	"github.com/NVIDIA/dcgm-exporter/internal/pkg/deviceinfo"
++	"github.com/NVIDIA/dcgm-exporter/internal/pkg/devicewatcher"
++	"github.com/NVIDIA/dcgm-exporter/internal/pkg/devicewatchlistmanager"
++)
++
++// The repair deliberately blocks longer than an HTTP scrape budget. Healthy
++// power must be read again on every scrape, while its watch stays installed.
++func TestProfilingRepairDoesNotBlockFreshPower(t *testing.T) {
++	realDCGM := dcgmprovider.Client()
++	t.Cleanup(func() { dcgmprovider.SetClient(realDCGM) })
++	ctrl := gomock.NewController(t)
++	client := mockdcgm.NewMockDCGM(ctrl)
++	dcgmprovider.SetClient(client)
++	info := testGPUDeviceInfo(ctrl)
++	watcher := mockdevicewatcher.NewMockWatcher(ctrl)
++	profile := testProfilingCounter()
++	power := counters.Counter{FieldID: dcgm.DCGM_FI_DEV_POWER_USAGE, FieldName: "DCGM_FI_DEV_POWER_USAGE", PromType: "gauge"}
++	fields := []dcgm.Short{power.FieldID, profile.FieldID}
++	watch := *devicewatchlistmanager.NewWatchList(info, fields, nil, watcher, 100)
++	var broken, powerReads, powerCleanup atomic.Int32
++	entered, release := make(chan struct{}), make(chan struct{})
++	var releaseOnce, enteredOnce sync.Once
++	unblock := func() { releaseOnce.Do(func() { close(release) }) }
++	defer unblock()
++	watcher.EXPECT().WatchDeviceFieldGroups(gomock.Any(), info).DoAndReturn(
++		func(groups []devicewatcher.FieldWatchGroup, _ deviceinfo.Provider) ([]dcgm.GroupHandle, []dcgm.FieldHandle, []func(), error) {
++			ownsPower := false
++			for _, group := range groups {
++				for _, field := range group.Fields {
++					ownsPower = ownsPower || field == power.FieldID
++				}
++			}
++			if broken.Load() == 1 {
++				enteredOnce.Do(func() { close(entered) })
++				<-release
++				broken.Store(2)
++			}
++			return nil, nil, []func(){func() {
++				if ownsPower {
++					powerCleanup.Add(1)
++				}
++			}}, nil
++		},
++	).AnyTimes()
++	client.EXPECT().EntityGetLatestValues(dcgm.FE_GPU, uint(0), gomock.Any()).DoAndReturn(
++		func(_ dcgm.Field_Entity_Group, _ uint, wanted []dcgm.Short) ([]dcgm.FieldValue_v1, error) {
++			var result []dcgm.FieldValue_v1
++			for _, field := range wanted {
++				if field == power.FieldID {
++					result = append(result, int64FieldValue(field, byte(100+powerReads.Add(1))))
++				}
++				if field == profile.FieldID {
++					status := dcgm.DCGM_ST_OK
++					if broken.Load() == 1 {
++						status = dcgm.DCGM_ST_NOT_WATCHED
++					}
++					result = append(result, profilingFieldValue(field, status, time.Now().UnixMicro(), 1))
++				}
++			}
++			return result, nil
++		},
++	).AnyTimes()
++	// Keep the old implementation runnable so the regression fails on blocking,
++	// rather than on an unexpected mock call.
++	client.EXPECT().UpdateAllFields().Return(nil).AnyTimes()
++	c, err := NewDCGMCollector([]counters.Counter{power, profile}, "host-a", &appconfig.Config{}, watch)
++	require.NoError(t, err)
++	defer c.Cleanup()
++	defer unblock()
++	initial, err := c.GetMetrics()
++	require.NoError(t, err)
++	require.Len(t, initial[profile], 1)
++	broken.Store(1)
++	type result struct {
++		metrics MetricsByCounter
++		err     error
++	}
++	response := make(chan result, 1)
++	go func() { m, e := c.GetMetrics(); response <- result{m, e} }()
++	select {
++	case <-entered:
++	case <-time.After(time.Second):
++		t.Fatal("repair did not start")
++	}
++	select {
++	case got := <-response:
++		require.NoError(t, got.err)
++		require.Len(t, got.metrics[power], 1)
++		assert.Equal(t, "102", got.metrics[power][0].Value)
++		assert.Empty(t, got.metrics[profile], "unhealthy profiling must be absent, not zero")
++	case <-time.After(time.Second):
++		unblock()
++		<-response
++		t.Fatal("profiling repair blocked a healthy power scrape")
++	}
++	got, err := c.GetMetrics()
++	require.NoError(t, err)
++	require.Len(t, got[power], 1)
++	assert.Equal(t, "103", got[power][0].Value, "power must not be a cached fallback")
++	assert.Empty(t, got[profile])
++	assert.Zero(t, powerCleanup.Load(), "profiling repair must not unwatch power")
++	unblock()
++	require.Eventually(t, func() bool { m, e := c.GetMetrics(); return e == nil && len(m[profile]) == 1 }, time.Second, time.Millisecond)
++	c.Cleanup()
++	assert.EqualValues(t, 1, powerCleanup.Load())
++}
+diff --git a/internal/pkg/server/live_profiling_isolation_test.go b/internal/pkg/server/live_profiling_isolation_test.go
+new file mode 100644
+index 0000000..a9106db
+--- /dev/null
++++ b/internal/pkg/server/live_profiling_isolation_test.go
+@@ -0,0 +1,170 @@
++/*
++ * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package server
++
++import (
++	"encoding/json"
++	"net/http"
++	"net/http/httptest"
++	stdos "os"
++	"path/filepath"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/NVIDIA/go-dcgm/pkg/dcgm"
++	"github.com/stretchr/testify/require"
++
++	"github.com/NVIDIA/dcgm-exporter/internal/pkg/appconfig"
++	"github.com/NVIDIA/dcgm-exporter/internal/pkg/collector"
++	"github.com/NVIDIA/dcgm-exporter/internal/pkg/counters"
++	"github.com/NVIDIA/dcgm-exporter/internal/pkg/dcgmprovider"
++	"github.com/NVIDIA/dcgm-exporter/internal/pkg/deviceinfo"
++	"github.com/NVIDIA/dcgm-exporter/internal/pkg/devicewatcher"
++	"github.com/NVIDIA/dcgm-exporter/internal/pkg/devicewatchlistmanager"
++	"github.com/NVIDIA/dcgm-exporter/internal/pkg/registry"
++)
++
++// This opt-in hardware probe uses real DCGM, watches, registry and HTTP rendering.
++// Only the profiling status and a five-second repair delay are injected. The
++// external SRT consumer records samples and checks that DCGM power timestamps
++// advance throughout the fault. No injection path enters the production binary.
++func TestLiveProfilingIsolation(t *testing.T) {
++	dir := stdos.Getenv("POWERX_LIVE_PROBE_DIR")
++	if dir == "" {
++		t.Skip("requires an explicitly owned GPU allocation and external SRT consumer")
++	}
++	require.NoError(t, stdos.MkdirAll(dir, 0o755))
++	file, err := stdos.Create(filepath.Join(dir, "dcgm-reads.jsonl"))
++	require.NoError(t, err)
++	defer file.Close()
++	trace := &isolationTrace{encoder: json.NewEncoder(file)}
++	config := &appconfig.Config{CollectInterval: 100, GPUDeviceOptions: appconfig.DeviceOptions{Flex: true, MajorRange: []int{-1}, MinorRange: []int{-1}}}
++	dcgmprovider.Initialize(config)
++	realClient := dcgmprovider.Client()
++	defer realClient.Cleanup()
++	config.MetricGroups, err = realClient.GetSupportedMetricGroups(0)
++	require.NoError(t, err)
++	config.CollectDCP = true
++	client := &isolationClient{DCGM: realClient, trace: trace}
++	dcgmprovider.SetClient(client)
++	defer dcgmprovider.SetClient(realClient)
++	set, err := counters.ExtractCounters([][]string{
++		{"DCGM_FI_DEV_POWER_USAGE", "gauge", "Power in watts"},
++		{"DCGM_FI_DEV_GPU_UTIL", "gauge", "GPU utilization"},
++		{"DCGM_FI_PROF_SM_ACTIVE", "gauge", "SM activity"},
++	}, config)
++	require.NoError(t, err)
++	require.True(t, set.HasProfilingMetrics(), "a power-only run cannot validate profiling isolation")
++	manager := devicewatchlistmanager.NewWatchListManager(set.DCGMCounters, config)
++	watcher := &isolationWatcher{Watcher: devicewatcher.NewDeviceWatcher(), trace: trace}
++	require.NoError(t, manager.CreateEntityWatchList(dcgm.FE_GPU, watcher, 100))
++	r := registry.NewRegistry()
++	defer r.Cleanup()
++	factory := collector.InitCollectorFactory(set, manager, "power-probe", config)
++	for _, tuple := range factory.NewCollectors() {
++		r.Register(tuple)
++	}
++	s, cleanup, err := NewMetricsServer(config, manager, r)
++	require.NoError(t, err)
++	defer cleanup()
++	mux := http.NewServeMux()
++	mux.HandleFunc("/metrics", s.Metrics)
++	mux.HandleFunc("/inject", func(w http.ResponseWriter, request *http.Request) {
++		if request.Method != http.MethodPost {
++			w.WriteHeader(http.StatusMethodNotAllowed)
++			return
++		}
++		if !trace.phase.CompareAndSwap(0, 1) {
++			w.WriteHeader(http.StatusConflict)
++			return
++		}
++		trace.write(map[string]any{"event": "fault_requested", "at": time.Now().UnixMicro()})
++		w.WriteHeader(http.StatusAccepted)
++	})
++	endpoint := httptest.NewServer(mux)
++	defer endpoint.Close()
++	require.NoError(t, stdos.WriteFile(filepath.Join(dir, "endpoint.txt"), []byte(endpoint.URL), 0o644))
++	deadline := time.After(90 * time.Second)
++	ticker := time.NewTicker(100 * time.Millisecond)
++	defer ticker.Stop()
++	for {
++		select {
++		case <-deadline:
++			t.Fatal("external SRT consumer did not finish within 90s")
++		case <-ticker.C:
++			if _, err := stdos.Stat(filepath.Join(dir, "stop")); err == nil {
++				require.EqualValues(t, 3, trace.phase.Load(), "profiling fault and repair must both execute")
++				return
++			}
++		}
++	}
++}
++
++type isolationTrace struct {
++	phase   atomic.Int32
++	mu      sync.Mutex
++	encoder *json.Encoder
++}
++
++func (p *isolationTrace) write(record any) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	if err := p.encoder.Encode(record); err != nil {
++		panic(err)
++	}
++}
++
++type isolationClient struct {
++	dcgmprovider.DCGM
++	trace *isolationTrace
++}
++
++func (p *isolationClient) EntityGetLatestValues(group dcgm.Field_Entity_Group, id uint, fields []dcgm.Short) ([]dcgm.FieldValue_v1, error) {
++	start := time.Now()
++	values, err := p.DCGM.EntityGetLatestValues(group, id, fields)
++	for i := range values {
++		v := &values[i]
++		if v.FieldID == dcgm.DCGM_FI_DEV_POWER_USAGE {
++			p.trace.write(map[string]any{"event": "power_read", "at": time.Now().UnixMicro(), "dcgm_timestamp": v.TS, "status": v.Status, "gpu": id, "phase": p.trace.phase.Load(), "request_seconds": time.Since(start).Seconds()})
++		}
++		if v.FieldID == dcgm.DCGM_FI_PROF_SM_ACTIVE && p.trace.phase.Load() == 1 {
++			v.Status = dcgm.DCGM_ST_NOT_WATCHED
++		}
++	}
++	return values, err
++}
++
++type isolationWatcher struct {
++	devicewatcher.Watcher
++	trace *isolationTrace
++}
++
++func (p *isolationWatcher) WatchDeviceFieldGroups(groups []devicewatcher.FieldWatchGroup, info deviceinfo.Provider) ([]dcgm.GroupHandle, []dcgm.FieldHandle, []func(), error) {
++	fault := p.trace.phase.CompareAndSwap(1, 2)
++	if fault {
++		p.trace.write(map[string]any{"event": "repair_entered", "at": time.Now().UnixMicro()})
++		time.Sleep(5 * time.Second)
++	}
++	a, b, cleanups, err := p.Watcher.WatchDeviceFieldGroups(groups, info)
++	if fault {
++		p.trace.phase.Store(3)
++		p.trace.write(map[string]any{"event": "repair_returned", "at": time.Now().UnixMicro(), "success": err == nil})
++	}
++	return a, b, cleanups, err
++}

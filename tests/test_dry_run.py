@@ -49,6 +49,14 @@ def _make_config(overrides: dict | None = None) -> SrtConfig:
     return SrtConfig.from_yaml(tmp_path)
 
 
+def test_cluster_gpu_visibility_is_visible(tmp_path, monkeypatch, capsys):
+    cluster_config = tmp_path / "srtslurm.yaml"
+    cluster_config.write_text(yaml.safe_dump({"visible_devices_env": "ROCR_VISIBLE_DEVICES"}))
+    monkeypatch.setenv("SRTSLURM_CONFIG", str(cluster_config))
+    show_config_details(_make_config())
+    assert "GPU subset visibility variable: ROCR_VISIBLE_DEVICES" in capsys.readouterr().out
+
+
 class TestDryRunDynamoMetrics:
     @pytest.mark.parametrize(
         ("settings", "expected", "excluded"),
@@ -1059,8 +1067,11 @@ class TestInfmaxWorkspaceMount:
 
 
 @pytest.mark.parametrize("nsys, expected", [({}, "enabled"), ({"enabled": False}, "disabled")])
-def test_observability_nsys_details(capsys, nsys, expected):
-    cfg = _make_config({"observability": {"enabled": True, "nsys": nsys}, "frontend": {"type": "dynamo"}})
+@pytest.mark.parametrize("backend", ["trtllm", "sglang"])
+def test_observability_nsys_details(capsys, nsys, expected, backend):
+    cfg = _make_config(
+        {"observability": {"enabled": True, "nsys": nsys}, "frontend": {"type": "dynamo"}, "backend": {"type": backend}}
+    )
     show_config_details(cfg)
     output = capsys.readouterr().out
     assert "nsys" in output and expected in output
@@ -1068,14 +1079,17 @@ def test_observability_nsys_details(capsys, nsys, expected):
         for text in (
             "NVTX (no CUDA tracing)",
             "nsys CPU sampling",
-            "process-tree (every target)",
+            "system-wide (every target)",
             "Dynamo frontends",
             "measured_workload",
             "after warmup",
             "1800s",
             "DYN_ENABLE_RUST_NVTX",
+            "DYN_NVTX=1",
+            "TLLM_LLMAPI_ENABLE_NVTX" if backend == "trtllm" else "SGLANG_ENABLE_NVTX_SCHEDULER",
         ):
             assert text in output
+        assert ("SGLANG_ENABLE_NVTX_SCHEDULER" in output) == (backend == "sglang")
     else:
         assert "nsys targets" not in output
 

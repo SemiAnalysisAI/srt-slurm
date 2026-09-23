@@ -129,9 +129,9 @@ class TRTLLMProtocol:
     sequential_node_start: int = 0
 
     # Whether to prefix the trtllm worker command with `numactl -m 0,1`.
-    # None (default) preserves the existing auto-detected behavior (enabled
-    # only for gb200/gb300). True/False forces numactl on/off regardless of
-    # gpu_type.
+    # None (default) enables it only for gb200/gb300/vrnvl72 prefill and decode
+    # workers (case-sensitive GPU type). True/False forces numactl on/off
+    # regardless of gpu_type or mode.
     numa_memory_bind: bool | None = None
 
     # Optional stricter NUMA CPU affinity for the worker process, in addition
@@ -197,7 +197,7 @@ class TRTLLMProtocol:
     def get_failover_environment(self, process: "Process", job_id: str) -> dict[str, str]:
         return {}
 
-    def should_set_cuda_visible_devices(self, process: "Process") -> bool:
+    def should_set_visible_devices(self) -> bool:
         return True
 
     def get_config_for_mode(self, mode: WorkerMode) -> dict[str, Any]:
@@ -348,7 +348,7 @@ class TRTLLMProtocol:
         model_arg = runtime.worker_model_arg
 
         if self.numa_memory_bind is None:
-            use_numactl = runtime.gpu_type in ("gb200", "gb300") and mode in ("prefill", "decode")
+            use_numactl = runtime.gpu_type in ("gb200", "gb300", "vrnvl72") and mode in ("prefill", "decode")
         else:
             use_numactl = self.numa_memory_bind
         numactl_prefix = ["numactl", "-m", "0,1"] if use_numactl else []
@@ -394,6 +394,8 @@ class TRTLLMProtocol:
             # ai-dynamo tensorrtllm-runtime 1.3.0-dev.1 container, which accept --config;
             # some trtllm-serve builds spell this --extra_llm_api_options.
             cmd.extend(["--config", str(container_config_path)])
+            if self.served_model_name:
+                cmd.extend(["--served_model_name", self.served_model_name])
             cmd.extend(self.get_extra_args_for_mode(mode))
             return self._wrap_with_numa_cpu_bind(cmd)
 

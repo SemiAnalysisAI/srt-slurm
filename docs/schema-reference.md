@@ -13,7 +13,7 @@ Top-level keys of a recipe YAML.
 | `name` | str | required |  |
 | `model` | [ModelConfig](#modelconfig) | required |  |
 | `resources` | [ResourceConfig](#resourceconfig) | required |  |
-| `engine` | str \| mapping | required | The engine type (`sglang`, `trtllm`, `vllm`, `mocker`) as a string, or a mapping with `type` plus the engine-wide knobs listed under [Engine types](#engine-types). |
+| `engine` | str \| mapping | required | The engine type (`atom`, `sglang`, `trtllm`, `vllm`, `mocker`) as a string, or a mapping with `type` plus the engine-wide knobs listed under [Engine types](#engine-types). |
 | `roles` | mapping of role -> [Role](#roles) | required | One block per worker role (`prefill`, `decode`, `agg`): topology, env, and engine args. |
 | `schema` | int | `2` | Recipe schema version. Write `schema: 2` for this layout. |
 | `slurm` | [SlurmConfig](#slurmconfig) | `SlurmConfig()` |  |
@@ -44,7 +44,7 @@ Three vocabularies are specific to the 2.0 layout. They are normalized into the 
 
 ### engine
 
-`engine: <type>` or `engine: {type: <type>, ...}`. `type` is one of `sglang`, `trtllm`, `vllm`, `mocker`; the remaining keys are that engine's knobs, listed under [Engine types](#engine-types).
+`engine: <type>` or `engine: {type: <type>, ...}`. `type` is one of `atom`, `sglang`, `trtllm`, `vllm`, `mocker`; the remaining keys are that engine's knobs, listed under [Engine types](#engine-types).
 
 ### roles
 
@@ -394,6 +394,7 @@ Native Tachometer collection for an observability-enabled run.
 | `storage_subdir` | str | `'tachometer'` |  |
 | `extra_metadata` | dict[str, str] | `{}` |  |
 | `default_exporters` | bool | `True` |  |
+| `default_gpu_exporter` | [TelemetryExporterConfig](#telemetryexporterconfig) \| None | `<lambda>()` | Resolved from srtslurm.yaml at load time; never read global config here. |
 | `dcgm_exporter` | [TelemetryExporterConfig](#telemetryexporterconfig) \| None | `None` |  |
 | `node_exporter` | [TelemetryExporterConfig](#telemetryexporterconfig) \| None | `None` |  |
 | `process_exporter` | [TelemetryExporterConfig](#telemetryexporterconfig) \| None | `None` |  |
@@ -408,6 +409,7 @@ Automatic NVTX tracing and CPU sampling of workers and Dynamo frontends.
 | `capture_window` | one of `'measured_workload'`, `'including_startup'` | `'measured_workload'` | measured_workload excludes warmup; including_startup spans process launch through teardown. |
 | `report_timeout_secs` | int | `1800` | Maximum wait for a control acknowledgment or a step's report finalization. |
 | `nvtx_injection_path` | str \| None | `None` | Optional container path to libToolsInjection64.so for NVTX injection. |
+| `cpu_sampling` | one of `'system-wide'`, `'process-tree'`, `'none'` | `'system-wide'` | CPU IP sampling and context-switch scope. process-tree fails on engines with many threads ("Not enough resources ... switch to system-wide"); system-wide samples every process on the node, none records NVTX only. |
 
 ### TelemetryExporterConfig
 
@@ -572,6 +574,18 @@ Ready when the service's log file contains a line matching the regular expressio
 
 `engine.type` selects one of the following; the remaining `engine` keys are that type's knobs.
 
+### AtomProtocol
+
+`engine.type: atom`
+
+Launch ``atom.entrypoints.openai_server`` on ROCm workers.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `type` | one of `'atom'` | `'atom'` |  |
+| `connector` | one of `'mooncake'` | `'mooncake'` |  |
+| `mooncake_protocol` | one of `'rdma'`, `'tcp'` \| None | `None` |  |
+
 ### SGLangProtocol
 
 `engine.type: sglang`
@@ -596,7 +610,7 @@ TRTLLM protocol - implements BackendProtocol.
 | `publish_metrics` | bool | `True` | Publish TRT-LLM engine metrics without enabling KV-cache events. Requires a Dynamo build supporting --publish-metrics; set False to omit the flag for older builds. Native trtllm-serve and sidecars are unaffected. Iteration statistics stay off regardless: srtctl bakes enable_iter_perf_stats: false into every engine section unless the recipe or observability sets it (TRTLLM_ENGINE_DEFAULTS), so this flag costs the per-request perf metrics only. |
 | `publish_events_and_metrics` | bool \| None | `None` | None means unspecified: metrics default on, events off (observability promotes this to True). Explicit False is a master opt-out of BOTH publication flags, even when publish_metrics is True. Preserve None in schema round-trips so an omitted value never becomes an explicit opt-out. |
 | `sequential_node_start` | int | `0` | Controls batched startup of workers that share the same node. 0 = start all workers in parallel (no constraint). 1 = fully sequential: one worker at a time, each must be ready before the next. N > 1 = start N workers simultaneously per batch, wait for all to be ready, then next batch. For trtllm_serve: readiness is an HTTP 200 on the worker's http_port. For dynamo.trtllm: readiness is a TCP connection on the worker's sys_port. |
-| `numa_memory_bind` | bool \| None | `None` | Whether to prefix the trtllm worker command with `numactl -m 0,1`. None (default) preserves the existing auto-detected behavior (enabled only for gb200/gb300). True/False forces numactl on/off regardless of gpu_type. |
+| `numa_memory_bind` | bool \| None | `None` | Whether to prefix the trtllm worker command with `numactl -m 0,1`. None (default) enables it only for gb200/gb300/vrnvl72 prefill and decode workers (case-sensitive GPU type). True/False forces numactl on/off regardless of gpu_type or mode. |
 | `numa_cpu_bind` | bool | `False` | Optional stricter NUMA CPU affinity for the worker process, in addition to numa_memory_bind. A previous post-hoc `taskset -pc <cpuset> $PPID` approach (see bind-b300-prefill-cpus.sh) only pins the leader PID *after* launch, so secondary threads spawned by Python/UCX/MPI/TRT-LLM can still land cross-socket. When true, srtctl instead: 1. sets TLLM_NUMA_AWARE_WORKER_AFFINITY=0 (disables TRT-LLM's own internal NUMA thread-pinning, which fights with the OS-level mask) 2. wraps the worker command (prefill/decode/agg) in `taskset -c <cpu_list>`, applied *before* exec so every spawned thread inherits the mask. The CPU list is discovered at runtime (configs/numa_cpu_bind.sh) from the physical GPU this task owns, not a static SLURM_LOCALID table — a static table assumes SLURM_LOCALID is a node-wide GPU ordinal, which breaks when two endpoints share a node (each gets its own srun step, so LOCALID restarts at 0 for both). |
 
 ### VLLMProtocol
@@ -608,8 +622,8 @@ vLLM protocol - implements BackendProtocol.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `type` | one of `'vllm'` | `'vllm'` |  |
-| `set_cuda_visible_devices` | bool | `False` | Legacy device binding for vLLM builds without --device-ids. |
-| `connector` | str \| None | `'nixl'` | Default KV connector: "nixl", "lmcache", "kvbm", or a raw JSON string for --kv-transfer-config. Can be overridden per role by setting "connector" in roles.<role>.args; connector_for_mode resolves it. dynamo 1.0.0+: translated to --kv-transfer-config (--connector was removed). |
+| `set_visible_devices` | bool | `False` | Use an environment mask instead of the engine's --device-ids option. |
+| `connector` | str \| None | `'nixl'` | Default KV connector: "nixl", "lmcache", "kvbm", "moriio", or a raw JSON string for --kv-transfer-config. Can be overridden per role by setting "connector" in roles.<role>.args; connector_for_mode resolves it. "moriio" (ROCm MoRI-IO) registers workers with the vLLM Router and needs frontend.type: vllm-router. dynamo 1.0.0+: translated to --kv-transfer-config (--connector was removed). |
 | `failover` | [VLLMFailoverConfig](#vllmfailoverconfig) \| None | `None` | Shadow engine recovery: when set, every worker runs shadow_engines standby engines on its GPUs next to an implied `gms` service that owns the weights. Dynamo frontend only. |
 | `allow_prefill_decode_colocation` | bool | `False` | Allow prefill and decode workers to share one node when the combined GPU request fits within gpus_per_node. Defaults off to preserve existing P/D node separation. |
 | `allow_prefill_decode_colocation_across_nodes` | bool | `False` | Extend P/D colocation to multi-node topologies. When enabled together with allow_prefill_decode_colocation, workers are packed contiguously across the minimum number of nodes instead of reserving separate P/D node pools. Defaults off to preserve the original one-node-only policy. |
@@ -663,6 +677,8 @@ Top-level keys of `srtslurm.yaml`. Recipes inherit these defaults and resolve al
 | `gpus_per_node` | int \| None | `None` |  |
 | `default_gpu_type` | str \| None | `None` | Default for ``ResourceConfig.gpu_type`` when the recipe omits it. Lets one recipe move between clusters of different GPU types without an edit. |
 | `network_interface` | str \| None | `None` |  |
+| `visible_devices_env` | str | `'CUDA_VISIBLE_DEVICES'` | GPU-subset mask passed to workers; ROCm clusters use ROCR_VISIBLE_DEVICES. |
+| `default_gpu_exporter` | [TelemetryExporterConfig](#telemetryexporterconfig) \| None | `<lambda>()` | Recipe exporter settings win. Explicit null disables the GPU default only. |
 | `use_gpus_per_node_directive` | bool | `True` |  |
 | `use_segment_sbatch_directive` | bool | `True` |  |
 | `use_exclusive_sbatch_directive` | bool | `False` |  |

@@ -3,7 +3,15 @@
 
 """Tests for TRT-LLM's served model name override."""
 
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
 from srtctl.backends.trtllm import TRTLLMProtocol, TRTLLMServerConfig
+from srtctl.core.schema import DynamoConfig
+from srtctl.core.topology import Process
 
 
 class TestTRTLLMServedModelName:
@@ -39,9 +47,6 @@ class TestTRTLLMServedModelName:
 
     def test_reaches_the_worker_command(self):
         """The worker must actually be launched with the configured name."""
-        from pathlib import Path
-        from unittest.mock import MagicMock
-
         backend = TRTLLMProtocol(served_model_name="deepseek-ai/deepseek-r1")
         runtime = MagicMock()
         runtime.model_path = Path("/models/deepseek_r1-torch-fp4-v2")
@@ -53,3 +58,29 @@ class TestTRTLLMServedModelName:
 
         assert "--served-model-name" in cmd
         assert cmd[cmd.index("--served-model-name") + 1] == "deepseek-ai/deepseek-r1"
+
+    @pytest.mark.parametrize("name", ["org/model", None])
+    def test_direct_worker_receives_explicit_name(self, tmp_path: Path, name: str | None) -> None:
+        backend = TRTLLMProtocol(served_model_name=name)
+        runtime = SimpleNamespace(
+            model_path=Path("/weights/checkpoint"),
+            worker_model_arg="/model",
+            log_dir=tmp_path,
+            gpu_type="h200",
+            frontend_port=8000,
+            dynamo=DynamoConfig(),
+        )
+        process = Process(
+            node="worker",
+            gpu_indices=frozenset({0}),
+            sys_port=7500,
+            http_port=9001,
+            endpoint_mode="agg",
+            endpoint_index=0,
+        )
+        command = backend.build_worker_command(process, [process], runtime, frontend_type="trtllm_serve")
+
+        if name is None:
+            assert "--served_model_name" not in command
+        else:
+            assert command[command.index("--served_model_name") + 1] == "org/model"

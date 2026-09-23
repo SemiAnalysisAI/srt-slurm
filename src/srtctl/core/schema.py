@@ -35,6 +35,7 @@ from marshmallow import Schema, ValidationError, fields, validate
 from marshmallow_dataclass import dataclass
 
 from srtctl.backends import (
+    AtomProtocol,
     BackendConfig,
     MockerProtocol,
     SGLangProtocol,
@@ -349,6 +350,10 @@ class ClusterConfig:
     # recipe move between clusters of different GPU types without an edit.
     default_gpu_type: str | None = None
     network_interface: str | None = None
+    # GPU-subset mask passed to workers; ROCm clusters use ROCR_VISIBLE_DEVICES.
+    visible_devices_env: str = "CUDA_VISIBLE_DEVICES"
+    # Recipe exporter settings win. Explicit null disables the GPU default only.
+    default_gpu_exporter: "TelemetryExporterConfig | None" = field(default_factory=lambda: DEFAULT_DCGM_EXPORTER)
     use_gpus_per_node_directive: bool = True
     use_segment_sbatch_directive: bool = True
     use_exclusive_sbatch_directive: bool = False
@@ -444,7 +449,7 @@ class BackendConfigField(fields.Field):
             # Default to SGLang
             return SGLangProtocol()
 
-        if isinstance(value, SGLangProtocol | TRTLLMProtocol | VLLMProtocol | MockerProtocol):
+        if isinstance(value, AtomProtocol | SGLangProtocol | TRTLLMProtocol | VLLMProtocol | MockerProtocol):
             return value
 
         if not isinstance(value, dict):
@@ -453,7 +458,9 @@ class BackendConfigField(fields.Field):
         # Get backend type from the value dict
         backend_type = value.get("type", "sglang")
 
-        if backend_type == "sglang":
+        if backend_type == "atom":
+            return AtomProtocol.Schema().load(value)
+        elif backend_type == "sglang":
             schema = SGLangProtocol.Schema()
             return schema.load(value)
         elif backend_type == "trtllm":
@@ -467,13 +474,15 @@ class BackendConfigField(fields.Field):
             return schema.load(value)
         else:
             raise ValidationError(
-                f"Unknown backend type: {backend_type!r}. Supported types: sglang, trtllm, vllm, mocker"
+                f"Unknown backend type: {backend_type!r}. Supported types: atom, sglang, trtllm, vllm, mocker"
             )
 
     def _serialize(self, value: Any | None, attr: str | None, obj: Any, **kwargs) -> Any:
         """Serialize backend config to dict."""
         if value is None:
             return None
+        if isinstance(value, AtomProtocol):
+            return AtomProtocol.Schema().dump(value)
         if isinstance(value, SGLangProtocol):
             return SGLangProtocol.Schema().dump(value)
         if isinstance(value, TRTLLMProtocol):
@@ -1330,6 +1339,8 @@ class TachometerConfig:
     storage_subdir: str = "tachometer"
     extra_metadata: dict[str, str] = field(default_factory=dict)
     default_exporters: bool = True
+    # Resolved from srtslurm.yaml at load time; never read global config here.
+    default_gpu_exporter: TelemetryExporterConfig | None = field(default_factory=lambda: DEFAULT_DCGM_EXPORTER)
     dcgm_exporter: TelemetryExporterConfig | None = None
     node_exporter: TelemetryExporterConfig | None = None
     process_exporter: TelemetryExporterConfig | None = None
@@ -1338,10 +1349,10 @@ class TachometerConfig:
 
     @property
     def resolved_dcgm_exporter(self) -> TelemetryExporterConfig | None:
-        """User-configured DCGM exporter, else the built-in default."""
+        """Recipe exporter, else the resolved cluster default."""
         if self.dcgm_exporter is not None:
             return self.dcgm_exporter
-        return DEFAULT_DCGM_EXPORTER if self.default_exporters else None
+        return self.default_gpu_exporter if self.default_exporters else None
 
     @property
     def resolved_node_exporter(self) -> TelemetryExporterConfig | None:
@@ -1377,10 +1388,16 @@ class NsysObservabilityConfig:
     report_timeout_secs: int = 1800
     # Optional container path to libToolsInjection64.so for NVTX injection.
     nvtx_injection_path: str | None = None
+    # CPU IP sampling and context-switch scope. process-tree fails on engines with
+    # many threads ("Not enough resources ... switch to system-wide"); system-wide
+    # samples every process on the node, none records NVTX only.
+    cpu_sampling: Literal["system-wide", "process-tree", "none"] = "system-wide"
 
     def __post_init__(self) -> None:
         if self.capture_window not in {"measured_workload", "including_startup"}:
             raise ValidationError("observability.nsys.capture_window must be measured_workload or including_startup")
+        if self.cpu_sampling not in {"system-wide", "process-tree", "none"}:
+            raise ValidationError("observability.nsys.cpu_sampling must be system-wide, process-tree or none")
         if self.report_timeout_secs <= 0:
             raise ValidationError("observability.nsys.report_timeout_secs must be positive")
         if self.nvtx_injection_path is not None and not self.nvtx_injection_path.startswith("/"):
@@ -2314,6 +2331,7 @@ class SrtConfig:
         self._validate_frontend()
         self._validate_dynamo_sidecar()
         self._validate_vllm_failover()
+        self._validate_vllm_discovery_connector()
         self._validate_host_setup()
         self._validate_benchmark_type()
         self._validate_services_only()
@@ -2444,6 +2462,22 @@ class SrtConfig:
                 "host_setup.teardown is set without host_setup.commands; "
                 "teardown will still run after the job, which is only what you want "
                 "if something outside this recipe set the node state"
+            )
+
+    def _validate_vllm_discovery_connector(self) -> None:
+        """A discovery connector (vLLM MoRI-IO) needs the router that runs its registration endpoint.
+
+        Workers learn each other's transfer addresses from the vLLM Router's ZMQ
+        discovery listener, which no other frontend runs. The Router's own rules
+        (both roles on the connector, one router on the head node, a P/D
+        topology) live in ``VLLMRouterFrontend.validate``.
+        """
+        if not isinstance(self.backend, VLLMProtocol) or not self.backend.discovers_workers():
+            return
+        if self.frontend.type != "vllm-router":
+            raise ValidationError(
+                "a discovery connector (engine.connector: moriio) registers workers with the vLLM Router; "
+                f"it requires frontend.type: vllm-router (got {self.frontend.type!r})"
             )
 
     def _validate_vllm_failover(self) -> None:
@@ -3205,6 +3239,17 @@ class SrtConfig:
     def served_model_name(self) -> str:
         """Get the served model name from backend config or model path."""
         default = Path(self.model.path).name
+        if isinstance(self.backend, AtomProtocol):
+            # ATOM advertises the literal --model argument; unlike SGLang/vLLM,
+            # it has no separate served-model-name alias. Match the worker's
+            # HF ID or container-visible path, including node-local staging.
+            model_path = os.path.expandvars(self.model.path)
+            if model_path.startswith("hf:"):
+                default = model_path[3:]
+            elif self.model.stage_dir:
+                default = str(Path(os.path.expandvars(self.model.stage_dir)) / Path(model_path).resolve().name)
+            else:
+                default = "/model"
         return self.backend.get_served_model_name(default)
 
     @property

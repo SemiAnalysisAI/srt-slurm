@@ -970,6 +970,15 @@ def _print_running_summary(config: SrtConfig, console: Console, *, serve_only: b
     console.print("[bold]Running:[/]")
     console.print(f"  Model:     {config.model.path}")
     console.print(f"  Container: {config.model.container}")
+    worker_counts = {
+        "prefill": config.resources.num_prefill,
+        "decode": config.resources.num_decode,
+        "agg": config.resources.num_agg,
+    }
+    for mode, count in worker_counts.items():
+        image = config.backend.get_container_image_for_mode(mode, config.model.container)
+        if count and image != config.model.container:
+            console.print(f"  {mode.capitalize()} container: {image}")
     console.print(f"  Backend:   {config.backend_type}")
     if serve_only:
         console.print("  Mode:      Serve only (no benchmark)")

@@ -81,7 +81,9 @@ def load_cluster_config() -> dict[str, Any] | None:
 
 # Keys whose string values name a container image. Any such leaf anywhere in a
 # recipe resolves against the cluster `containers:` alias map.
-CONTAINER_ALIAS_KEYS: frozenset[str] = frozenset({"container", "container_image", "image", "nginx_container"})
+CONTAINER_ALIAS_KEYS: frozenset[str] = frozenset(
+    {"container", "container_image", "image", "nginx_container", "prefill_container"}
+)
 
 # Sub-trees the alias walker never enters: `identity` declares the pullable image a
 # run *should* be using (verification only, never an alias); the rest are free-form
@@ -105,6 +107,7 @@ _CONTAINER_ALIAS_SKIP_KEYS: frozenset[str] = frozenset(
         "srun_options",
         "sglang_config",
         "atom_config",
+        "tilert_config",
         "vllm_config",
         "trtllm_config",
         "mocker_config",

@@ -1,0 +1,74 @@
+# ROCm vLLM prefill + TileRT decode over Mooncake, one 8-GPU MI355X node per role, prepared
+# images for both roles. Decode workers convert the weights on first use (docs/tilert.md).
+# Configure visible_devices_env: ROCR_VISIBLE_DEVICES in the cluster srtslurm.yaml.
+schema: 2
+name: glm5.3-tilert-rocm-disagg
+
+model:
+  path: glm5.3
+  container: ghcr.io/tile-ai/tilert-rocm-decode:0.1.6
+  precision: fp8
+
+resources:
+  gpu_type: mi355x
+  gpus_per_node: 8
+
+engine:
+  type: tilert
+  prefill_container: ghcr.io/tile-ai/tilert-rocm-prefill:0.1.6
+  served_model_name: glm5_2
+  model_profile: glm5_2
+  weights_dir: /models/GLM-5.3-tilert-tp8
+  max_seq_len: 1048576
+  kv_cache_dtype: bf16
+  prefill_kv_cache_dtype: bfloat16
+  transport: mooncake
+  with_mtp: true
+  speculative_tokens: 1
+  weight_converter:
+    module: tilert.models.glm_5_2_rocm.weight_converter
+    args:
+      device: cuda:7
+      num_mtp: 3
+    ready_file: tilert_meta.json
+
+environment:
+  RDMAV_FORK_SAFE: "1"
+
+roles:
+  prefill:
+    nodes: 1
+    workers: 1
+    gpus: 8
+    env:
+      VLLM_ROCM_USE_AITER: "1"
+      VLLM_ROCM_USE_AITER_MOE: "1"
+      VLLM_ROCM_USE_AITER_FUSION_SHARED_EXPERTS: "1"
+      VLLM_ENGINE_READY_TIMEOUT_S: "10800"
+    args:
+      enforce-eager: true
+      trust-remote-code: true
+      gpu-memory-utilization: 0.85
+      block-size: 64
+  decode:
+    nodes: 1
+    workers: 1
+    gpus: 8
+    env:
+      GLM5_AR_N: "2"
+    args:
+      num-mtp: 3
+
+frontend:
+  type: tilert-router
+  enable_multiple_frontends: false
+  args:
+    parser: none
+    queue-timeout: 1800
+
+health_check:
+  max_attempts: 2160
+  interval_seconds: 10
+
+benchmark:
+  type: manual

@@ -143,6 +143,9 @@ class MockerProtocol:
     def should_set_visible_devices(self) -> bool:
         return True
 
+    def get_container_image_for_mode(self, mode: str, default: str) -> str:
+        return default
+
     def get_config_for_mode(self, mode: WorkerMode) -> dict[str, Any]:
         """Get merged config dict for a worker mode."""
         if not self.mocker_config:

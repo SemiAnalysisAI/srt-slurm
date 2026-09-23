@@ -49,6 +49,8 @@ from srtctl.backends import (
     MockerServerConfig,
     SGLangProtocol,
     SGLangServerConfig,
+    TileRTProtocol,
+    TileRTServerConfig,
     TRTLLMProtocol,
     TRTLLMServerConfig,
     VLLMProtocol,
@@ -83,6 +85,7 @@ GENERATED_NOTICE = (
 BACKEND_TYPES: tuple[tuple[str, type], ...] = (
     ("atom", AtomProtocol),
     ("sglang", SGLangProtocol),
+    ("tilert", TileRTProtocol),
     ("trtllm", TRTLLMProtocol),
     ("vllm", VLLMProtocol),
     ("mocker", MockerProtocol),
@@ -106,7 +109,7 @@ _V2_TOP_LEVEL_ROWS = (
         type_label="str \\| mapping",
         default="required",
         description=(
-            "The engine type (`atom`, `sglang`, `trtllm`, `vllm`, `mocker`) as a string, or a mapping with `type` "
+            "The engine type (`atom`, `sglang`, `tilert`, `trtllm`, `vllm`, `mocker`) as a string, or a mapping with `type` "
             "plus the engine-wide knobs listed under [Engine types](#engine-types)."
         ),
     ),
@@ -434,9 +437,12 @@ _V2_SERVICE_OPTION_FIELDS: dict[type, frozenset[str]] = {
     VLLMMooncakeKVStoreConfig: frozenset({"device_names_by_gpu"}),
 }
 
-# ATOM was added in v2; its normalized role fields are internal, not v1 API.
-INTERNAL_FIELDS = {AtomProtocol: _present(AtomProtocol, _backend_legacy_fields(ENGINE_CONFIG_KEY["atom"]))}
-INTERNAL_CLASSES = frozenset({AtomServerConfig})
+# ATOM and TileRT were added in v2; their normalized role fields are internal, not v1 API.
+INTERNAL_FIELDS = {
+    AtomProtocol: _present(AtomProtocol, _backend_legacy_fields(ENGINE_CONFIG_KEY["atom"])),
+    TileRTProtocol: _present(TileRTProtocol, _backend_legacy_fields(ENGINE_CONFIG_KEY["tilert"])),
+}
+INTERNAL_CLASSES = frozenset({AtomServerConfig, TileRTServerConfig})
 
 
 def _row(row: FieldDoc) -> str:

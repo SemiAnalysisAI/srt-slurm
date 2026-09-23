@@ -97,9 +97,6 @@ class AtomProtocol:
     def should_set_visible_devices(self) -> bool:
         return True
 
-    def get_container_image_for_mode(self, mode: str, default: str) -> str:
-        return default
-
     def allocate_endpoints(
         self,
         num_prefill: int,

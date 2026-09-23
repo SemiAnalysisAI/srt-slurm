@@ -13,6 +13,7 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, Any
 
+from srtctl.backends.tilert import worker_container_image
 from srtctl.backends.vllm import VLLMFailoverConfig, VLLMProtocol
 from srtctl.core.fingerprint import generate_capture_script
 from srtctl.core.health import wait_for_health
@@ -381,7 +382,7 @@ class WorkerStageMixin:
             command=cmd,
             nodelist=[process.node],
             output=str(worker_log),
-            container_image=self.backend.get_container_image_for_mode(mode, str(self.runtime.container_image)),
+            container_image=worker_container_image(self.backend, mode, str(self.runtime.container_image)),
             container_mounts=self.runtime.container_mounts,
             env_to_set=env_to_set,
             env_to_unset=env_to_unset,
@@ -606,7 +607,7 @@ class WorkerStageMixin:
             ntasks=total_gpus,
             nodelist=endpoint_nodes,
             output=str(worker_log),
-            container_image=self.backend.get_container_image_for_mode(mode, str(self.runtime.container_image)),
+            container_image=worker_container_image(self.backend, mode, str(self.runtime.container_image)),
             container_mounts=self.runtime.container_mounts,
             env_to_set=env_to_set,
             bash_preamble=bash_preamble,

@@ -189,13 +189,6 @@ class BackendProtocol(Protocol):
         """
         ...
 
-    def get_container_image_for_mode(self, mode: str, default: str) -> str:
-        """Container image for workers of one mode; ``default`` is model.container.
-
-        Engines that run every role from one image return ``default``.
-        """
-        ...
-
     def get_served_model_name(self, default: str) -> str:
         """Get served model name from backend config, or return default."""
         ...

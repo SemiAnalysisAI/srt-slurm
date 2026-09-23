@@ -972,9 +972,6 @@ class VLLMProtocol:
         """Whether worker launch should set the cluster-configured GPU mask."""
         return self.set_visible_devices
 
-    def get_container_image_for_mode(self, mode: str, default: str) -> str:
-        return default
-
     def endpoints_to_processes(
         self,
         endpoints: list[Endpoint],

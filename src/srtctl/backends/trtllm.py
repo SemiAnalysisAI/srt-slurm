@@ -200,9 +200,6 @@ class TRTLLMProtocol:
     def should_set_visible_devices(self) -> bool:
         return True
 
-    def get_container_image_for_mode(self, mode: str, default: str) -> str:
-        return default
-
     def get_config_for_mode(self, mode: WorkerMode) -> dict[str, Any]:
         if not self.trtllm_config:
             return {}

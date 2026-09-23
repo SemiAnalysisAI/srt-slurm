@@ -37,6 +37,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 
 from srtctl.backends import VLLMMooncakeKVStoreConfig, VLLMProtocol
+from srtctl.backends.tilert import worker_container_image
 from srtctl.core.config import (
     expand_engine_config_defaults,
     generate_override_configs,
@@ -976,7 +977,7 @@ def _print_running_summary(config: SrtConfig, console: Console, *, serve_only: b
         "agg": config.resources.num_agg,
     }
     for mode, count in worker_counts.items():
-        image = config.backend.get_container_image_for_mode(mode, config.model.container)
+        image = worker_container_image(config.backend, mode, config.model.container)
         if count and image != config.model.container:
             console.print(f"  {mode.capitalize()} container: {image}")
     console.print(f"  Backend:   {config.backend_type}")

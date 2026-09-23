@@ -170,11 +170,6 @@ class TileRTProtocol:
     def get_process_environment(self, process: Process) -> dict[str, str]:
         return {"TILERT_ROLE": process.endpoint_mode}
 
-    def get_container_image_for_mode(self, mode: str, default: str) -> str:
-        if mode == "prefill" and self.prefill_container:
-            return self.prefill_container
-        return default
-
     def get_served_model_name(self, default: str) -> str:
         return self.served_model_name or default
 
@@ -400,3 +395,10 @@ def _conversion_script(converter: TileRTWeightConverter, source: str, weights_di
         "done\n"
         "exec 9>&-\n"
     )
+
+
+def worker_container_image(backend: object, mode: str, default: str) -> str:
+    """Worker image for one role: TileRT prefill may use its own image; everything else uses ``default``."""
+    if isinstance(backend, TileRTProtocol) and mode == "prefill" and backend.prefill_container:
+        return backend.prefill_container
+    return default

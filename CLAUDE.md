@@ -119,7 +119,7 @@ Which rank serves what is the frontend's call too, one method per consumer: `wor
 
 ### Ports
 
-Fixed ports are constants in `src/srtctl/ports.py`. Every port a worker process binds is a `PortKind` in the same module (`name`, `base`, `stride`, `per_node`) and is handed out by `NodePortAllocator.next(kind, node, size)` in `src/srtctl/core/topology.py`: per-node counters for listeners only bound on that node (`HTTP_PORTS`, `BOOTSTRAP_PORTS`, `DP_RPC_PORTS`, `DIST_INIT_PORTS`) and global counters for side channels peers address (`SYS_PORTS`, `KV_EVENTS_PORTS`, `NIXL_PORTS`, `KVBM_ZMQ_PORTS`, `NCCL_PORTS`, `VLLM_SCAN_PORTS`, `TRTLLM_DIST_INIT_PORTS`, `SIDECAR_GRPC_PORTS`). `size > 1` reserves a block when the engine adds a rank offset to the port it is given. `endpoints_to_processes` allocates the generic kinds and stores them on `Process`; a backend adds its engine-specific kinds with `dataclasses.replace` on the way out (SGLang `nccl_port` and `dist_init_port`, vLLM `vllm_scan_port`, TRT-LLM `trtllm_dist_init_port`). `do_sweep` builds the one allocator per job, seeding the sidecar gRPC base from `dynamo.sidecar_port`.
+Fixed ports are constants in `src/srtctl/ports.py`. Every port a worker process binds is a `PortKind` in the same module (`name`, `base`, `stride`, `per_node`) and is handed out by `NodePortAllocator.next(kind, node, size)` in `src/srtctl/core/topology.py`: per-node counters for listeners only bound on that node (`HTTP_PORTS`, `BOOTSTRAP_PORTS`, `DP_RPC_PORTS`, `DIST_INIT_PORTS`) and global counters for side channels peers address (`SYS_PORTS`, `KV_EVENTS_PORTS`, `NIXL_PORTS`, `KVBM_ZMQ_PORTS`, `NCCL_PORTS`, `VLLM_SCAN_PORTS`, `MORIIO_HANDSHAKE_PORTS`, `MORIIO_NOTIFY_PORTS`, `TRTLLM_DIST_INIT_PORTS`, `SIDECAR_GRPC_PORTS`). `size > 1` reserves a block when the engine adds a rank offset to the port it is given (MoRI-IO adds the local DP and TP rank to its notify base). `endpoints_to_processes` allocates the generic kinds and stores them on `Process`; a backend adds its engine-specific kinds with `dataclasses.replace` on the way out (SGLang `nccl_port` and `dist_init_port`, vLLM `vllm_scan_port` or, for a discovery connector, `moriio_handshake_port` and `moriio_notify_port`, TRT-LLM `trtllm_dist_init_port`). `do_sweep` builds the one allocator per job, seeding the sidecar gRPC base from `dynamo.sidecar_port`.
 
 Rules that follow: a new listener is a new `PortKind` plus a `Process` field, allocated in the topology builder, never `some_base + (sys_port - DYN_SYSTEM_PORT_BASE)` or any other arithmetic on another port at command-build time. Consumers read the field; a `None` means the topology was built without that kind, and a consumer that needs it raises rather than guessing. A worker's own address is `get_hostname_ip(node, runtime.network_interface)`, not upstream's interface guess. Fixed scan bases such as `VLLM_PORT` exist only to keep co-located `get_open_port()` scans apart; if a connector allocates inside forked children, leave the base unset so the kernel assigns ports. Frontends bind `FRONTEND_PUBLIC_PORT` (8000), or `FRONTEND_INTERNAL_PORT` (8180) behind nginx when `enable_multiple_frontends` is set. Service ports are `ServiceKind` defaults overridden by `options`. `tests/test_port_allocator.py` asserts over every example recipe that no two processes on a node share a port and global kinds never repeat.
 
@@ -371,12 +371,13 @@ with patch.dict(os.environ, H100Rack.slurm_env()):
    - `get_process_environment(process)` - Per-process env derived from `Process` ports (side channels, scan bases)
    - `mooncake_kv_store` / `get_mooncake_worker_env(...)` - the Mooncake block and its worker env; `None` / `{}` without one
    - `failover` / `get_failover_environment(...)` - shadow engine recovery; `None` / `{}` without it
-   - `should_set_cuda_visible_devices(process)` - `True` unless the engine takes its devices on the command line
+   - `should_set_visible_devices()` - `True` unless the engine takes its devices on the command line; the variable is the cluster's `visible_devices_env`
    - `get_served_model_name(default)`
 3. Export from `backends/__init__.py`
 4. Add polymorphic deserialization in `BackendConfigField` in `schema.py`
 
 **Current backends:**
+- **ATOM**: Native ROCm servers behind AToMesh, with one Slurm node per logical worker and allocator-owned Mooncake handshake ports
 - **SGLang**: Per-process srun launching, supports prefill/decode/aggregated modes
 - **TRTLLM**: MPI-style launching (one srun per endpoint with all nodes), prefill/decode only
 - **vLLM**: Per-process srun launching, prefill/decode/aggregated, `per_node` DP; `frontend_type` selects Dynamo registration or a direct `vllm serve` server, and `_CONNECTOR_MAP` owns the KV connector table

@@ -43,6 +43,19 @@ This page is the prose guide: what each block means, how the pieces interact, an
 
 ## Overview
 
+### ATOM with AToMesh
+
+Use `engine: atom` with `frontend.type: atomesh` to launch native
+`atom.entrypoints.openai_server` workers and the official AToMesh router. Both
+aggregate workers and prefill/decode topologies use static HTTP endpoints;
+disaggregated workers receive topology-owned Mooncake handshake ports.
+
+Engine flags belong under `roles.prefill.args`, `roles.decode.args`, or
+`roles.agg.args` (schema v2).
+srt-slurm owns the model path, HTTP port, tensor parallel size, and KV-transfer
+contract, so recipes cannot override those arguments. See the complete
+[ATOM/AToMesh recipe](../examples/atom/atomesh-disagg.yaml).
+
 ```yaml
 schema: 2                      # Required: recipe layout version
 name: "my-benchmark"           # Required: job name
@@ -135,6 +148,8 @@ The `srtslurm.yaml` file can contain the following fields:
 | `gpus_per_node`                 | int    | Default GPUs per node (applied to recipes that omit `resources.gpus_per_node`) |
 | `default_gpu_type`              | string | Default `resources.gpu_type` for recipes that omit it |
 | `network_interface`             | string | Network interface for NCCL                            |
+| `visible_devices_env`           | string | Worker GPU-subset mask; defaults to `CUDA_VISIBLE_DEVICES` |
+| `default_gpu_exporter`          | dict/null | Cluster GPU exporter; defaults to DCGM, explicit null disables it |
 | `srtctl_root`                   | string | Root directory for srtctl                             |
 | `output_dir`                    | string | Custom output directory (overrides srtctl_root/outputs) |
 | `model_paths`                   | dict   | Model path aliases                                    |
@@ -242,6 +257,22 @@ model:
 
 ## engine
 
+GPU scheduling uses upstream's existing cluster settings. For eight-GPU
+allocations on GRES-only clusters, set `use_gpus_per_node_directive: false`
+and `default_sbatch_directives: {gres: "gpu:8"}`.
+
+### GPU visibility on AMD
+
+Set `visible_devices_env: ROCR_VISIBLE_DEVICES` in the cluster profile for ROCm
+workers. GPU subsets then use only that mask, without applying a second mask to
+already-renumbered devices. Set `default_gpu_exporter: null` to disable the
+NVIDIA GPU exporter, or configure an exporter image, port, and command once for
+the cluster. Other telemetry is unchanged; an explicit recipe exporter wins.
+
+For vLLM builds without `--device-ids`, set `engine.set_visible_devices: true`.
+This is one explicit boolean, not automatic vLLM version detection. The default
+is false: vLLM binds devices with `--device-ids`. There is no CUDA-named alias.
+
 `engine:` names the inference engine that builds every worker role's command. A bare string is the common form; a mapping carries the engine-wide knobs, the fields that are not per role:
 
 ```yaml
@@ -260,6 +291,11 @@ engine:
   served_model_name: "Qwen/Qwen3-0.6B"
 ```
 
+For `trtllm_serve`, an explicit `served_model_name` is passed to the worker's
+`--served_model_name` option so the server and benchmark/eval clients use the same
+API model name. Leave it unset to retain the server's default. This is a server
+option, not a key in `roles.*.args` (the engine YAML).
+
 ```yaml
 engine:
   type: mocker
@@ -272,7 +308,7 @@ Valid types are `sglang`, `vllm`, `trtllm`, and `mocker`. Everything that is per
 | Engine | Engine-wide knobs |
 | --- | --- |
 | `sglang-router` | none beyond `type` |
-| `vllm` | `connector` (default `nixl`), `dp_launch_mode`, `vllm_serve_binary`, `set_cuda_visible_devices`, `allow_prefill_decode_colocation`, `allow_prefill_decode_colocation_across_nodes` |
+| `vllm` | `connector` (default `nixl`), `dp_launch_mode`, `vllm_serve_binary`, `set_visible_devices`, `allow_prefill_decode_colocation`, `allow_prefill_decode_colocation_across_nodes` |
 | `trtllm` | `served_model_name`, `publish_metrics`, `publish_events_and_metrics`, `sequential_node_start`, `numa_memory_bind`, `numa_cpu_bind` |
 | `mocker` | the simulation parameters: `engine_type`, `speedup_ratio`, `decode_speedup_ratio`, `num_gpu_blocks_override`, `max_num_seqs`, `max_num_batched_tokens`, `block_size`, `data_parallel_size`, ... |
 
@@ -749,6 +785,8 @@ Compare with `frontend.type: dynamo` + `engine: vllm`, which keeps Dynamo as the
 ### vllm-router frontend
 
 `type: vllm-router` launches the official vLLM Router in front of direct `vllm serve` workers. It supports aggregate replicas and disaggregated P/D topologies without Dynamo or NATS/etcd. See [vLLM Router](vllm-router.md) for complete topology examples and the division of responsibility between the upstream vLLM backend topology and Router adapter.
+
+`engine.connector: moriio` (AMD MoRI-IO on ROCm) switches the same frontend to the Router's discovery mode. srtctl launches one Router on the head node with `--kv-connector moriio --vllm-discovery-address 0.0.0.0:36367` and no worker URLs, gives every prefill and decode worker a role-aware `MoRIIOConnector` `--kv-transfer-config` that carries the Router's address, the worker's own routable IP and HTTP port, and the handshake and notify listeners the port allocator reserved for it, and waits on the Router's `/health`, which answers 503 until a prefill and a decode have registered. Both roles must run the connector, the topology must be prefill/decode, and `frontend.enable_multiple_frontends` must be `false`. See [MoRI-IO discovery](vllm-router.md#mori-io-discovery).
 
 ---
 
@@ -1431,6 +1469,11 @@ NVTX support. See [Observability capture](profiling.md#observability-capture)
 for timing, sampling, injection, and report-finalization settings.
 
 The component perf dashboard is **not** configured here. It is built in post-processing on every run; `enabled` decides which capture legs exist and therefore which tabs the page carries. See [Component Performance Dashboard](component-dashboard.md).
+
+SGLang workers always receive `--enable-metrics` unless the recipe sets it: native
+`sglang.launch_server` serves `/metrics` only with the flag, and `dynamo.sglang`
+merges the engine's `sglang:*` series into its system-port `/metrics` only when
+SGLang was started with it.
 
 Tachometer collects every worker rank, frontend, DCGM, node, and process metrics by default (minus the client-polled complement described above); the exporters launch from pinned multi-arch registry images with no configuration. Air-gapped clusters override the images via the `containers:` alias map in `srtslurm.yaml`; `default_exporters: false` disables the built-ins:
 

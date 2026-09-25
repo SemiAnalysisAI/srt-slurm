@@ -121,9 +121,8 @@ argument. This records a 60-second window with a second 1 Hz HTTP reader.
 
 ## Validation on GB200, 2026-09-22
 
-Same node, four GPUs, DCGM runtime 4.6.0, driver 580.126.20; SRT consumer
-`33fac260bd74868ffbb0a4fea9026bd9418fb470`. Exporter cadence 100 ms, consumer
-cadence 1 s, timeout 2 s. No model workload was running.
+Same node, four GPUs, DCGM 4.6.0, driver 580.126.20; SRT consumer `33fac260`.
+Exporter cadence 100 ms, consumer cadence 1 s, timeout 2 s. No model workload.
 
 | Injected five-second repair | Original | Patched |
 | --- | ---: | ---: |
@@ -133,32 +132,11 @@ cadence 1 s, timeout 2 s. No model workload was running.
 | Maximum power source age during repair | unavailable | 24.2 ms |
 | GPUs with profiling recovered afterward | 4/4 | 4/4 |
 
-Normal production-binary comparison used the runtime's full default counters
-and two concurrent 1 Hz readers. Both retained the same 24 metric families,
-including five profiling families on all four GPUs, with 272 SRT rows and no
-errors after readiness. Both had four connection errors before the HTTP listener
-started; these remain recorded in their manifests.
+Normal-path checks retained all 24 metric families with two concurrent readers.
+Splitting fields adds a DCGM read per entity; overhead under model load is unverified.
+The default counter file omits SM_ACTIVE; the fault probe checks its recovery.
 
-| Normal path | Original | Patched |
-| --- | ---: | ---: |
-| Maximum sample gap | 1.0006 s | 1.0022 s |
-| SRT request median / maximum | 1.96 / 3.17 ms | 2.74 / 7.12 ms |
-| Second reader median / maximum | 1.83 / 2.86 ms | 2.92 / 12.59 ms |
-
-Splitting fields adds a DCGM read per entity. The measured absolute overhead is
-small relative to the one-second cadence, but this short idle-node check cannot
-establish overhead under model load. The default file does not contain SM_ACTIVE;
-the fault probe explicitly includes it and verifies its recovery separately.
-
-Collector, watch manager, and server unit tests passed; collector/watch-manager
-race tests passed. The full Go short suite fails in integration and NVML packages
-on the CPU build host without DCGM libraries/drivers; the original base fails
-in those same packages. SRT's 476 focused power/telemetry/window tests passed.
-The full local SRT suite reported 2959 passed, 14 failed, two skipped, and six
-deselected. All 14 failures reproduce on the unchanged PR head in the same macOS
-environment (mock worker, CPU affinity, migration output, and nsys shell tests).
-Ruff, schema-doc freshness, and the example's config validation/dry-run passed.
-The repository's advisory type check reports 39 diagnostics in unchanged source.
-Native ARM64 build and runtime execution were verified; the Docker build recipe,
-registry publication, original multi-node model canary, x86/MIG, and production
-rollout remain unverified.
+Native ARM64 build and execution were verified. Docker build, registry publication,
+the original multi-node model canary, x86/MIG, and production rollout remain unverified.
+See the [full validation record](https://github.com/SemiAnalysisAI/srt-slurm/blob/63c9d2428a1e02e19933b4326b0eb614551825f9/docs/dcgm-profiling-isolation.md#validation-on-gb200-2026-09-22)
+for normal-path timings, unit/race results, and baseline environment failures.

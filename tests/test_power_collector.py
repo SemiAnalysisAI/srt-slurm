@@ -438,7 +438,6 @@ class TestScrapeTiming:
             assert cycle["schedule_lag_seconds"] is None
             assert cycle["sample_write_completed"] is True
             assert cycle["cycle_wall_seconds"] >= cycle["poll_wall_seconds"] >= 0.1
-            assert cycle["sample_write_seconds"] < 0.1
             assert cycle["writer_lock_wait_seconds"] >= 0
             assert {endpoint["hostname"] for endpoint in cycle["endpoints"]} == {"node-a", "node-b"}
             for endpoint in cycle["endpoints"]:

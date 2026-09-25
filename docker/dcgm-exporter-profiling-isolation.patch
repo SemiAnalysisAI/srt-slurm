@@ -431,10 +431,10 @@ index 6d6fcf5..19cbf0b 100644
 +}
 diff --git a/internal/pkg/collector/profiling_isolation_test.go b/internal/pkg/collector/profiling_isolation_test.go
 new file mode 100644
-index 0000000..6799cd6
+index 0000000..0cf6739
 --- /dev/null
 +++ b/internal/pkg/collector/profiling_isolation_test.go
-@@ -0,0 +1,140 @@
+@@ -0,0 +1,139 @@
 +/*
 + * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 + *
@@ -492,7 +492,6 @@ index 0000000..6799cd6
 +	entered, release := make(chan struct{}), make(chan struct{})
 +	var releaseOnce, enteredOnce sync.Once
 +	unblock := func() { releaseOnce.Do(func() { close(release) }) }
-+	defer unblock()
 +	watcher.EXPECT().WatchDeviceFieldGroups(gomock.Any(), info).DoAndReturn(
 +		func(groups []devicewatcher.FieldWatchGroup, _ deviceinfo.Provider) ([]dcgm.GroupHandle, []dcgm.FieldHandle, []func(), error) {
 +			ownsPower := false

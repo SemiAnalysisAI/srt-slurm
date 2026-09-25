@@ -291,44 +291,25 @@ class TestIndependenceFromTheManifestBooleans:
         assert report.failures == ()
         assert report.summary["max_sample_gap_seconds"] == pytest.approx(4.0)
 
-    def test_one_late_exporter_reply_keeps_the_window_valid(self, package):
-        """An hour of measurement is not discarded over two scrapes running late.
-
-        H200 Kimi-K3 run 35532102407 lost its TP16 lane this way: one node's
-        exporter answered after the 2 s request timeout twice in a 3640 s
-        window, which at a 1 s cadence is a 3.1-3.3 s gap on that node, and
-        every point on 32 GPUs was voided. The gap is now reported for the
-        consumer to weigh; the energy it can misstate is under 0.04%.
-        """
+    @pytest.mark.parametrize(
+        ("pauses", "max_gap"),
+        [
+            ([(600.0, 3.26), (1800.0, 3.10)], 3.26),
+            ([(600.0, 60.0)], 60.0),
+        ],
+    )
+    def test_interior_pauses_are_reported_not_rejected(self, package, pauses, max_gap):
+        """Interior pauses are metadata while both window boundaries remain covered."""
         expected = build_expected_devices(_processes())
         end = START + 3600.0
-        rows = _rows(expected, end=end, pauses=[(600.0, 3.26), (1800.0, 3.10)])
+        rows = _rows(expected, end=end, pauses=pauses)
 
         log_dir, power_dir = package(rows=rows, end=end)
         report = _validate(power_dir, log_dir)
 
         assert report.ok is True
         assert report.failures == ()
-        assert report.summary["max_sample_gap_seconds"] == pytest.approx(3.26)
-
-    def test_a_long_pause_is_reported_but_never_a_verdict(self, package):
-        """Gap size is metadata: a 60 s pause is surfaced, not judged here.
-
-        The producer cannot tell a stalled exporter from a stalled head node,
-        so it records the largest gap and leaves the call to the consumer. A
-        collector that never resumed is still caught: it leaves no sample at or
-        after the window end, so the window is not bracketed.
-        """
-        expected = build_expected_devices(_processes())
-        end = START + 3600.0
-        rows = _rows(expected, end=end, pauses=[(600.0, 60.0)])
-
-        log_dir, power_dir = package(rows=rows, end=end)
-        report = _validate(power_dir, log_dir)
-
-        assert report.ok is True
-        assert report.failures == ()
-        assert report.summary["max_sample_gap_seconds"] == pytest.approx(60.0)
+        assert report.summary["max_sample_gap_seconds"] == pytest.approx(max_gap)
 
     def test_reversed_short_window_is_rejected_end_to_end(self, package):
         log_dir, power_dir = package()

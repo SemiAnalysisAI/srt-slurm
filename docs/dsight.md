@@ -3,6 +3,9 @@
 DSight aligns client requests, Dynamo lifecycle spans, worker metrics, hardware
 samples, and existing Nsight exports on one timeline.
 
+See the [data-flow guide](dsight-data-flow.md) for diagrams connecting each source
+file to its UI view, request-identity joins, and the limits of each source.
+
 ## Generate on a cluster login node
 
 Run these commands manually on the login node after the run's artifacts have
@@ -96,8 +99,8 @@ response text and SSE payloads are excluded from the normalized dataset.
 For metrics, `final.parquet` supersedes compacted Parquet shards. An Arrow tail
 is also read, with identical samples deduplicated within complete series
 identities. The upload mirror is excluded. Absolute `timestamp_ns` is required
-for alignment. Imported families are listed in `src/srtctl/dsight/metrics.py`;
-this context view does not replace the complete Tachometer metric catalog.
+for alignment. Imported families are listed in `src/srtctl/dsight/metrics.py` and
+`src/srtctl/dsight/engines.py`; this context view does not replace the complete Tachometer metric catalog.
 
 Nsight worker filenames follow
 `<host>_<role>_w<index>_profile_rank<rank>.sqlite` for MPI ranks and
@@ -122,8 +125,13 @@ report; a CUDA table's presence is reported separately from imported data.
   named milestone. **Fit TTFT** selects the client TTFT window and expands the
   lifecycle only when available.
 - Click a milestone or raw span for boundaries and source references. Expand
-  workers for operation/dispatch/response-pump nesting. Select a metric series
-  explicitly when a worker has several rank/label combinations.
+  workers in the request path for operation/dispatch/response-pump nesting and
+  Nsight reports. **Server metrics** shows the metric selected at its top right
+  as one chart across workers, using the same offline uPlot library as the
+  Tachometer dashboard. Click a legend entry to hide or show its line. Every
+  recorded series remains available in the legend; **Labels** exposes its full
+  identity. Hover values include the actual sample timestamp. Chart dragging
+  changes the shared time range; saved views preserve line visibility per metric.
 - **Inspect phase in Nsight** follows the recorded worker. Select a rank or
   compare frontend + request workers. Router DP rank is retained as evidence;
   it is not assumed to map to a global process rank.
@@ -240,3 +248,21 @@ source files (uses the same isolated Chrome port):
 uv run --with websockets python tests/dsight_optional_otel_check.py \
   --port 9338 --out "<path_to_browser_check_output>"
 ```
+
+## Extending engine evidence
+
+The [data-flow guide](dsight-data-flow.md#what-the-shared-engine-interface-contributes)
+shows where this interface sits between recorded evidence and the UI.
+
+`src/srtctl/dsight/engines.py` owns the engine dialect table: log decoders, NVTX
+prefixes and metric labels/units. TRT-LLM supplies all three; SGLang currently
+supplies NVTX prefixes and metric definitions. Unsupported log lines return
+`None`; a dialect does not need a decoder for sources it cannot interpret.
+
+Log decoders return typed observations with the recorded identity and iteration
+fields. They perform no I/O or joins. The importer supplies worker identity,
+source/line references, timezone alignment and time-window filtering. Nsight and
+Tachometer readers likewise retain responsibility for clocks, limits, labels and
+provenance. These observations are internal; the normalized dataset and viewer
+remain the shared contract. Add engine vocabulary to the table and decoder,
+with source-artifact tests, rather than branching on engine names in readers.

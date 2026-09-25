@@ -114,4 +114,4 @@ def test_no_cluster_containers_map_leaves_aliases_as_written() -> None:
 
 
 def test_alias_key_set_is_the_documented_one() -> None:
-    assert set(CONTAINER_ALIAS_KEYS) == {"container", "container_image", "image", "nginx_container"}
+    assert set(CONTAINER_ALIAS_KEYS) == {"container", "container_image", "image", "nginx_container", "prefill_container"}

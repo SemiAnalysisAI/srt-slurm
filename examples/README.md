@@ -63,6 +63,13 @@ for p in sorted(Path('examples').rglob('*.yaml')):
 "
 ```
 
+### TileRT
+
+[`tilert/glm5-disagg.yaml`](tilert/glm5-disagg.yaml) (B200, NIXL) and
+[`tilert/glm5-rocm-mooncake-disagg.yaml`](tilert/glm5-rocm-mooncake-disagg.yaml) (MI355X, Mooncake)
+launch vLLM prefill and TileRT decode workers, each role in its own image, behind the
+TileRT P/D router. They need GLM-5 weights and 8-GPU nodes; see [../docs/tilert.md](../docs/tilert.md).
+
 ### ATOM and AToMesh
 
 [`atom/atomesh-disagg.yaml`](atom/atomesh-disagg.yaml) launches native ATOM prefill

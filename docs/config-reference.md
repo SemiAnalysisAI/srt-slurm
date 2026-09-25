@@ -43,6 +43,13 @@ This page is the prose guide: what each block means, how the pieces interact, an
 
 ## Overview
 
+### TileRT with vLLM prefill
+
+Use `engine: tilert` with `frontend.type: tilert-router` to run a vLLM prefill
+worker and TileRT decode workers behind TileRT's P/D router. `model.container` is
+the decode image and `engine.prefill_container` the prefill image. See
+[tilert.md](tilert.md) and the [TileRT recipes](../examples/tilert/).
+
 ### ATOM with AToMesh
 
 Use `engine: atom` with `frontend.type: atomesh` to launch native
@@ -181,7 +188,7 @@ reporting:
 
 **output_dir**: When set, job logs are written to `output_dir/{job_id}/logs` instead of `srtctl_root/outputs/{job_id}/logs`. Useful for CI/CD and ephemeral environments.
 
-**containers**: A map from alias to image path or registry URI. One resolver walks the whole recipe and replaces any string under a `container`, `container_image`, `image`, or `nginx_container` key that matches an alias: `model.container`, `frontend.container_image`, `frontend.nginx_container`, `benchmark.container_image`, the Tachometer and power exporter images, `services[].container`, and any future block that names an image. Literal paths and registry URIs pass through untouched. Free-form maps (`environment`, `roles.<role>.env`, `roles.<role>.args`, `services[].env`, `container_mounts`) and the `identity` block are never rewritten.
+**containers**: A map from alias to image path or registry URI. One resolver walks the whole recipe and replaces any string under a `container`, `container_image`, `image`, `nginx_container`, or `prefill_container` key that matches an alias: `model.container`, `engine.prefill_container`, `frontend.container_image`, `frontend.nginx_container`, `benchmark.container_image`, the Tachometer and power exporter images, `services[].container`, and any future block that names an image. Literal paths and registry URIs pass through untouched. Free-form maps (`environment`, `roles.<role>.env`, `roles.<role>.args`, `services[].env`, `container_mounts`) and the `identity` block are never rewritten.
 
 **default_bash_preamble**: A shell snippet (e.g. `"ulimit -n 1048576 -s unlimited -u 1048576"`) prepended to every container srun launched by srtctl: workers, frontends, telemetry, benchmark, postprocess. Runs before per-call `bash_preamble` and the main command, so cluster-wide ulimits apply to everything downstream. Silently dropped for distroless containers (e.g. `prom/node-exporter`) that bypass the bash wrapper; a WARNING log is emitted in that case.
 

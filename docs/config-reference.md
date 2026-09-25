@@ -266,8 +266,22 @@ and `default_sbatch_directives: {gres: "gpu:8"}`.
 Set `visible_devices_env: ROCR_VISIBLE_DEVICES` in the cluster profile for ROCm
 workers. GPU subsets then use only that mask, without applying a second mask to
 already-renumbered devices. Set `default_gpu_exporter: null` to disable the
-NVIDIA GPU exporter, or configure an exporter image, port, and command once for
-the cluster. Other telemetry is unchanged; an explicit recipe exporter wins.
+NVIDIA GPU exporter, or configure an exporter image, port, command and
+`power_profile` once for the cluster. Other telemetry is unchanged; an explicit
+recipe exporter wins.
+
+```yaml
+visible_devices_env: ROCR_VISIBLE_DEVICES
+default_gpu_exporter:
+  container_image: "docker://rocm/device-metrics-exporter:v1.5.2"
+  command: "/home/amd/tools/entrypoint.sh"
+  port: 5000
+  power_profile: amd-device-metrics
+```
+
+With this block a recipe that sets `telemetry: {enabled: true}` and nothing else
+under `telemetry` collects GPU power from the AMD exporter; see
+[GPU power telemetry](power-telemetry.md#exporter-profiles).
 
 For vLLM builds without `--device-ids`, set `engine.set_visible_devices: true`.
 This is one explicit boolean, not automatic vLLM version detection. The default
@@ -1515,7 +1529,7 @@ observability:
 | `node_exporter` | object/null | built-in | Defaults to `quay.io#prometheus/node-exporter:v1.8.2` on port 9101 with the `cpu`, `infiniband`, `meminfo`, `processes`, `stat`, `vmstat`, `pressure` and `meminfo_numa` collectors on worker nodes. Includes major faults and page-reclaim counters; retains process-state and NUMA-node identity. An explicit block overrides |
 | `process_exporter` | object/null | built-in | Defaults to the **host-native** `configs/process-exporter` binary (ncabatoff/process-exporter 0.8.7, installed by `make setup` for the compute arch, like `configs/nats-server` and `configs/etcd`) on port 9256, launched with plain `srun` (no container) on every allocated node (the `process-exporter` service, `placement.node: all`). Reads the host `/proc` and publishes per-process-group CPU seconds by mode, thread count, per-thread-name CPU and count (`-threads=true`), context switches, RSS and open fds. The passthrough filter retains metric names and labels, including summary sum/count suffixes, and attaches hostname and run metadata to raw rows. Groups (frontend, `dynamo_trtllm` / `dynamo_sglang` / `dynamo_vllm` handlers, `trtllm_engine` children, launcher, client, infra daemons) come from `<log_dir>/process-exporter.yml`, written at launch. If the binary is missing the leg is skipped with a warning (submit warns too). An explicit block may set `binary` (absolute, or relative to the srtctl checkout) or instead a `container_image` with `binary` unset to run it containerized; the upstream `FROM scratch` image is not used by default because pyxis/enroot on some clusters cannot start shell-less images |
 
-Every exporter block accepts `container_image`, `port`, `command` and `binary`. `binary` selects host-native launch (the executable runs directly under `srun`, `container_image` is ignored and may be `""`); without it the exporter runs from `container_image`. One of the two must be set.
+Every exporter block accepts `container_image`, `port`, `command`, `binary` and `power_profile`. `binary` selects host-native launch (the executable runs directly under `srun`, `container_image` is ignored and may be `""`); without it the exporter runs from `container_image`. One of the two must be set. `power_profile` matters only to GPU power telemetry (`telemetry.dcgm_exporter` and the cluster `default_gpu_exporter` it inherits from): `dcgm` (the default) or `amd-device-metrics`.
 
 `make setup ARCH=<compute_arch>` downloads and checksum-verifies the matching Tachometer binary from the latest srt-slurm release and installs the process-exporter binary for the same arch. The scraper and the process exporter run as native `srun` processes; the DCGM and node exporters remain containerized on worker nodes. Run `make tachometer-scraper` to build the scraper from source instead. The process-exporter passthrough filter and node process-state/NUMA-label preservation require a scraper built from this revision or a release containing it; rebuild the scraper when using an older downloaded binary.
 
@@ -1529,7 +1543,7 @@ The scraper runs as a best-effort process: if it dies (or the binary is missing 
 
 ## telemetry
 
-`telemetry` is reserved for DCGM power measurement. It can run alongside `observability.tachometer`; it does not start Tachometer itself.
+`telemetry` is GPU power measurement (the `dcgm-power` artifact producer). It can run alongside `observability.tachometer`; it does not start Tachometer itself. The exporter that supplies the watts is not tied to DCGM: the exporter block's `power_profile` selects the metric and label mapping (see [GPU power telemetry](power-telemetry.md#exporter-profiles)).
 
 When both are enabled, `telemetry.dcgm_exporter` is shared with Tachometer. Do not also configure `observability.tachometer.dcgm_exporter`; Tachometer can still launch an optional node exporter from its own block.
 
@@ -1549,8 +1563,8 @@ telemetry:
 
 | Field | Type | Default | Description |
 | ----- | ---- | ------- | ----------- |
-| `enabled` | bool | `false` | Enable DCGM power collection |
-| `dcgm_exporter` | object/null | `null` | DCGM exporter image, port, and optional command; required when enabled |
+| `enabled` | bool | `false` | Enable GPU power collection |
+| `dcgm_exporter` | object/null | `null` | GPU power exporter image, port, optional command and `power_profile`. When enabled with no `dcgm_exporter` and no CPU leg, the cluster's `default_gpu_exporter` is used |
 | `collect_interval_ms` | int | `1000` | Milliseconds between collector cycles (shared by the DCGM and CPU legs); must be at most `3000` (replaces the retired `default_frequency`, which was seconds despite its name) |
 | `storage_subdir` | string | `power` | Output directory below the run log directory |
 | `required` | bool | `false` | Fail the benchmark when publishable DCGM power artifacts cannot be produced (CPU power is always best-effort; see below) |

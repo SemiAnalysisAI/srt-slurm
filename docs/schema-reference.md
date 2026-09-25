@@ -421,6 +421,7 @@ Configuration for a metrics exporter deployed on worker nodes.
 | `port` | int | required |  |
 | `command` | str \| None | `None` |  |
 | `binary` | str \| None | `None` |  |
+| `power_profile` | str \| None | `None` | GPU power telemetry only: which ``srtctl.core.power.profile`` row describes this exporter's power metric and device labels (``dcgm`` when unset; ``amd-device-metrics`` for rocm/device-metrics-exporter). Also supplies the default ``command``. |
 
 ### CpuPowerExporterConfig
 

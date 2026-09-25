@@ -107,6 +107,38 @@ dead endpoints. The manifest fails closed (`exporter_exited` /
 `collector_interrupted` force `publication_valid=false`); the cost is that a
 job that was simply cancelled can record `exporter_exited`.
 
+## Profiling fields and scrape latency
+
+The stock dcgm-exporter `4.6.0-4.8.3-distroless` can repair stale profiling
+watches synchronously while serving a scrape. To avoid that recovery path,
+opt out of profiling fields in the power exporter's recipe command using the
+bundled counters file (mounted at `/configs` in the exporter container):
+
+```yaml
+dcgm_exporter:
+  container_image: dcgm-exporter
+  port: 9401
+  command: "dcgm-exporter --collect-interval=100 --address :{port} -f /configs/dcgm-counters-noprof.csv"
+```
+
+`configs/dcgm-counters-noprof.csv` retains the 4.6.0 default list's active
+non-profiling fields. Power and GPU utilization remain available; `sm_active`
+is empty, and Tachometer cannot collect the omitted profiling metrics from
+this exporter. Global defaults are unchanged.
+
+The [H200 TP16 c2/c3 canary](https://github.com/SemiAnalysisAI/InferenceX/actions/runs/36065327223)
+used producer `efddfffb` and recipe revision `b38bcfee`, with the stock image,
+100 ms watch interval, 1 s scrape interval and 2 s timeout. Repair warnings
+fell from 130 to zero and maximum successful response time from 1.730 s to
+0.121 s. Both power windows passed independent validation, each covering
+32 GPUs with maximum sample gap below 1.107 s. Both the baseline and candidate
+had zero missed scrapes inside measurement windows; this result establishes
+the configuration mitigation on these lanes, not a fleet-wide reliability fix.
+
+The separate [profiling recovery isolation patch](dcgm-profiling-isolation.md)
+retains profiling metrics and requires an opt-in custom image. This stock-image
+canary does not validate that patch.
+
 ## Diagnosing missed scrapes
 
 The collector also writes `scrape-timings.jsonl`, one compact JSON record per

@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Opt-in exporter build; configure the dcgm-power-isolated container alias first.
+# See docs/dcgm-profiling-isolation.md. This recipe has not been benchmarked.
+schema: 2
+name: qwen3-0.6b-power-profiling-isolation
+slurm:
+  time_limit: "00:15:00"
+model:
+  path: qwen3-0.6b
+  container: vllm
+  precision: bf16
+resources:
+  gpu_type: gb200
+  gpus_per_node: 4
+frontend:
+  type: vllm
+  enable_multiple_frontends: false
+engine: vllm
+roles:
+  agg:
+    nodes: 1
+    workers: 1
+    gpus: 4
+    args:
+      served-model-name: Qwen/Qwen3-0.6B
+      tensor-parallel-size: 4
+      max-model-len: 4096
+benchmark:
+  type: sa-bench
+  isl: 128
+  osl: 128
+  concurrencies: "4"
+telemetry:
+  enabled: true
+  required: true
+  collect_interval_ms: 1000
+  request_timeout_seconds: 2
+  dcgm_exporter:
+    container_image: dcgm-power-isolated
+    port: 9401
+    command: "dcgm-exporter --collect-interval=100 --address :{port}"

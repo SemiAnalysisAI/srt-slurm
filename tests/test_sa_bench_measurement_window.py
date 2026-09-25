@@ -344,13 +344,16 @@ class TestCoverageValidation:
 
         assert rows[0].power_coverage_valid is True
 
-    def test_gap_above_the_threshold_fails(self, logs):
+    def test_gap_above_the_threshold_is_reported_not_rejected(self, logs):
         start, end = self._completed(logs)
 
         rows = _validate(logs, _samples(start, end, step=MAX_SAMPLE_GAP_SECONDS + 0.5))
 
-        assert rows[0].power_coverage_valid is False
-        assert Reason.SAMPLE_GAP_EXCEEDED in rows[0].reason_codes
+        assert rows[0].power_coverage_valid is True
+        assert Reason.SAMPLE_GAP_EXCEEDED not in rows[0].reason_codes
+        assert max(rows[0].per_device_max_sample_gap_seconds.values()) == pytest.approx(
+            MAX_SAMPLE_GAP_SECONDS + 0.5
+        )
 
     def test_result_timing_mismatch_is_reported(self, logs):
         start, end = self._completed(logs, result_duration=19.0)

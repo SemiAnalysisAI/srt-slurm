@@ -386,7 +386,7 @@ class TestDcgmPowerConfig:
             ),
             ({"collect_interval_ms": 0}, None, "collect_interval_ms"),
             ({"collect_interval_ms": -1}, None, "collect_interval_ms"),
-            ({"collect_interval_ms": 3500}, None, "sample_gap_exceeded"),
+            ({"collect_interval_ms": 3500}, None, "max sample gap"),
             ({"startup_timeout_seconds": 0.0}, None, "startup_timeout_seconds"),
             ({"request_timeout_seconds": -1.0}, None, "request_timeout_seconds"),
             ({"collector_join_timeout_seconds": 2.0}, None, "collector_join_timeout_seconds"),
@@ -423,7 +423,7 @@ class TestDcgmPowerConfig:
             collector_join_timeout_seconds=10.0,
             dcgm_exporter=TelemetryExporterConfig(container_image="dcgm-exporter", port=9401),
         )
-        with pytest.raises(ValidationError, match="sample_gap_exceeded"):
+        with pytest.raises(ValidationError, match="max sample gap"):
             _make_config(telemetry=telemetry, benchmark=_sa_bench())
 
     def test_schema_constant_copies_match_the_power_contract(self):

@@ -12,8 +12,10 @@ orchestrator can finalize artifacts before deciding the job's exit code.
 
 from __future__ import annotations
 
+import json
 import logging
 import queue
+import socket
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -104,6 +106,14 @@ class _EndpointResult:
     rows: list[SampleRow]
     reason_codes: list[str]
     duration_seconds: float | None
+    request_started_at_unix: float
+    request_finished_at_unix: float
+    request_started_monotonic: float
+    request_finished_monotonic: float
+    http_status: int | None
+    # Exception class name for a failed request (ConnectTimeout, ReadTimeout,
+    # ConnectionError, HTTPError); separates connect-phase from response-phase stalls.
+    error_type: str | None
 
 
 class PowerTelemetrySession:
@@ -132,6 +142,9 @@ class PowerTelemetrySession:
         self._ready_at_monotonic: float | None = None
         self._thread: threading.Thread | None = None
         self._writer: SampleWriter | None = None
+        self._timing_enabled = False
+        self._previous_timing_write_seconds: float | None = None
+        self._collector_hostname = socket.gethostname()
         self._exporters: list[ManagedProcess] = []
 
         self._scrape_seq = 0
@@ -190,6 +203,12 @@ class PowerTelemetrySession:
         """Create the exact CSV header and the ``starting`` manifest."""
         self.windows_dir.mkdir(parents=True, exist_ok=True)
         self._writer = SampleWriter(self.samples_path)
+        try:
+            with (self.power_dir / "scrape-timings.jsonl").open("w", encoding="utf-8"):
+                pass
+            self._timing_enabled = True
+        except OSError:
+            logger.warning("Power scrape timing diagnostics unavailable", exc_info=True)
         self._write_manifest()
 
     def add_exporter(self, process: ManagedProcess) -> None:
@@ -262,8 +281,10 @@ class PowerTelemetrySession:
         self.record_reason(Reason.EXPORTER_STARTUP_TIMEOUT)
         return False
 
-    def collect_once(self) -> int:
+    def collect_once(self, *, scheduled_monotonic: float | None = None) -> int:
         """Run one logical cycle: poll every endpoint concurrently, append rows."""
+        cycle_started = time.monotonic()
+        cycle_started_unix = time.time()
         with self._writer_lock:
             if self._mutation_disabled:
                 return 0
@@ -274,7 +295,8 @@ class PowerTelemetrySession:
             self._scrape_count += 1
 
         # NOTE: requests applies its timeout to connect and read separately, so an endpoint can take 2x.
-        deadline = time.monotonic() + 2 * self._settings.request_timeout_seconds + COLLECT_CYCLE_TIMEOUT_GRACE_SECONDS
+        poll_started = time.monotonic()
+        deadline = poll_started + 2 * self._settings.request_timeout_seconds + COLLECT_CYCLE_TIMEOUT_GRACE_SECONDS
         results, failures = _run_daemon_workers(
             [
                 (f"PowerScrape-{endpoint.hostname}", lambda endpoint: self._poll(endpoint, scrape_seq), endpoint)
@@ -282,6 +304,7 @@ class PowerTelemetrySession:
             ],
             deadline=deadline,
         )
+        poll_finished = time.monotonic()
         if failures:
             raise failures[0]
 
@@ -304,33 +327,117 @@ class PowerTelemetrySession:
             if durations:
                 self._max_scrape_duration = max(durations + [self._max_scrape_duration or 0.0])
 
+        writer_wait_started = time.monotonic()
         with self._writer_lock:
             if self._mutation_disabled or self._writer is None:
                 return 0
-            self._writer.append(rows)
-            self._writer.flush()
-            observed_keys = {(row.hostname, row.gpu_index) for row in rows}
-            if self._expected_device_keys and self._expected_device_keys <= observed_keys and not self._ready.is_set():
-                self._ready_at_monotonic = time.monotonic()
-                self._ready.set()
+            write_started = time.monotonic()
+            write_completed = False
+            try:
+                self._writer.append(rows)
+                self._writer.flush()
+                write_completed = True
+            finally:
+                write_finished = time.monotonic()
+                if write_completed:
+                    observed_keys = {(row.hostname, row.gpu_index) for row in rows}
+                    if (
+                        self._expected_device_keys
+                        and self._expected_device_keys <= observed_keys
+                        and not self._ready.is_set()
+                    ):
+                        self._ready_at_monotonic = time.monotonic()
+                        self._ready.set()
+                by_host = {result.hostname: result for result in settled}
+                endpoint_timings = []
+                for endpoint in endpoints:
+                    result = by_host.get(endpoint.hostname)
+                    endpoint_timings.append(
+                        {
+                            "hostname": endpoint.hostname,
+                            "settled": result is not None,
+                            "reason_codes": result.reason_codes if result else [Reason.ENDPOINT_TIMEOUT],
+                            "row_count": len(result.rows) if result else 0,
+                            "http_status": result.http_status if result else None,
+                            "error_type": result.error_type if result else None,
+                            "request_started_at_unix": result.request_started_at_unix if result else None,
+                            "request_finished_at_unix": result.request_finished_at_unix if result else None,
+                            "request_start_delay_seconds": (
+                                result.request_started_monotonic - cycle_started if result else None
+                            ),
+                            "request_duration_seconds": (
+                                result.request_finished_monotonic - result.request_started_monotonic if result else None
+                            ),
+                            "sample_timestamp_unix": result.rows[0].timestamp_unix if result and result.rows else None,
+                        }
+                    )
+                self._write_timing(
+                    {
+                        "schema_version": 1,
+                        "job_id": self._settings.job_id,
+                        "run_name": self._settings.run_name,
+                        "collector_hostname": self._collector_hostname,
+                        "scrape_seq": scrape_seq,
+                        "cycle_started_at_unix": cycle_started_unix,
+                        "scheduled_monotonic": scheduled_monotonic,
+                        "cycle_started_monotonic": cycle_started,
+                        "schedule_lag_seconds": (
+                            max(0.0, cycle_started - scheduled_monotonic) if scheduled_monotonic is not None else None
+                        ),
+                        "poll_wall_seconds": poll_finished - poll_started,
+                        "writer_lock_wait_seconds": write_started - writer_wait_started,
+                        "sample_write_seconds": write_finished - write_started,
+                        "sample_write_completed": write_completed,
+                        "cycle_wall_seconds": write_finished - cycle_started,
+                        "previous_timing_write_seconds": self._previous_timing_write_seconds,
+                        "endpoints": endpoint_timings,
+                    }
+                )
         return len(rows)
+
+    def _write_timing(self, record: dict[str, Any]) -> None:
+        """One small diagnostic write per cycle, under the existing writer lock.
+
+        Diagnostics never participate in publication validation. A failed sidecar
+        is disabled, leaving collection and its original error policy intact.
+        """
+        if not self._timing_enabled:
+            return
+        started = time.monotonic()
+        try:
+            # Open/close on the collector thread too: finalization must not gain
+            # a new potentially blocking close outside its bounded writer lock.
+            with (self.power_dir / "scrape-timings.jsonl").open("a", encoding="utf-8") as writer:
+                writer.write(json.dumps(record, separators=(",", ":")) + "\n")
+                writer.flush()
+        except OSError:
+            logger.warning("Power scrape timing diagnostics disabled after write failure", exc_info=True)
+            self._timing_enabled = False
+        self._previous_timing_write_seconds = time.monotonic() - started
 
     def _poll(self, endpoint: PowerEndpoint, scrape_seq: int) -> _EndpointResult:
         """One endpoint request, timestamped adjacently on the head-node clock."""
         started_unix = time.time()
-        started_monotonic = time.perf_counter()
+        started_monotonic = time.monotonic()
+        body = None
+        reasons: list[str] = []
+        http_status = None
+        error_type = None
         try:
             response = requests.get(endpoint.url, timeout=self._settings.request_timeout_seconds)
+            http_status = response.status_code
             response.raise_for_status()
             body = response.text
-        except requests.Timeout:
-            return _EndpointResult(endpoint.hostname, [], [Reason.ENDPOINT_TIMEOUT], None)
-        except requests.RequestException:
-            return _EndpointResult(endpoint.hostname, [], [Reason.ENDPOINT_HTTP_ERROR], None)
-        settled_monotonic = time.perf_counter()
+        except requests.Timeout as exc:
+            reasons.append(Reason.ENDPOINT_TIMEOUT)
+            error_type = type(exc).__name__
+        except requests.RequestException as exc:
+            reasons.append(Reason.ENDPOINT_HTTP_ERROR)
+            error_type = type(exc).__name__
+        settled_monotonic = time.monotonic()
         settled_unix = time.time()
 
-        scrape = parse_power_scrape(body)
+        scrape = parse_power_scrape(body) if body is not None else None
         timestamp_unix = (started_unix + settled_unix) / 2
         rows = [
             SampleRow(
@@ -343,13 +450,20 @@ class PowerTelemetrySession:
                 gpu_util_pct=reading.gpu_util_pct,
                 sm_active=reading.sm_active,
             )
-            for reading in scrape.readings
+            for reading in (scrape.readings if scrape else ())
         ]
         return _EndpointResult(
             hostname=endpoint.hostname,
             rows=rows,
-            reason_codes=list(scrape.reason_codes),
-            duration_seconds=settled_monotonic - started_monotonic,
+            reason_codes=list(scrape.reason_codes) if scrape else reasons,
+            # Preserve the manifest aggregate's historical successful-request population.
+            duration_seconds=settled_monotonic - started_monotonic if body is not None else None,
+            request_started_at_unix=started_unix,
+            request_finished_at_unix=settled_unix,
+            request_started_monotonic=started_monotonic,
+            request_finished_monotonic=settled_monotonic,
+            http_status=http_status,
+            error_type=error_type,
         )
 
     def _run(self) -> None:
@@ -358,7 +472,7 @@ class PowerTelemetrySession:
         try:
             next_cycle = time.monotonic()
             while not self._stop.is_set():
-                self.collect_once()
+                self.collect_once(scheduled_monotonic=next_cycle)
                 self._check_exporters()
                 next_cycle += interval
                 self._stop.wait(max(0.0, next_cycle - time.monotonic()))

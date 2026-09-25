@@ -105,7 +105,21 @@ CPU_SAMPLES_HEADER = (
 # out to be wrong, only the ACPI total is affected, since the component-rail
 # columns and DCGM mode (one already-aggregate value per socket) are unaffected.
 
+# The longest distance the audit interpolates across at a window boundary: a
+# boundary farther than this from its nearest sample is not integrated, and the
+# recipe validator caps the collector period at it. It is NOT a validity verdict
+# for gaps inside a window. Those are reported per device as the largest gap
+# (per_device_max_sample_gap_seconds) and left to the consumer: a gap is
+# interpolated rather than measured, and its per-device energy error is bounded
+# by (dynamic range) x gap / 2 -- under 0.04% for a 3.3 s gap in a 3640 s
+# window -- whereas voiding the window discards an hour of measurement on every
+# GPU of the job. With a 1 s cadence and a 2 s request timeout, one late
+# exporter response alone produces a 3.0 s+ gap, so any threshold here turned a
+# single slow HTTP reply into a discarded lane. A collector that stopped for
+# good still fails the window: no sample at or after the window end means it is
+# not bracketed.
 MAX_SAMPLE_GAP_SECONDS = 3.0
+
 COLLECT_CYCLE_TIMEOUT_GRACE_SECONDS = 1.0
 
 BENCHMARK_TYPE_SA_BENCH = "sa-bench"
@@ -156,6 +170,8 @@ class Reason:
     MEASUREMENT_WINDOW_RESULT_PATH_INVALID = "measurement_window_result_path_invalid"
     MEASUREMENT_WINDOW_CLOCK_MISMATCH = "measurement_window_clock_mismatch"
     MEASUREMENT_WINDOW_NOT_BRACKETED = "measurement_window_not_bracketed"
+    # Retired: no longer emitted (gaps are reported, not judged). Kept so
+    # artifacts written by earlier producers still parse.
     SAMPLE_GAP_EXCEEDED = "sample_gap_exceeded"
 
 

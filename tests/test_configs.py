@@ -1345,6 +1345,8 @@ class TestWorkerEnvironmentTemplating:
 
             with patch.object(worker_stage, "config") as mock_config:
                 mock_config.backend = mock_backend
+                mock_config.backend_for_role.return_value = mock_backend
+                mock_config.worker_container_for_role.return_value = config.model.container
                 mock_config.dynamo = config.dynamo
                 mock_config.profiling = config.profiling
 
@@ -1466,6 +1468,8 @@ class TestWorkerEnvironmentTemplating:
 
             with patch.object(worker_stage, "config") as mock_config:
                 mock_config.backend = mock_backend
+                mock_config.backend_for_role.return_value = mock_backend
+                mock_config.worker_container_for_role.return_value = config.model.container
                 mock_config.dynamo = config.dynamo
                 mock_config.profiling = config.profiling
 

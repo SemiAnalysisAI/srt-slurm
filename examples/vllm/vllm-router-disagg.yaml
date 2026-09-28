@@ -27,11 +27,12 @@ frontend:
   args:
     policy: "consistent_hash"
 
-engine:
-  type: vllm
-  connector: nixl
+# Explicit role engines; a shared top-level engine is also supported.
 roles:
   prefill:
+    engine:
+      type: vllm
+      connector: nixl
     nodes: 1
     workers: 1
     gpus: 1
@@ -43,6 +44,9 @@ roles:
       gpu-memory-utilization: 0.5
       max-model-len: 4096
   decode:
+    engine:
+      type: vllm
+      connector: nixl
     nodes: colocate
     workers: 1
     gpus: 1

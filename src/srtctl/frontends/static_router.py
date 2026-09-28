@@ -256,7 +256,7 @@ class StaticRouterFrontend:
         from srtctl.core.processes import FRONTEND_TERMINATE_TIMEOUT_SECONDS, ManagedProcess
 
         configured_backend = getattr(getattr(config, "backend", None), "type", self.required_backend)
-        if configured_backend != self.required_backend:
+        if self.required_backend is not None and configured_backend != self.required_backend:
             raise ValueError(
                 f"frontend.type: {self.type} requires backend.type: {self.required_backend} "
                 f"(got {configured_backend!r})"

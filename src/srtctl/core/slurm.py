@@ -11,6 +11,7 @@ This module consolidates all SLURM-related functionality:
 - Container utilities: get_container_mounts_str
 """
 
+import ipaddress
 import logging
 import os
 import shlex
@@ -117,6 +118,14 @@ def get_hostname_ip(hostname: str, network_interface: str | None = None) -> str:
     Returns:
         IP address as string
     """
+    # An explicit address needs no discovery, even inside a SLURM allocation.
+    # Offline command renderers also use this path to avoid launching srun.
+    if network_interface is None:
+        try:
+            return str(ipaddress.ip_address(hostname))
+        except ValueError:
+            pass
+
     # If we're inside a SLURM allocation, use srun-based resolution
     # This gets the actual routable IP from the target node
     slurm_job_id = get_slurm_job_id()

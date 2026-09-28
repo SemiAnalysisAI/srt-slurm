@@ -193,6 +193,8 @@ def test_worker_stage_wraps_nonfatal_fingerprint_hook(tmp_path: Path) -> None:
         profiling=SimpleNamespace(enabled=False, is_nsys=False),
         resources=ResourceConfig(),
         backend=backend,
+        backend_for_role=lambda _mode: backend,
+        role_containers={},
     )
     mixin.runtime = SimpleNamespace(
         log_dir=tmp_path,
@@ -261,6 +263,8 @@ def _remap_worker_mixin(tmp_path: Path, *, frontend_type: str, dynamo_install: b
         profiling=SimpleNamespace(enabled=False, is_nsys=False),
         resources=ResourceConfig(),
         backend=backend,
+        backend_for_role=lambda _mode: backend,
+        role_containers={},
     )
     mixin.runtime = SimpleNamespace(
         log_dir=tmp_path,
@@ -690,6 +694,8 @@ def test_worker_stage_unsets_vllm_port_for_multinode_endpoint(tmp_path: Path) ->
         profiling=SimpleNamespace(enabled=False, is_nsys=False),
         resources=ResourceConfig(),
         backend=backend,
+        backend_for_role=lambda _mode: backend,
+        role_containers={},
     )
     mixin.runtime = SimpleNamespace(
         log_dir=tmp_path,

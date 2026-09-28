@@ -11,7 +11,7 @@ import logging
 import shlex
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from srtctl.backends.vllm import VLLMFailoverConfig, VLLMProtocol
 from srtctl.core.fingerprint import generate_capture_script
@@ -69,9 +69,10 @@ class WorkerStageMixin:
     runtime: "RuntimeContext"
 
     def _apply_mooncake_process_config(self, process: "Process", environment: dict[str, str]) -> None:
-        if not isinstance(self.backend, VLLMProtocol):
+        backend = self.config.backend_for_role(process.endpoint_mode)
+        if not isinstance(backend, VLLMProtocol):
             return
-        local_config = self.backend.build_mooncake_process_config(
+        local_config = backend.build_mooncake_process_config(
             process, self.runtime.infra_node_ip, self.runtime.gpus_per_node
         )
         if local_config is not None:
@@ -146,8 +147,9 @@ class WorkerStageMixin:
         see the same device list as the engine (see start_gms_sidecar). A process
         that owns the whole node needs no mask.
         """
-        force_mask = (self.config.dynamo.sidecar and self.backend.type == "vllm") or self.failover is not None
-        if not (force_mask or self.backend.should_set_visible_devices()):
+        backend = self.config.backend_for_role(process.endpoint_mode)
+        force_mask = (self.config.dynamo.sidecar and backend.type == "vllm") or backend.failover is not None
+        if not (force_mask or backend.should_set_visible_devices()):
             return {}
         if len(process.gpu_indices) >= self.runtime.gpus_per_node:
             return {}
@@ -178,14 +180,15 @@ class WorkerStageMixin:
         env_to_set.setdefault("DYN_KVBM_LEADER_ZMQ_PUB_PORT", str(leader.kvbm_zmq_port))
         env_to_set.setdefault("DYN_KVBM_LEADER_ZMQ_ACK_PORT", str(leader.kvbm_zmq_port + 1))
 
-    def _get_worker_environment_for_mode(self, mode: str) -> dict[str, str]:
+    def _get_worker_environment_for_mode(self, mode: Literal["prefill", "decode", "agg"]) -> dict[str, str]:
         """Return mode environment with engine-specific defaults the recipe can override."""
-        environment = self.backend.get_environment_for_mode(mode)
-        if self.config.dynamo.sidecar and self.backend.type == "vllm":
+        backend = self.config.backend_for_role(mode)
+        environment = backend.get_environment_for_mode(mode)
+        if self.config.dynamo.sidecar and backend.type == "vllm":
             # Installed plugins may replace native engine output types and
             # break the fixed Rust/Python MessagePack contract used by vllm-rs.
             environment.setdefault("VLLM_PLUGINS", "")
-        if self.config.dynamo.sidecar and self.backend.type == "sglang":
+        if self.config.dynamo.sidecar and backend.type == "sglang":
             # The sidecar talks to SGLang's native gRPC server, a prebuilt Rust extension. In
             # images that run SGLang from a source checkout (the nightlies), the extension
             # loader's default "auto" mode ignores the bundled .so and tries to rebuild it
@@ -194,7 +197,7 @@ class WorkerStageMixin:
             # TODO: drop once the SGLang loader prefers a bundled extension over a rebuild
             #       (sglang.srt.utils.load_rust_extension, auto mode in source checkouts).
             environment.setdefault("SGLANG_RUST_BUILD_MODE", "never")
-        if self.backend.type == "sglang":
+        if backend.type == "sglang":
             # SGLang treats its own exit after SIGTERM as a crash: it drains in a few
             # seconds, then tries py-spy (needs root) and waits 60s for CUDA
             # coredumps that are never produced unless SGLANG_CUDA_COREDUMP=1. That
@@ -213,8 +216,9 @@ class WorkerStageMixin:
         also remains endpoint-wide because one MPI launch owns all executor
         ranks and uses ``TLLM_PROFILE_START_STOP`` instead of HTTP control.
         """
+        backend = self.config.backend_for_role(process.endpoint_mode)
         profiling = self.config.profiling
-        if not profiling.is_nsys or profiling.is_nsys_time or self.backend.type == "trtllm":
+        if not profiling.is_nsys or profiling.is_nsys_time or backend.type == "trtllm":
             return True
         return profiling.selects_process(
             process.endpoint_mode,
@@ -225,8 +229,9 @@ class WorkerStageMixin:
     def start_worker(self, process: "Process", endpoint_processes: list["Process"]) -> ManagedProcess:
         """Start a single worker process (one srun per node, used by SGLang)."""
         mode = process.endpoint_mode
+        backend = self.config.backend_for_role(mode)
         index = process.endpoint_index
-        failover = self.failover
+        failover = backend.failover
         # "" for engine 0, "_e<k>" for a shadow: step name, logs, and dumps stay apart.
         # (getattr: tests drive this stage with plain namespaces standing in for Process.)
         suffix = getattr(process, "engine_suffix", "")
@@ -253,11 +258,11 @@ class WorkerStageMixin:
                 f"{process.node}_{mode}_w{index}{suffix}_profile_gpu{gpu_label}"
             )
             nsys_prefix = profiling.get_nsys_prefix(
-                nsys_output, frontend_type=self.config.frontend.type, backend_type=self.config.backend_type
+                nsys_output, frontend_type=self.config.frontend.type, backend_type=backend.type
             )
 
         # Build command using backend's method
-        cmd = self.backend.build_worker_command(
+        cmd = backend.build_worker_command(
             process=process,
             endpoint_processes=endpoint_processes,
             runtime=self.runtime,
@@ -318,19 +323,19 @@ class WorkerStageMixin:
         env_to_set.update(self._visible_device_environment(process))
 
         # Add backend-specific process environment variables (e.g., unique ports)
-        env_to_set.update(self.backend.get_process_environment(process))
+        env_to_set.update(backend.get_process_environment(process))
         if failover is not None:
-            env_to_set.update(self.backend.get_failover_environment(process, self.runtime.job_id))
+            env_to_set.update(backend.get_failover_environment(process, self.runtime.job_id))
 
         # Add mooncake worker env vars if configured. Resolve the worker's own IP
         # so MOONCAKE_LOCAL_HOSTNAME is correct for multi-node peer-to-peer
         # transfers (defaulting to "localhost" silently breaks them).
-        if self.backend.mooncake_kv_store is not None:
+        if backend.mooncake_kv_store is not None:
             # A MOONCAKE_LOCAL_HOSTNAME already in the worker env (roles.*.env) pins a NIC; otherwise the node IP.
             local_hostname = env_to_set.get("MOONCAKE_LOCAL_HOSTNAME") or get_hostname_ip(
                 process.node, self.runtime.network_interface
             )
-            env_to_set.update(self.backend.get_mooncake_worker_env(self.runtime.infra_node_ip, local_hostname))
+            env_to_set.update(backend.get_mooncake_worker_env(self.runtime.infra_node_ip, local_hostname))
 
         self._apply_mooncake_process_config(process, env_to_set)
 
@@ -366,7 +371,8 @@ class WorkerStageMixin:
             # The engine creates the lock file itself; its directory (also the GMS
             # socket dir) must exist. The gms service made it, but the engine step
             # should not depend on that after a relaunch.
-            worker_dir = self.backend.failover_worker_dir(self.runtime.job_id, process)
+            assert isinstance(backend, VLLMProtocol)
+            worker_dir = backend.failover_worker_dir(self.runtime.job_id, process)
             bash_preamble = _append_preamble(bash_preamble, f"mkdir -p {shlex.quote(worker_dir)}")
 
         # vLLM uses VLLM_PORT as the initial port for its internal message
@@ -374,14 +380,18 @@ class WorkerStageMixin:
         # same value and can race while probing and binding remote TCP queues.
         # Let vLLM choose an ephemeral base port instead.
         endpoint_nodes = {endpoint_process.node for endpoint_process in endpoint_processes}
-        env_to_unset = ["VLLM_PORT"] if self.backend.type == "vllm" and len(endpoint_nodes) > 1 else None
+        env_to_unset = ["VLLM_PORT"] if backend.type == "vllm" and len(endpoint_nodes) > 1 else None
 
         step_name = f"{mode}_{index}_{process.node}{suffix}"
         proc = start_srun_process(
             command=cmd,
             nodelist=[process.node],
             output=str(worker_log),
-            container_image=str(self.runtime.container_image),
+            container_image=(
+                self.config.worker_container_for_role(mode)
+                if mode in self.config.role_containers
+                else str(self.runtime.container_image)
+            ),
             container_mounts=self.runtime.container_mounts,
             env_to_set=env_to_set,
             env_to_unset=env_to_unset,
@@ -418,6 +428,7 @@ class WorkerStageMixin:
         # Use the leader process for metadata
         leader = endpoint_processes[0]
         mode = leader.endpoint_mode
+        backend = self.config.backend_for_role(mode)
         index = leader.endpoint_index
 
         # Collect all unique nodes for this endpoint
@@ -425,7 +436,7 @@ class WorkerStageMixin:
         num_nodes = len(endpoint_nodes)
         total_gpus = sum(len(p.gpu_indices) for p in endpoint_processes)
         # TRT-LLM derives local devices from global rank modulo visible GPUs.
-        if self.backend.type == "trtllm":
+        if backend.type == "trtllm":
             rank_offset = 0
             for process in endpoint_processes:
                 local_size = len(process.gpu_indices)
@@ -462,11 +473,11 @@ class WorkerStageMixin:
                 f"{leader.node}_{mode}_w{index}_profile_rank%q{{SLURM_PROCID}}"
             )
             nsys_prefix = profiling.get_nsys_prefix(
-                nsys_output, frontend_type=self.config.frontend.type, backend_type=self.config.backend_type
+                nsys_output, frontend_type=self.config.frontend.type, backend_type=backend.type
             )
 
         # Build command using backend's method
-        cmd = self.backend.build_worker_command(
+        cmd = backend.build_worker_command(
             process=leader,
             endpoint_processes=endpoint_processes,
             runtime=self.runtime,
@@ -510,7 +521,7 @@ class WorkerStageMixin:
         # Add config environment variables
         env_to_set.update(self.runtime.environment)
 
-        if self.backend.type == "trtllm" and leader.trtllm_dist_init_port is not None:
+        if backend.type == "trtllm" and leader.trtllm_dist_init_port is not None:
             # Enroot may infer rank 0 from the sorted step nodelist, which
             # differs from our rank order for workers sharing a partial node.
             env_to_set.setdefault("MASTER_ADDR", get_hostname_ip(leader.node, self.runtime.network_interface))
@@ -522,15 +533,15 @@ class WorkerStageMixin:
         # be available inside every container-launch path.  Set the endpoint's
         # nodes explicitly, while preserving a recipe-provided override.
         if (
-            self.backend.type == "trtllm"
+            backend.type == "trtllm"
             and len(endpoint_nodes) > 1
             and env_to_set.get("DYN_TRTLLM_PUBLISH_KV_EVENTS", "").lower() == "true"
         ):
             env_to_set.setdefault("DYN_TRTLLM_KV_EVENT_HOSTS", ",".join(endpoint_nodes))
 
-        force_mask = self.config.dynamo.sidecar and self.backend.type == "vllm"
+        force_mask = self.config.dynamo.sidecar and backend.type == "vllm"
         node_gpu_setup = ""
-        if force_mask or self.backend.should_set_visible_devices():
+        if force_mask or backend.should_set_visible_devices():
             if any(p.gpu_indices != leader.gpu_indices for p in endpoint_processes):
                 # One srun covers every node of the endpoint, so the mask is chosen per node at exec time.
                 mask_env = self.runtime.visible_devices_env
@@ -546,11 +557,11 @@ class WorkerStageMixin:
         # launching we use the leader node's IP: mooncake's per-worker hostname
         # is fundamentally per-process, but TRTLLM-style launching uses one srun
         # for the whole endpoint, so leader IP is the best we can do.
-        if self.backend.mooncake_kv_store is not None:
+        if backend.mooncake_kv_store is not None:
             local_hostname = env_to_set.get("MOONCAKE_LOCAL_HOSTNAME") or get_hostname_ip(
                 leader.node, self.runtime.network_interface
             )
-            env_to_set.update(self.backend.get_mooncake_worker_env(self.runtime.infra_node_ip, local_hostname))
+            env_to_set.update(backend.get_mooncake_worker_env(self.runtime.infra_node_ip, local_hostname))
 
         # Add profiling environment variables after the worker environment.
         if profiling.enabled and profiling_selects_process:
@@ -593,8 +604,8 @@ class WorkerStageMixin:
             endpoint_nodes = task_nodes
 
         # Get srun config from backend
-        srun_config = self.backend.get_srun_config()
-        if self.backend.type == "trtllm" and self.config.dynamo.sidecar:
+        srun_config = backend.get_srun_config()
+        if backend.type == "trtllm" and self.config.dynamo.sidecar:
             # The sidecar runs only on rank zero. Make any follower-rank exit
             # terminate the full endpoint step instead of leaving rank zero up.
             srun_options["kill-on-bad-exit"] = "1"
@@ -606,7 +617,11 @@ class WorkerStageMixin:
             ntasks=total_gpus,
             nodelist=endpoint_nodes,
             output=str(worker_log),
-            container_image=str(self.runtime.container_image),
+            container_image=(
+                self.config.worker_container_for_role(mode)
+                if mode in self.config.role_containers
+                else str(self.runtime.container_image)
+            ),
             container_mounts=self.runtime.container_mounts,
             env_to_set=env_to_set,
             bash_preamble=bash_preamble,
@@ -668,15 +683,24 @@ class WorkerStageMixin:
             raise RuntimeError(f"Sequential node start: worker on {leader.node}:{port} did not become healthy")
 
     def start_all_workers(self) -> NamedProcesses:
-        """Start all backend workers."""
-        logger.info("Starting backend workers")
+        """Launch each role using its engine's existing launch strategy."""
+        if not self.config.role_backends:
+            return self._start_workers(self.backend, self.backend_processes)
+        result: NamedProcesses = {}
+        for role, backend in self.config.active_role_backends():
+            processes = [p for p in self.backend_processes if p.endpoint_mode == role]
+            result.update(self._start_workers(backend, processes))
+        return result
+
+    def _start_workers(self, backend: Any, processes: list["Process"]) -> NamedProcesses:
+        logger.info("Starting %s backend workers", backend.type)
 
         # Check if backend uses MPI-style per-endpoint launching
-        srun_config = self.backend.get_srun_config()
+        srun_config = backend.get_srun_config()
         launch_per_endpoint = srun_config.launch_per_endpoint
 
         grouped: dict[tuple, list[Process]] = defaultdict(list)
-        for process in self.backend_processes:
+        for process in processes:
             key = (process.endpoint_mode, process.endpoint_index)
             grouped[key].append(process)
 

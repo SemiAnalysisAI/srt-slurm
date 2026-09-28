@@ -1279,9 +1279,10 @@ class VLLMProtocol:
             overridden = pop_vllm_orchestration_flags(config)
             config.setdefault("served-model-name", served_model_name)
 
-            # A prefill/decode worker gets its KV connector; an aggregate worker has none.
-            config.pop("connector", None)
-            if mode in {"prefill", "decode"}:
+            # A prefill/decode worker gets its KV connector. An aggregate worker gets
+            # only the one its role names (e.g. lmcache-mp offload), not the P/D default.
+            role_connector = config.pop("connector", None)
+            if mode in {"prefill", "decode"} or role_connector is not None:
                 kv_transfer_config = self.kv_transfer_config(mode, process, runtime)
                 if kv_transfer_config is not None:
                     config.setdefault("kv-transfer-config", kv_transfer_config)

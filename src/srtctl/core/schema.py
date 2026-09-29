@@ -101,8 +101,15 @@ class ReportingStatusConfig:
     # variable name belongs in a recipe: the resolved config is written to the lockfile
     # and the log directory, so a literal token there would leak.
     token_env: str | None = None
+    # Seconds between pushes of new log and metric output (text files under the run's log
+    # directory) to every endpoint. Unset disables streaming; lifecycle events are unaffected.
+    stream_interval: float | None = None
 
     Schema: ClassVar[type[Schema]] = Schema
+
+    def __post_init__(self) -> None:
+        if self.stream_interval is not None and not _is_finite_positive(self.stream_interval):
+            raise ValidationError(f"reporting.status.stream_interval must be positive, got {self.stream_interval!r}")
 
 
 @dataclass(frozen=True)

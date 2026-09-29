@@ -27,12 +27,21 @@ Configuration (in srtslurm.yaml or recipe YAML):
         endpoint: "https://status.example.com"
         endpoints:
           - "https://status2.example.com"
+
+    # Also push new log and metric output every 10 seconds
+    reporting:
+      status:
+        endpoint: "https://status.example.com"
+        stream_interval: 10
 """
 
+import json
 import logging
 import os
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import requests
@@ -424,3 +433,118 @@ def create_job_record(
             break
 
     return any_success
+
+
+# Append-only text files under the log directory: engine and sweep logs, and
+# metric samples (power samples.csv, host_samples.jsonl, profile_export.jsonl).
+STREAM_SUFFIXES = (".out", ".err", ".log", ".csv", ".jsonl")
+# Tachometer's capture is binary (a current.arrow snapshot plus out-N.parquet
+# segments), so the streamer appends its new rows here as JSON lines.
+TACHOMETER_STREAM_FILE = "tachometer_rows.jsonl"
+# Raw bytes per POST; JSON escaping can grow text up to 6x, which stays under the collector's 1 MiB cap.
+STREAM_REQUEST_BYTES = 128 * 1024
+
+
+class LogStreamer:
+    """Every ``interval`` seconds, POST the bytes appended to the run's log and metric files.
+
+    Each chunk carries its file (relative to ``log_dir``), byte ``offset`` and
+    ``size``, so the collector stores deltas by position and a resend is a no-op.
+    Offsets advance per endpoint only on success, so an unreachable collector
+    catches up on a later flush. With ``tachometer_dir`` set, rows newer than the
+    last flush are first appended to ``TACHOMETER_STREAM_FILE``, which then
+    streams like any other file.
+    """
+
+    def __init__(self, reporter: StatusReporter, log_dir: Path, interval: float, tachometer_dir: Path | None = None):
+        self.reporter = reporter
+        self.log_dir = log_dir
+        self.interval = interval
+        self.tachometer_dir = tachometer_dir
+        self._offsets: dict[tuple[str, str], int] = {}
+        self._tachometer_ns = 0
+        self._tachometer_done: set[Path] = set()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="status-log-stream", daemon=True)
+
+    @classmethod
+    def from_config(
+        cls,
+        reporting: "ReportingConfig | None",
+        reporter: StatusReporter,
+        log_dir: Path,
+        tachometer_dir: Path | None = None,
+    ) -> "LogStreamer | None":
+        interval = reporting.status.stream_interval if reporting and reporting.status else None
+        if not reporter.enabled or interval is None:
+            return None
+        return cls(reporter, log_dir, interval, tachometer_dir)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop the thread and send whatever was written since its last flush."""
+        self._stop.set()
+        self._thread.join()
+        self.flush()
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            self.flush()
+
+    def flush(self) -> None:
+        if self.tachometer_dir is not None:
+            self._export_tachometer()
+        files = sorted(p for p in self.log_dir.rglob("*") if p.suffix in STREAM_SUFFIXES and p.is_file())
+        for endpoint in self.reporter.api_endpoints:
+            for path in files:
+                rel = path.relative_to(self.log_dir).as_posix()
+                try:
+                    with path.open("rb") as f:
+                        f.seek(self._offsets.get((endpoint, rel), 0))
+                        while data := f.read(STREAM_REQUEST_BYTES):
+                            if not self._post(endpoint, rel, data):
+                                break
+                except OSError as e:  # a file vanishing mid-read must not stop streaming
+                    logger.debug("Log stream skipped %s: %s", rel, e)
+
+    def _post(self, endpoint: str, rel: str, data: bytes) -> bool:
+        offset = self._offsets.get((endpoint, rel), 0)
+        chunk = {"file": rel, "offset": offset, "size": len(data), "data": data.decode(errors="replace")}
+        try:
+            response = requests.post(
+                f"{endpoint}/api/jobs/{self.reporter.job_id}/logs",
+                json={"chunks": [chunk]},
+                headers=_auth_headers(self.reporter.token_env),
+                timeout=self.reporter.timeout,
+                allow_redirects=False,
+            )
+        except requests.exceptions.RequestException as e:
+            logger.debug("Log stream to %s failed: %s", endpoint, e)
+            return False
+        if response.status_code != 200:
+            _log_rejection("Log stream", endpoint, response.status_code, self.reporter.token_env)
+            return False
+        self._offsets[(endpoint, rel)] = offset + len(data)
+        return True
+
+    def _export_tachometer(self) -> None:
+        """Append capture rows with ``timestamp_ns`` past the last export (scrapers stamp them monotonically)."""
+        from srtctl.dsight.metrics import batches, capture_files  # lazy: pyarrow
+
+        try:
+            files = [p for p in capture_files(self.tachometer_dir) if p not in self._tachometer_done]
+            with (self.log_dir / TACHOMETER_STREAM_FILE).open("a") as out:
+                for path in files:
+                    newest = self._tachometer_ns
+                    for batch in batches(path):
+                        for row in batch.to_pylist():
+                            if row["timestamp_ns"] > self._tachometer_ns:
+                                out.write(json.dumps(row) + "\n")
+                                newest = max(newest, row["timestamp_ns"])
+                    self._tachometer_ns = newest
+                    if path.suffix == ".parquet":  # segments are published once and never change
+                        self._tachometer_done.add(path)
+        except Exception as e:  # noqa: BLE001 - a half-written or unreadable capture must not stop streaming
+            logger.debug("Tachometer export skipped: %s", e)

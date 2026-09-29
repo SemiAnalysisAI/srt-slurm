@@ -56,11 +56,14 @@ from srtctl.contract import (
     JobDetail,
     JobEventListResponse,
     JobListResponse,
+    JobLogFilesResponse,
+    JobLogResponse,
     JobResponse,
     JobStage,
     JobStatus,
     JobSummary,
     JobUpdatePayload,
+    LogAppendPayload,
 )
 from srtctl.status_server.store import StatusStore
 
@@ -83,6 +86,7 @@ UI_PATHS = frozenset({"/", "/index.html"})
 
 _JOB_ROUTE = re.compile(r"^/api/jobs/(?P<job_id>[^/]+)$")
 _JOB_EVENTS_ROUTE = re.compile(r"^/api/jobs/(?P<job_id>[^/]+)/events$")
+_JOB_LOGS_ROUTE = re.compile(r"^/api/jobs/(?P<job_id>[^/]+)/logs$")
 
 Response = tuple[HTTPStatus, dict[str, Any]]
 
@@ -251,6 +255,11 @@ def route(store: StatusStore, method: str, raw_path: str, body: dict[str, Any] |
         return _event_feed(store, query)
     if (match := _JOB_EVENTS_ROUTE.match(path)) and method == "GET":
         return _job_events(store, match["job_id"], query)
+    if match := _JOB_LOGS_ROUTE.match(path):
+        if method == "POST":
+            return _append_logs(store, match["job_id"], body)
+        if method == "GET":
+            return _job_logs(store, match["job_id"], query)
     if match := _JOB_ROUTE.match(path):
         if method == "GET":
             return _get_job(store, match["job_id"])
@@ -322,6 +331,26 @@ def _job_events(store: StatusStore, job_id: str, query: dict[str, str]) -> Respo
     limit = _int_param(query, "limit", 100, minimum=1, maximum=1000)
     events = store.list_events(after=after, limit=limit, job_id=job_id)
     response = JobEventListResponse(job_id=job_id, events=events, next_cursor=_next_cursor(events, after))
+    return HTTPStatus.OK, response.model_dump()
+
+
+def _append_logs(store: StatusStore, job_id: str, body: dict[str, Any] | None) -> Response:
+    payload = LogAppendPayload.model_validate(body or {})
+    stored = store.append_logs(job_id, [chunk.model_dump() for chunk in payload.chunks])
+    return HTTPStatus.OK, {"job_id": job_id, "stored": stored}
+
+
+def _job_logs(store: StatusStore, job_id: str, query: dict[str, str]) -> Response:
+    """File list without ``file``; with it, content from ``offset`` (poll with ``offset = next_offset``)."""
+    file = query.get("file")
+    if file is None:
+        files = store.list_log_files(job_id)
+        if not files and store.get_job(job_id) is None:
+            raise ApiError(HTTPStatus.NOT_FOUND, "Job not found")
+        return HTTPStatus.OK, JobLogFilesResponse(job_id=job_id, files=files).model_dump()
+    offset = _int_param(query, "offset", 0, minimum=0)
+    data, next_offset = store.read_log(job_id, file, offset=offset)
+    response = JobLogResponse(job_id=job_id, file=file, offset=offset, next_offset=next_offset, data=data)
     return HTTPStatus.OK, response.model_dump()
 
 

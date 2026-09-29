@@ -45,6 +45,18 @@ CREATE TABLE IF NOT EXISTS job_events (
     created_at TEXT NOT NULL
 );
 
+-- Streamed log and metric output. A chunk is keyed by where it sits in its file,
+-- so a resend after a lost response is a no-op.
+CREATE TABLE IF NOT EXISTS job_logs (
+    job_id TEXT NOT NULL,
+    file TEXT NOT NULL,
+    offset INTEGER NOT NULL,
+    size INTEGER NOT NULL,
+    data TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (job_id, file, offset)
+);
+
 CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
 CREATE INDEX IF NOT EXISTS idx_jobs_cluster ON jobs(cluster);
 CREATE INDEX IF NOT EXISTS idx_jobs_submitted_at ON jobs(submitted_at DESC);
@@ -271,7 +283,19 @@ class StatusStore:
         with self._transaction() as conn:
             deleted = conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,)).rowcount
             conn.execute("DELETE FROM job_events WHERE job_id = ?", (job_id,))
+            conn.execute("DELETE FROM job_logs WHERE job_id = ?", (job_id,))
         return deleted > 0
+
+    def append_logs(self, job_id: str, chunks: list[dict[str, Any]]) -> int:
+        """Store streamed chunks (``POST /api/jobs/{job_id}/logs``). Returns how many were new."""
+        now = now_iso()
+        with self._transaction() as conn:
+            before = conn.total_changes
+            conn.executemany(
+                "INSERT OR IGNORE INTO job_logs (job_id, file, offset, size, data, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                [(job_id, c["file"], c["offset"], c["size"], c["data"], now) for c in chunks],
+            )
+            return conn.total_changes - before
 
     # ------------------------------------------------------------------- reads
 
@@ -330,3 +354,35 @@ class StatusStore:
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
         return [dict(row) for row in rows]
+
+    def list_log_files(self, job_id: str) -> list[dict[str, Any]]:
+        """Every streamed file of a job with the bytes received so far."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT file, MAX(offset + size) AS size, MAX(created_at) AS updated_at
+                FROM job_logs WHERE job_id = ? GROUP BY file ORDER BY file
+                """,
+                (job_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def read_log(self, job_id: str, file: str, *, offset: int = 0, max_bytes: int = 1 << 20) -> tuple[str, int]:
+        """Contiguous content of ``file`` from ``offset``, stopping at a gap or after ``max_bytes``.
+
+        Returns ``(data, next_offset)``. ``offset`` is a chunk boundary, i.e. 0 or a
+        ``next_offset`` from an earlier read.
+        """
+        parts: list[str] = []
+        cursor = offset
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT offset, size, data FROM job_logs WHERE job_id = ? AND file = ? AND offset >= ? ORDER BY offset",
+                (job_id, file, offset),
+            )
+            for row in rows:
+                if row["offset"] != cursor or cursor - offset >= max_bytes:
+                    break
+                parts.append(row["data"])
+                cursor += row["size"]
+        return "".join(parts), cursor

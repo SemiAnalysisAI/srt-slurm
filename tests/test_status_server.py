@@ -12,6 +12,7 @@ agree with each other with nothing patched in between.
 from __future__ import annotations
 
 import http.client
+import json
 import logging
 import sys
 import threading
@@ -868,3 +869,68 @@ class TestCreateJobRecordRetry:
         assert [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING] == [
             "Status report to https://collector.example lost after 2 attempts: timed out"
         ]
+
+
+class TestLogStreaming:
+    def test_streamed_files_are_stored_as_deltas_and_read_back(self, base_url, tmp_path):
+        from srtctl.core.status import LogStreamer
+
+        log_dir = tmp_path / "logs"
+        (log_dir / "power").mkdir(parents=True)
+        worker = log_dir / "node-01_decode_w0.out"
+        worker.write_text("loading\n")
+        (log_dir / "power" / "samples.csv").write_text("t,w\n0,700\n")
+        (log_dir / "benchmark-rollup.json").write_text("{}")  # not an append-only suffix
+
+        reporter = StatusReporter(job_id="7", api_endpoints=(base_url,))
+        streamer = LogStreamer(reporter, log_dir, interval=60)
+        streamer.flush()
+        with worker.open("a") as f:
+            f.write("ready\n")
+        streamer.flush()
+        streamer.flush()  # nothing new
+
+        files = _get(base_url, "/api/jobs/7/logs").json()["files"]
+        assert [(f["file"], f["size"]) for f in files] == [("node-01_decode_w0.out", 14), ("power/samples.csv", 10)]
+
+        log = _get(base_url, "/api/jobs/7/logs?file=node-01_decode_w0.out").json()
+        assert (log["data"], log["next_offset"]) == ("loading\nready\n", 14)
+        tail = _get(base_url, "/api/jobs/7/logs?file=node-01_decode_w0.out&offset=8").json()
+        assert tail["data"] == "ready\n"
+
+        # A resend of a stored chunk is a no-op.
+        chunk = {"file": "node-01_decode_w0.out", "offset": 0, "size": 8, "data": "loading\n"}
+        resent = requests.post(f"{base_url}/api/jobs/7/logs", json={"chunks": [chunk]}, timeout=5)
+        assert resent.json()["stored"] == 0
+
+    def test_unknown_job_logs_404(self, base_url):
+        assert _get(base_url, "/api/jobs/nope/logs").status_code == 404
+
+    def test_tachometer_rows_stream_once_as_json_lines(self, base_url, tmp_path):
+        import pyarrow as pa
+        from pyarrow import ipc
+
+        from srtctl.core.status import TACHOMETER_STREAM_FILE, LogStreamer
+
+        log_dir, capture = tmp_path / "logs", tmp_path / "logs" / "tachometer" / "raw" / "scrape"
+        capture.mkdir(parents=True)
+
+        def snapshot(values: list[float]) -> None:  # tachometer rewrites current.arrow with its whole buffer
+            table = pa.table(
+                {
+                    "metric_name": ["tok_s"] * len(values),
+                    "metric_value": values,
+                    "timestamp_ns": list(range(1, len(values) + 1)),
+                }
+            )
+            with ipc.new_file(capture / "current.arrow", table.schema) as writer:
+                writer.write_table(table)
+
+        streamer = LogStreamer(StatusReporter(job_id="8", api_endpoints=(base_url,)), log_dir, 60, capture)
+        snapshot([1.0])
+        streamer.flush()
+        snapshot([1.0, 2.0])
+        streamer.flush()
+
+        log = _get(base_url, f"/api/jobs/8/logs?file={TACHOMETER_STREAM_FILE}").json()
+        assert [json.loads(line)["metric_value"] for line in log["data"].splitlines()] == [1.0, 2.0]

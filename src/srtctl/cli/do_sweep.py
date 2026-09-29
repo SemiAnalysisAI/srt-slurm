@@ -46,7 +46,8 @@ from srtctl.core.resource_snapshot import record_resource_snapshot
 from srtctl.core.runtime import RuntimeContext
 from srtctl.core.schema import SrtConfig
 from srtctl.core.slurm import get_slurm_job_id, start_srun_process
-from srtctl.core.status import JobStage, JobStatus, StatusReporter
+from srtctl.core.status import JobStage, JobStatus, LogStreamer, StatusReporter
+from srtctl.core.telemetry import TACHOMETER_STORAGE_LEAF, TACHOMETER_STORAGE_PARENT
 from srtctl.core.topology import Endpoint, NodePortAllocator, Process, allocate_endpoints_het
 from srtctl.logging_utils import setup_logging
 from srtctl.ports import (
@@ -656,6 +657,20 @@ class SweepOrchestrator(
 
         exit_code = 1
 
+        # Live log/metric streaming to the status API (reporting.status.stream_interval)
+        observability = self.config.observability
+        tachometer_dir = (
+            self.runtime.log_dir
+            / observability.tachometer.storage_subdir
+            / TACHOMETER_STORAGE_PARENT
+            / TACHOMETER_STORAGE_LEAF
+            if observability.tachometer_enabled
+            else None
+        )
+        log_streamer = LogStreamer.from_config(self.config.reporting, reporter, self.runtime.log_dir, tachometer_dir)
+        if log_streamer is not None:
+            log_streamer.start()
+
         try:
             # Stage 0: Bare-host node setup (GPU clocks, kernel modules). Runs
             # before anything containerized so workers see the prepared node.
@@ -788,6 +803,8 @@ class SweepOrchestrator(
             # push logs_url to the status API. Runs before report_completed so
             # the final PUT can reassert the artifact pointer.
             self.run_postprocess(exit_code, reporter=reporter)
+            if log_streamer is not None:
+                log_streamer.stop()
             reporter.report_completed(
                 exit_code,
                 logs_url=getattr(self, "_last_logs_url", None),

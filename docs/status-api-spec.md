@@ -16,6 +16,8 @@ reporting:
       - "https://status.example.com"
     # Optional: which environment variable holds the bearer token (default SRTCTL_STATUS_TOKEN)
     token_env: SRTCTL_STATUS_TOKEN
+    # Optional: push new log and metric output every N seconds (off when unset)
+    stream_interval: 10
 ```
 
 If not configured, status reporting is disabled and jobs run normally.
@@ -253,9 +255,25 @@ Incremental event feed for one job. Events carry a monotonically increasing `id`
 
 Same as above across every job, with an optional `job_id` filter. This is the feed for dashboards and agents that want to react to job transitions without polling each job.
 
+### POST /api/jobs/{job_id}/logs
+
+Live log and metric output, sent every `stream_interval` seconds while the sweep runs and once more before the completed PUT. The sweep sends the bytes appended since its last successful push for every `.out`, `.err`, `.log`, `.csv` and `.jsonl` file under the run's log directory (engine and sweep logs, power `samples.csv`, `host_samples.jsonl`, `profile_export.jsonl`). Tachometer's capture is binary Arrow/Parquet, so when tachometer is enabled the sweep first appends its new rows (by `timestamp_ns`) to `tachometer_rows.jsonl`, which streams like the rest.
+
+```json
+{"chunks": [{"file": "power/samples.csv", "offset": 4096, "size": 512, "data": "..."}]}
+```
+
+`file` is relative to the log directory, `offset` and `size` are byte positions in it, `data` is the bytes decoded as UTF-8. A chunk is stored by `(file, offset)`, so a resend is a no-op. Response: `{"job_id": "12345", "stored": 1}`.
+
+### GET /api/jobs/{job_id}/logs
+
+Without `file`: `{"job_id": "12345", "files": [{"file": "...", "size": 4608, "updated_at": "..."}]}`, `size` being the bytes received so far.
+
+With `file` (and optional `offset`, default 0): the contiguous content from `offset`, up to about 1 MiB, as `{"job_id", "file", "offset", "next_offset", "data"}`. Tail a file by polling with `offset = next_offset`.
+
 ### DELETE /api/jobs/{job_id}
 
-Remove a job and its events. `200 {"deleted": true, "job_id": ...}` or `404`.
+Remove a job, its events and its streamed logs. `200 {"deleted": true, "job_id": ...}` or `404`.
 
 ### GET /api/health
 

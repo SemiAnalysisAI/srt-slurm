@@ -31,3 +31,18 @@ class JobUpdatePayload(BaseModel):
     benchmark_results: dict | None = Field(None, description="Parsed benchmark results")
     artifacts: dict | None = Field(None, description="Collector-side artifact pointers to merge")
     metadata: dict | None = Field(None, description="Additional metadata to merge")
+
+
+class LogChunk(BaseModel):
+    """New bytes of one file under the run's log directory."""
+
+    file: str = Field(..., description="Path relative to the run's log directory")
+    offset: int = Field(..., ge=0, description="Byte offset of the chunk in the file")
+    size: int = Field(..., ge=0, description="Byte length of the chunk in the file")
+    data: str = Field(..., description="The chunk decoded as UTF-8 (invalid bytes replaced)")
+
+
+class LogAppendPayload(BaseModel):
+    """Payload for POST /api/jobs/{job_id}/logs."""
+
+    chunks: list[LogChunk] = Field(..., description="Chunks to store; a repeated (file, offset) is ignored")

@@ -379,6 +379,7 @@ with patch.dict(os.environ, H100Rack.slurm_env()):
 **Current backends:**
 - **ATOM**: Native ROCm servers behind AToMesh, with one Slurm node per logical worker and allocator-owned Mooncake handshake ports
 - **SGLang**: Per-process srun launching, supports prefill/decode/aggregated modes
+- **TileRT**: Decode workers behind `tilert-router`; select a compatible prefill engine and image through `roles.prefill.engine` / `.container`.
 - **TRTLLM**: MPI-style launching (one srun per endpoint with all nodes), prefill/decode only
 - **vLLM**: Per-process srun launching, prefill/decode/aggregated, `per_node` DP; `frontend_type` selects Dynamo registration or a direct `vllm serve` server, and `_CONNECTOR_MAP` owns the KV connector table
 
@@ -429,4 +430,3 @@ tail -f outputs/<job_id>/logs/sweep_<job_id>.log | grep "srun command"
 ```
 
 Per-worker env vars and commands are also logged individually (search for `Env:` and `Command:` lines).
-

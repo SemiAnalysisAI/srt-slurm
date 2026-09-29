@@ -444,6 +444,7 @@ For mixed-engine recipes, declare both engines explicitly and omit the top-level
 Per-role engines do not support Dynamo, sidecars, Slurm heterogeneous jobs,
 profiling, failover, implicit Mooncake stores, or vLLM discovery connectors.
 Multi-node workers must occupy whole nodes; multi-node TRT-LLM is unsupported.
+TileRT's point-to-point Mooncake transfer is supported; see [TileRT](tilert.md).
 
 These restrictions are checked when `SrtConfig` loads, before Slurm submission,
 including dry-run and preflight. `_validate_role_backends()` rejects per-role

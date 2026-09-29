@@ -656,7 +656,7 @@ class SweepOrchestrator(
 
         exit_code = 1
 
-        # Live log/metric streaming to the status API (reporting.status.stream_interval)
+        # Live log/metric streaming to the status API (reporting.status.logging-stream-interval)
         observability = self.config.observability
         tachometer_dir = (
             self.runtime.log_dir / observability.tachometer.storage_subdir / "local"

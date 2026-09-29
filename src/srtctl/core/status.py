@@ -32,7 +32,7 @@ Configuration (in srtslurm.yaml or recipe YAML):
     reporting:
       status:
         endpoint: "https://status.example.com"
-        stream_interval: 10
+        logging-stream-interval: 10
 """
 
 import codecs
@@ -482,7 +482,7 @@ class LogStreamer:
         log_dir: Path,
         tachometer_dir: Path | None = None,
     ) -> "LogStreamer | None":
-        interval = reporting.status.stream_interval if reporting and reporting.status else None
+        interval = reporting.status.logging_stream_interval if reporting and reporting.status else None
         if not reporter.enabled or interval is None:
             return None
         return cls(reporter, log_dir, interval, tachometer_dir)

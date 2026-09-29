@@ -17,7 +17,7 @@ reporting:
     # Optional: which environment variable holds the bearer token (default SRTCTL_STATUS_TOKEN)
     token_env: SRTCTL_STATUS_TOKEN
     # Optional: push new log and metric output every N seconds (off when unset)
-    stream_interval: 10
+    logging-stream-interval: 10
 ```
 
 If not configured, status reporting is disabled and jobs run normally.
@@ -257,7 +257,7 @@ Same as above across every job, with an optional `job_id` filter. This is the fe
 
 ### POST /api/jobs/{job_id}/logs
 
-Live log and metric output, sent every `stream_interval` seconds while the sweep runs and on a final best-effort flush before the completed PUT (shutdown waits at most five seconds). The sweep sends the bytes appended since its last successful push for every `.out`, `.err`, `.log`, `.csv` and `.jsonl` file under the run's log directory (engine and sweep logs, power `samples.csv`, `host_samples.jsonl`, `profile_export.jsonl`). Tachometer's capture is binary Arrow/Parquet, so when tachometer is enabled the sweep reads its live `tachometer/local` capture and appends previously unseen observations to `tachometer_rows.jsonl`, which streams like the rest. A local disk-backed identity index handles snapshot overlap, rotation and compaction without assuming timestamp order.
+Live log and metric output, sent every `logging-stream-interval` seconds while the sweep runs and on a final best-effort flush before the completed PUT (shutdown waits at most five seconds). The sweep sends the bytes appended since its last successful push for every `.out`, `.err`, `.log`, `.csv` and `.jsonl` file under the run's log directory (engine and sweep logs, power `samples.csv`, `host_samples.jsonl`, `profile_export.jsonl`). Tachometer's capture is binary Arrow/Parquet, so when tachometer is enabled the sweep reads its live `tachometer/local` capture and appends previously unseen observations to `tachometer_rows.jsonl`, which streams like the rest. A local disk-backed identity index handles snapshot overlap, rotation and compaction without assuming timestamp order.
 
 ```json
 {"metadata": {"cluster": "b200"}, "chunks": [{"file": "power/samples.csv", "offset": 4096, "size": 512, "data": "..."}]}

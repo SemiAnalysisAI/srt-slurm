@@ -65,7 +65,7 @@ from srtctl.contract import (
     JobUpdatePayload,
     LogAppendPayload,
 )
-from srtctl.status_server.store import StatusStore
+from srtctl.status_server.store import LogChunkConflict, StatusStore
 
 logger = logging.getLogger(__name__)
 
@@ -336,7 +336,10 @@ def _job_events(store: StatusStore, job_id: str, query: dict[str, str]) -> Respo
 
 def _append_logs(store: StatusStore, job_id: str, body: dict[str, Any] | None) -> Response:
     payload = LogAppendPayload.model_validate(body or {})
-    stored = store.append_logs(job_id, [chunk.model_dump() for chunk in payload.chunks])
+    try:
+        stored = store.append_logs(job_id, [chunk.model_dump() for chunk in payload.chunks])
+    except LogChunkConflict as exc:
+        raise ApiError(HTTPStatus.CONFLICT, str(exc)) from exc
     return HTTPStatus.OK, {"job_id": job_id, "stored": stored}
 
 

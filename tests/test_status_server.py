@@ -871,6 +871,79 @@ class TestCreateJobRecordRetry:
         ]
 
 
+class TestLogCollector:
+    def test_exact_retry_is_ignored_and_conflicting_batch_is_rolled_back(self, base_url, store):
+        url = f"{base_url}/api/jobs/7/logs"
+        original = {"file": "worker.log", "offset": 0, "size": 3, "data": "abc"}
+        payload = {"chunks": [original], "metadata": {"cluster": "test-cluster"}}
+        assert requests.post(url, json=payload, timeout=5).json()["stored"] == 1
+        assert requests.post(url, json=payload, timeout=5).json()["stored"] == 0
+
+        response = requests.post(
+            url,
+            json={
+                "chunks": [
+                    {"file": "other.log", "offset": 0, "size": 3, "data": "new"},
+                    {**original, "size": 6, "data": "abcdef"},
+                ]
+            },
+            timeout=5,
+        )
+        assert response.status_code == 409
+        assert store.read_log("7", "worker.log") == ("abc", 3)
+        assert store.list_log_files("7")[0]["file"] == "worker.log"
+        assert len(store.list_log_files("7")) == 1
+
+    @pytest.mark.parametrize(
+        "conflict",
+        [
+            {"offset": 3, "size": 3, "data": "xyz"},
+            {"offset": 2, "size": 2, "data": "cd"},
+            {"offset": 5, "size": 2, "data": "fg"},
+            {"offset": 0, "size": 9, "data": "abcdefghi"},
+        ],
+    )
+    def test_overlapping_ranges_are_rejected(self, base_url, store, conflict):
+        url = f"{base_url}/api/jobs/7/logs"
+        original = {"file": "worker.log", "offset": 3, "size": 3, "data": "def"}
+        assert requests.post(url, json={"chunks": [original]}, timeout=5).status_code == 200
+        response = requests.post(url, json={"chunks": [{"file": "worker.log", **conflict}]}, timeout=5)
+        assert response.status_code == 409
+        # Out-of-order, non-overlapping chunks remain supported.
+        prefix = {"file": "worker.log", "offset": 0, "size": 3, "data": "abc"}
+        assert requests.post(url, json={"chunks": [prefix]}, timeout=5).status_code == 200
+        assert store.read_log("7", "worker.log") == ("abcdef", 6)
+
+    @pytest.mark.parametrize(
+        "invalid",
+        [
+            {"size": 0},
+            {"size": (1 << 20) + 1},
+            {"offset": -1},
+            {"offset": 1 << 63},
+            {"offset": (1 << 63) - 1},
+            {"file": "../outside.log"},
+            {"file": "/absolute.log"},
+            {"file": "worker/../outside.log"},
+            {"data": ""},
+        ],
+    )
+    def test_invalid_chunks_are_rejected_before_storage(self, base_url, store, invalid):
+        chunk = {"file": "worker.log", "offset": 0, "size": 3, "data": "abc", **invalid}
+        response = requests.post(f"{base_url}/api/jobs/7/logs", json={"chunks": [chunk]}, timeout=5)
+        assert response.status_code == 422
+        assert store.list_log_files("7") == []
+
+    def test_log_routes_require_the_existing_tokens(self, auth_url):
+        url = f"{auth_url}/api/jobs/7/logs"
+        payload = {"chunks": [{"file": "worker.log", "offset": 0, "size": 3, "data": "abc"}]}
+        assert requests.post(url, json=payload, timeout=5).status_code == 401
+        assert requests.post(url, json=payload, headers=_bearer(READ), timeout=5).status_code == 403
+        assert requests.post(url, json=payload, headers=_bearer(WRITE), timeout=5).status_code == 200
+        assert requests.get(url, timeout=5).status_code == 401
+        assert requests.get(url, headers=_bearer(READ), timeout=5).status_code == 200
+
+
 class TestLogStreaming:
     def test_streamed_files_are_stored_as_deltas_and_read_back(self, base_url, tmp_path):
         from srtctl.core.status import LogStreamer
@@ -912,7 +985,7 @@ class TestLogStreaming:
 
         from srtctl.core.status import TACHOMETER_STREAM_FILE, LogStreamer
 
-        log_dir, capture = tmp_path / "logs", tmp_path / "logs" / "tachometer" / "raw" / "scrape"
+        log_dir, capture = tmp_path / "logs", tmp_path / "logs" / "tachometer" / "local"
         capture.mkdir(parents=True)
 
         def snapshot(values: list[float]) -> None:  # tachometer rewrites current.arrow with its whole buffer
@@ -934,3 +1007,118 @@ class TestLogStreaming:
 
         log = _get(base_url, f"/api/jobs/8/logs?file={TACHOMETER_STREAM_FILE}").json()
         assert [json.loads(line)["metric_value"] for line in log["data"].splitlines()] == [1.0, 2.0]
+
+    def test_lost_response_retries_identical_bytes_after_file_grows(self, base_url, tmp_path, monkeypatch):
+        from srtctl.core.status import LogStreamer
+
+        path = tmp_path / "worker.log"
+        path.write_text("abc")
+        streamer = LogStreamer(StatusReporter(job_id="retry", api_endpoints=(base_url,)), tmp_path, 60)
+        real_post = requests.post
+        sent = []
+
+        def lose_first_response(url, **kwargs):
+            sent.append(kwargs["json"]["chunks"][0])
+            response = real_post(url, **kwargs)
+            if len(sent) == 1:
+                raise requests.Timeout("response lost after commit")
+            return response
+
+        monkeypatch.setattr(requests, "post", lose_first_response)
+        streamer.flush()
+        with path.open("a") as out:
+            out.write("def")
+        streamer.flush()
+        with path.open("a") as out:
+            out.write("ghi")
+        streamer.flush()
+        log = _get(base_url, "/api/jobs/retry/logs?file=worker.log").json()
+        assert (log["data"], log["next_offset"]) == ("abcdefghi", 9)
+        assert [(chunk["offset"], chunk["data"]) for chunk in sent] == [
+            (0, "abc"),
+            (0, "abc"),
+            (3, "def"),
+            (6, "ghi"),
+        ]
+
+    def test_utf8_survives_chunk_and_append_boundaries(self, base_url, tmp_path):
+        from srtctl.core.status import STREAM_REQUEST_BYTES, LogStreamer
+
+        path = tmp_path / "worker.log"
+        prefix = "a" * (STREAM_REQUEST_BYTES - 1)
+        path.write_bytes(prefix.encode() + "€".encode()[:2])
+        streamer = LogStreamer(StatusReporter(job_id="utf8", api_endpoints=(base_url,)), tmp_path, 60)
+        streamer.flush()
+        with path.open("ab") as out:
+            out.write("€".encode()[2:] + "文\n".encode())
+        streamer.flush()
+        log = _get(base_url, "/api/jobs/utf8/logs?file=worker.log").json()
+        assert log["data"] == prefix + "€文\n"
+        assert log["next_offset"] == len(path.read_bytes())
+
+    def test_stream_authenticates_and_includes_cluster_on_each_chunk(self, auth_url, tmp_path, monkeypatch):
+        from srtctl.core.status import LogStreamer
+
+        monkeypatch.setenv("SRTCTL_STATUS_TOKEN", WRITE)
+        monkeypatch.setattr("srtctl.core.status._cluster_setting", lambda: "mi300x-amd")
+        path = tmp_path / "worker.log"
+        path.write_text("first\n")
+        real_post = requests.post
+        payloads = []
+
+        def record(url, **kwargs):
+            payloads.append(kwargs["json"])
+            return real_post(url, **kwargs)
+
+        monkeypatch.setattr(requests, "post", record)
+        streamer = LogStreamer(StatusReporter(job_id="cluster", api_endpoints=(auth_url,)), tmp_path, 60)
+        streamer.flush()
+        with path.open("a") as out:
+            out.write("second\n")
+        streamer.flush()
+        assert [payload["metadata"] for payload in payloads] == [
+            {"cluster": "mi300x-amd"},
+            {"cluster": "mi300x-amd"},
+        ]
+        response = requests.get(
+            f"{auth_url}/api/jobs/cluster/logs?file=worker.log",
+            headers=_bearer(READ),
+            timeout=5,
+        )
+        assert response.json()["data"] == "first\nsecond\n"
+
+    def test_stop_does_not_wait_indefinitely_for_a_collector(self, tmp_path, monkeypatch, caplog):
+        from srtctl.core.status import LogStreamer
+
+        entered, release = threading.Event(), threading.Event()
+        (tmp_path / "worker.log").write_text("data")
+
+        def stalled_post(*args, **kwargs):
+            entered.set()
+            release.wait(timeout=5)
+            raise requests.Timeout("stalled collector")
+
+        monkeypatch.setattr(requests, "post", stalled_post)
+        monkeypatch.setattr("srtctl.core.status.STREAM_SHUTDOWN_SECONDS", 0.02)
+        streamer = LogStreamer(StatusReporter(job_id="stalled", api_endpoints=("https://collector",)), tmp_path, 0.001)
+        streamer.start()
+        try:
+            assert entered.wait(timeout=2)
+            streamer.stop()
+            assert not release.is_set()
+            assert "local logs are retained" in caplog.text
+        finally:
+            release.set()
+            streamer._thread.join(timeout=2)
+        assert not streamer._thread.is_alive()
+
+    def test_stop_flushes_final_bytes_before_first_interval(self, base_url, tmp_path):
+        from srtctl.core.status import LogStreamer
+
+        (tmp_path / "worker.log").write_bytes(b"last line\n\xe2")
+        streamer = LogStreamer(StatusReporter(job_id="final", api_endpoints=(base_url,)), tmp_path, 60)
+        streamer.start()
+        streamer.stop()
+        log = _get(base_url, "/api/jobs/final/logs?file=worker.log").json()
+        assert log["data"] == "last line\n\ufffd"
+        assert log["next_offset"] == 11

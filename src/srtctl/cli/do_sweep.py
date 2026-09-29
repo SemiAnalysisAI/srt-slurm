@@ -47,7 +47,6 @@ from srtctl.core.runtime import RuntimeContext
 from srtctl.core.schema import SrtConfig
 from srtctl.core.slurm import get_slurm_job_id, start_srun_process
 from srtctl.core.status import JobStage, JobStatus, LogStreamer, StatusReporter
-from srtctl.core.telemetry import TACHOMETER_STORAGE_LEAF, TACHOMETER_STORAGE_PARENT
 from srtctl.core.topology import Endpoint, NodePortAllocator, Process, allocate_endpoints_het
 from srtctl.logging_utils import setup_logging
 from srtctl.ports import (
@@ -660,10 +659,7 @@ class SweepOrchestrator(
         # Live log/metric streaming to the status API (reporting.status.stream_interval)
         observability = self.config.observability
         tachometer_dir = (
-            self.runtime.log_dir
-            / observability.tachometer.storage_subdir
-            / TACHOMETER_STORAGE_PARENT
-            / TACHOMETER_STORAGE_LEAF
+            self.runtime.log_dir / observability.tachometer.storage_subdir / "local"
             if observability.tachometer_enabled
             else None
         )

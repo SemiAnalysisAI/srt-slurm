@@ -257,13 +257,15 @@ Same as above across every job, with an optional `job_id` filter. This is the fe
 
 ### POST /api/jobs/{job_id}/logs
 
-Live log and metric output, sent every `stream_interval` seconds while the sweep runs and once more before the completed PUT. The sweep sends the bytes appended since its last successful push for every `.out`, `.err`, `.log`, `.csv` and `.jsonl` file under the run's log directory (engine and sweep logs, power `samples.csv`, `host_samples.jsonl`, `profile_export.jsonl`). Tachometer's capture is binary Arrow/Parquet, so when tachometer is enabled the sweep first appends its new rows (by `timestamp_ns`) to `tachometer_rows.jsonl`, which streams like the rest.
+Live log and metric output, sent every `stream_interval` seconds while the sweep runs and on a final best-effort flush before the completed PUT (shutdown waits at most five seconds). The sweep sends the bytes appended since its last successful push for every `.out`, `.err`, `.log`, `.csv` and `.jsonl` file under the run's log directory (engine and sweep logs, power `samples.csv`, `host_samples.jsonl`, `profile_export.jsonl`). Tachometer's capture is binary Arrow/Parquet, so when tachometer is enabled the sweep reads its live `tachometer/local` capture and appends previously unseen observations to `tachometer_rows.jsonl`, which streams like the rest. A local disk-backed identity index handles snapshot overlap, rotation and compaction without assuming timestamp order.
 
 ```json
-{"chunks": [{"file": "power/samples.csv", "offset": 4096, "size": 512, "data": "..."}]}
+{"metadata": {"cluster": "b200"}, "chunks": [{"file": "power/samples.csv", "offset": 4096, "size": 512, "data": "..."}]}
 ```
 
-`file` is relative to the log directory, `offset` and `size` are byte positions in it, `data` is the bytes decoded as UTF-8. A chunk is stored by `(file, offset)`, so a resend is a no-op. Response: `{"job_id": "12345", "stored": 1}`.
+`file` is a relative path under the log directory; `offset` is its source byte position and `size` is its positive byte length. `data` is decoded as UTF-8, preserving characters split across chunks or appends; invalid source bytes are replaced. Failed requests retry the exact same bytes even if the file has grown. An exact resend is a no-op; a conflicting or overlapping chunk returns HTTP 409 and rolls back the whole request. Response: `{"job_id": "12345", "stored": 1}` (`stored: 0` for an exact resend). The sender validates the acknowledgment before advancing its offset. Files must be append-only; offsets are maintained for the running streamer, not persisted across process restarts.
+
+When `cluster` is configured, every log request includes `metadata.cluster`. Shared collectors must use `(cluster, job_id)` for identity. The built-in collector continues to key jobs and logs by job ID alone. Streaming requires a collector implementing these log routes; a lifecycle-only collector needs separate log storage/read support.
 
 ### GET /api/jobs/{job_id}/logs
 

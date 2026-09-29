@@ -35,10 +35,15 @@ Configuration (in srtslurm.yaml or recipe YAML):
         stream_interval: 10
 """
 
+import codecs
+import hashlib
 import json
 import logging
 import os
+import sqlite3
 import threading
+import time
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -443,6 +448,7 @@ STREAM_SUFFIXES = (".out", ".err", ".log", ".csv", ".jsonl")
 TACHOMETER_STREAM_FILE = "tachometer_rows.jsonl"
 # Raw bytes per POST; JSON escaping can grow text up to 6x, which stays under the collector's 1 MiB cap.
 STREAM_REQUEST_BYTES = 128 * 1024
+STREAM_SHUTDOWN_SECONDS = 5.0
 
 
 class LogStreamer:
@@ -451,8 +457,8 @@ class LogStreamer:
     Each chunk carries its file (relative to ``log_dir``), byte ``offset`` and
     ``size``, so the collector stores deltas by position and a resend is a no-op.
     Offsets advance per endpoint only on success, so an unreachable collector
-    catches up on a later flush. With ``tachometer_dir`` set, rows newer than the
-    last flush are first appended to ``TACHOMETER_STREAM_FILE``, which then
+    catches up on a later flush. With ``tachometer_dir`` set, previously unseen
+    observations are appended to ``TACHOMETER_STREAM_FILE``, which then
     streams like any other file.
     """
 
@@ -462,7 +468,8 @@ class LogStreamer:
         self.interval = interval
         self.tachometer_dir = tachometer_dir
         self._offsets: dict[tuple[str, str], int] = {}
-        self._tachometer_ns = 0
+        self._pending: dict[tuple[str, str], bytes] = {}
+        self._shutdown_deadline: float | None = None
         self._tachometer_done: set[Path] = set()
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="status-log-stream", daemon=True)
@@ -484,67 +491,172 @@ class LogStreamer:
         self._thread.start()
 
     def stop(self) -> None:
-        """Stop the thread and send whatever was written since its last flush."""
+        """Give the worker a bounded final flush; telemetry cannot delay job completion indefinitely."""
+        self._shutdown_deadline = time.monotonic() + STREAM_SHUTDOWN_SECONDS
         self._stop.set()
-        self._thread.join()
-        self.flush()
+        if self._thread.ident is not None:
+            self._thread.join(timeout=STREAM_SHUTDOWN_SECONDS)
+            if self._thread.is_alive():
+                logger.warning(
+                    "Log streaming did not finish within %.1fs; local logs are retained", STREAM_SHUTDOWN_SECONDS
+                )
 
     def _run(self) -> None:
         while not self._stop.wait(self.interval):
             self.flush()
+        self.flush()
+
+    def _expired(self) -> bool:
+        return self._shutdown_deadline is not None and time.monotonic() >= self._shutdown_deadline
 
     def flush(self) -> None:
-        if self.tachometer_dir is not None:
-            self._export_tachometer()
-        files = sorted(p for p in self.log_dir.rglob("*") if p.suffix in STREAM_SUFFIXES and p.is_file())
-        for endpoint in self.reporter.api_endpoints:
-            for path in files:
-                rel = path.relative_to(self.log_dir).as_posix()
-                try:
-                    with path.open("rb") as f:
-                        f.seek(self._offsets.get((endpoint, rel), 0))
-                        while data := f.read(STREAM_REQUEST_BYTES):
-                            if not self._post(endpoint, rel, data):
+        """Upload a finite snapshot of each file, retaining unacknowledged bytes verbatim."""
+        try:
+            if self._expired():
+                return
+            if self.tachometer_dir is not None:
+                self._export_tachometer()
+            files = sorted(p for p in self.log_dir.rglob("*") if p.suffix in STREAM_SUFFIXES and p.is_file())
+            for endpoint in self.reporter.api_endpoints:
+                for path in files:
+                    if self._expired():
+                        return
+                    rel = path.relative_to(self.log_dir).as_posix()
+                    key = (endpoint, rel)
+                    try:
+                        with path.open("rb") as f:
+                            # Do not chase an actively growing file forever and starve other files/endpoints.
+                            end = os.fstat(f.fileno()).st_size
+                            while not self._expired():
+                                offset = self._offsets.get(key, 0)
+                                data = self._pending.get(key)
+                                if data is None:
+                                    if offset >= end:
+                                        break
+                                    f.seek(offset)
+                                    data = f.read(min(STREAM_REQUEST_BYTES, end - offset))
+                                    # Keep a partial UTF-8 character for the next read/flush. Invalid
+                                    # source bytes are replaced, but valid split characters stay intact.
+                                    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+                                    decoder.decode(data, final=self._stop.is_set() and offset + len(data) >= end)
+                                    pending_bytes, _ = decoder.getstate()
+                                    if pending_bytes:
+                                        data = data[: -len(pending_bytes)]
+                                    if not data:
+                                        break
+                                    self._pending[key] = data
+                                if not self._post(endpoint, rel, data):
+                                    # One failed collector must not incur a timeout for every file.
+                                    break
+                                del self._pending[key]
+                            else:
+                                return
+                            if key in self._pending:
                                 break
-                except OSError as e:  # a file vanishing mid-read must not stop streaming
-                    logger.debug("Log stream skipped %s: %s", rel, e)
+                    except OSError as e:
+                        logger.debug("Log stream skipped %s: %s", rel, e)
+        except Exception:
+            logger.warning("Log streaming flush failed; will retry", exc_info=True)
 
     def _post(self, endpoint: str, rel: str, data: bytes) -> bool:
         offset = self._offsets.get((endpoint, rel), 0)
         chunk = {"file": rel, "offset": offset, "size": len(data), "data": data.decode(errors="replace")}
+        payload: dict = {"chunks": [chunk]}
+        cluster = _cluster_setting()
+        if cluster:
+            payload["metadata"] = {"cluster": cluster}
+        timeout = self.reporter.timeout
+        if self._shutdown_deadline is not None:
+            timeout = min(timeout, self._shutdown_deadline - time.monotonic())
+            if timeout <= 0:
+                return False
         try:
             response = requests.post(
                 f"{endpoint}/api/jobs/{self.reporter.job_id}/logs",
-                json={"chunks": [chunk]},
+                json=payload,
                 headers=_auth_headers(self.reporter.token_env),
-                timeout=self.reporter.timeout,
+                timeout=timeout,
                 allow_redirects=False,
             )
-        except requests.exceptions.RequestException as e:
+            if response.status_code != 200:
+                _log_rejection("Log stream", endpoint, response.status_code, self.reporter.token_env)
+                return False
+            acknowledgment = response.json()
+            if (
+                not isinstance(acknowledgment, dict)
+                or acknowledgment.get("job_id") != self.reporter.job_id
+                or acknowledgment.get("stored") not in (0, 1)
+            ):
+                logger.debug("Log stream to %s returned an invalid acknowledgment", endpoint)
+                return False
+        except (requests.exceptions.RequestException, ValueError) as e:
             logger.debug("Log stream to %s failed: %s", endpoint, e)
-            return False
-        if response.status_code != 200:
-            _log_rejection("Log stream", endpoint, response.status_code, self.reporter.token_env)
             return False
         self._offsets[(endpoint, rel)] = offset + len(data)
         return True
 
     def _export_tachometer(self) -> None:
-        """Append capture rows with ``timestamp_ns`` past the last export (scrapers stamp them monotonically)."""
+        """Export observations once across snapshots, rotations and reordered compactions.
+
+        Compaction replaces local segments and adds ``metric_name_clean``. A
+        disk-backed identity index avoids both timestamp assumptions and keeping
+        millions of sample identities in memory.
+        """
+        if self.tachometer_dir is None:
+            return
+
+        import pyarrow as pa
+        from pyarrow import ipc
+
         from srtctl.dsight.metrics import batches, capture_files  # lazy: pyarrow
 
         try:
             files = [p for p in capture_files(self.tachometer_dir) if p not in self._tachometer_done]
-            with (self.log_dir / TACHOMETER_STREAM_FILE).open("a") as out:
+            index_path = self.log_dir / ".tachometer-stream.sqlite3"
+            with (
+                closing(sqlite3.connect(index_path)) as index,
+                (self.log_dir / TACHOMETER_STREAM_FILE).open("a+b", buffering=0) as out,
+            ):
+                index.execute("CREATE TABLE IF NOT EXISTS exported (identity BLOB PRIMARY KEY) WITHOUT ROWID")
                 for path in files:
-                    newest = self._tachometer_ns
-                    for batch in batches(path):
-                        for row in batch.to_pylist():
-                            if row["timestamp_ns"] > self._tachometer_ns:
-                                out.write(json.dumps(row) + "\n")
-                                newest = max(newest, row["timestamp_ns"])
-                    self._tachometer_ns = newest
-                    if path.suffix == ".parquet":  # segments are published once and never change
+                    if self._expired():
+                        return
+                    if path.suffix == ".arrow":
+                        # The writer truncates current.arrow in place. Copy before
+                        # decoding: mmap can SIGBUS when the next snapshot shrinks.
+                        data = path.read_bytes()
+                        source = pa.BufferReader(data)
+                        if data.startswith(b"ARROW1"):
+                            reader = ipc.open_file(source)
+                            capture_batches = (reader.get_batch(i) for i in range(reader.num_record_batches))
+                        else:
+                            capture_batches = iter(ipc.open_stream(source))
+                    else:
+                        capture_batches = batches(path)
+                    for batch in capture_batches:
+                        if self._expired():
+                            return
+                        start = out.tell()
+                        pending = bytearray()
+                        try:
+                            with index:
+                                for row in batch.to_pylist():
+                                    row.pop("metric_name_clean", None)
+                                    encoded = (json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n").encode()
+                                    inserted = index.execute(
+                                        "INSERT OR IGNORE INTO exported VALUES (?)", (hashlib.sha256(encoded).digest(),)
+                                    ).rowcount
+                                    if inserted:
+                                        pending.extend(encoded)
+                                if out.write(pending) != len(pending):
+                                    raise OSError("Incomplete Tachometer JSONL write")
+                        except Exception:
+                            # Retry an incomplete batch without retaining half of
+                            # its JSONL output or advancing its identity index.
+                            out.seek(start)
+                            out.truncate()
+                            raise
+                    if path.suffix == ".parquet":
                         self._tachometer_done.add(path)
-        except Exception as e:  # noqa: BLE001 - a half-written or unreadable capture must not stop streaming
+        except Exception as e:  # noqa: BLE001 - unreadable/rotating captures must not stop streaming
             logger.debug("Tachometer export skipped: %s", e)

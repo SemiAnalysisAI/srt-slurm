@@ -81,6 +81,10 @@ def placeholder_name(job_id: str) -> str:
     return f"job-{job_id}"
 
 
+class LogChunkConflict(ValueError):
+    """An incoming chunk disagrees with bytes already stored for the same file."""
+
+
 def _decode_job(row: sqlite3.Row) -> dict[str, Any]:
     job = dict(row)
     for key in _JSON_COLUMNS:
@@ -287,15 +291,26 @@ class StatusStore:
         return deleted > 0
 
     def append_logs(self, job_id: str, chunks: list[dict[str, Any]]) -> int:
-        """Store streamed chunks (``POST /api/jobs/{job_id}/logs``). Returns how many were new."""
+        """Store chunks atomically, accepting exact retries and rejecting conflicting ranges."""
         now = now_iso()
         with self._transaction() as conn:
-            before = conn.total_changes
-            conn.executemany(
-                "INSERT OR IGNORE INTO job_logs (job_id, file, offset, size, data, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                [(job_id, c["file"], c["offset"], c["size"], c["data"], now) for c in chunks],
-            )
-            return conn.total_changes - before
+            stored = 0
+            for chunk in chunks:
+                overlapping = conn.execute(
+                    """SELECT offset, size, data FROM job_logs
+                    WHERE job_id = ? AND file = ? AND offset < ? ORDER BY offset DESC LIMIT 1""",
+                    (job_id, chunk["file"], chunk["offset"] + chunk["size"]),
+                ).fetchone()
+                if overlapping is not None and overlapping["offset"] + overlapping["size"] > chunk["offset"]:
+                    if all(overlapping[key] == chunk[key] for key in ("offset", "size", "data")):
+                        continue
+                    raise LogChunkConflict(f"Conflicting log chunk for {chunk['file']} at offset {chunk['offset']}")
+                conn.execute(
+                    "INSERT INTO job_logs (job_id, file, offset, size, data, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (job_id, chunk["file"], chunk["offset"], chunk["size"], chunk["data"], now),
+                )
+                stored += 1
+            return stored
 
     # ------------------------------------------------------------------- reads
 

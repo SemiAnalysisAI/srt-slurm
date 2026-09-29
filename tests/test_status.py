@@ -598,3 +598,126 @@ class TestJobStageEnum:
         assert JobStage.FRONTEND.value == "frontend"
         assert JobStage.BENCHMARK.value == "benchmark"
         assert JobStage.CLEANUP.value == "cleanup"
+
+
+class TestTachometerStreaming:
+    """Capture rotation and compaction must not drop or repeat observations."""
+
+    @staticmethod
+    def _snapshot(path, rows):
+        import pyarrow as pa
+        from pyarrow import ipc
+
+        table = pa.Table.from_pylist(rows)
+        with ipc.new_stream(path, table.schema) as writer:
+            writer.write_table(table)
+
+    @staticmethod
+    def _parquet(path, rows):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        pq.write_table(pa.Table.from_pylist(rows), path)
+
+    @staticmethod
+    def _streamer(tmp_path):
+        from srtctl.core.status import LogStreamer
+
+        capture = tmp_path / "tachometer" / "local"
+        capture.mkdir(parents=True)
+        return LogStreamer(StatusReporter(job_id="8"), tmp_path, 60, capture), capture
+
+    @staticmethod
+    def _rows(tmp_path):
+        import json
+
+        from srtctl.core.status import TACHOMETER_STREAM_FILE
+
+        return [json.loads(line) for line in (tmp_path / TACHOMETER_STREAM_FILE).read_text().splitlines()]
+
+    def test_live_snapshots_rotation_and_reordered_compaction(self, tmp_path):
+        streamer, capture = self._streamer(tmp_path)
+        rows = [
+            {"timestamp_ns": 20, "metric_name": "z", "metric_value": 1.0},
+            {"timestamp_ns": 20, "metric_name": "a", "metric_value": 2.0},
+            {"timestamp_ns": 10, "metric_name": "a", "metric_value": 3.0},
+            {"timestamp_ns": 30, "metric_name": "a", "metric_value": 4.0},
+        ]
+        self._snapshot(capture / "current.arrow", rows[:1])
+        streamer._export_tachometer()
+        self._snapshot(capture / "current.arrow", rows[:2])
+        streamer._export_tachometer()
+        # Rotation publishes parquet before replacing its overlapping Arrow tail.
+        self._parquet(capture / "out-1.parquet", rows[:3])
+        streamer._export_tachometer()
+        self._snapshot(capture / "current.arrow", rows[3:])
+        streamer._export_tachometer()
+        compacted = [{**row, "metric_name_clean": row["metric_name"]} for row in reversed(rows)]
+        self._parquet(capture / "incomplete-1.parquet", compacted[:3])
+        (capture / "out-1.parquet").unlink()
+        streamer._export_tachometer()
+        self._parquet(capture / "final.parquet", compacted)
+        (capture / "incomplete-1.parquet").unlink()
+        (capture / "current.arrow").unlink()
+        streamer._export_tachometer()
+        streamer._export_tachometer()
+        assert self._rows(tmp_path) == rows
+
+    def test_numeric_segments_do_not_drop_earlier_timestamps(self, tmp_path):
+        streamer, capture = self._streamer(tmp_path)
+        for index in (1, 2, 10):
+            self._parquet(
+                capture / f"out-{index}.parquet",
+                [{"timestamp_ns": index, "metric_name": "requests", "metric_value": float(index)}],
+            )
+        streamer._export_tachometer()
+        streamer._export_tachometer()
+        assert sorted(row["timestamp_ns"] for row in self._rows(tmp_path)) == [1, 2, 10]
+
+    def test_partial_capture_read_retries_without_duplicate_rows(self, tmp_path):
+        import pyarrow as pa
+
+        streamer, capture = self._streamer(tmp_path)
+        rows = [{"timestamp_ns": 1, "metric_name": metric, "metric_value": 1.0} for metric in ("a", "b")]
+        self._parquet(capture / "out-1.parquet", rows)
+
+        def failing_batches(path):
+            yield pa.RecordBatch.from_pylist(rows[:1])
+            raise OSError("capture disappeared during compaction")
+
+        with patch("srtctl.dsight.metrics.batches", failing_batches):
+            streamer._export_tachometer()
+        assert self._rows(tmp_path) == rows[:1]
+        streamer._export_tachometer()
+        assert self._rows(tmp_path) == rows
+
+    def test_failed_output_append_rolls_back_rows_and_index(self, tmp_path):
+        from pathlib import Path
+
+        from srtctl.core.status import TACHOMETER_STREAM_FILE
+
+        streamer, capture = self._streamer(tmp_path)
+        rows = [{"timestamp_ns": 1, "metric_name": metric, "metric_value": 1.0} for metric in ("a", "b")]
+        self._snapshot(capture / "current.arrow", rows)
+        original_open = Path.open
+
+        def failing_open(path, *args, **kwargs):
+            output = original_open(path, *args, **kwargs)
+            if path.name != TACHOMETER_STREAM_FILE:
+                return output
+            wrapped = MagicMock(wraps=output)
+            wrapped.__enter__.return_value = wrapped
+            wrapped.__exit__.side_effect = output.__exit__
+
+            def fail_write(data):
+                output.write(data[:5])
+                raise OSError("disk full")
+
+            wrapped.write.side_effect = fail_write
+            return wrapped
+
+        with patch.object(Path, "open", failing_open):
+            streamer._export_tachometer()
+        assert self._rows(tmp_path) == []
+        streamer._export_tachometer()
+        assert self._rows(tmp_path) == rows

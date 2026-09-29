@@ -257,15 +257,59 @@ Same as above across every job, with an optional `job_id` filter. This is the fe
 
 ### POST /api/jobs/{job_id}/logs
 
-Live log and metric output, sent every `logging-stream-interval` seconds while the sweep runs and on a final best-effort flush before the completed PUT (shutdown waits at most five seconds). The sweep sends the bytes appended since its last successful push for every `.out`, `.err`, `.log`, `.csv` and `.jsonl` file under the run's log directory (engine and sweep logs, power `samples.csv`, `host_samples.jsonl`, `profile_export.jsonl`). Tachometer's capture is binary Arrow/Parquet, so when tachometer is enabled the sweep reads its live `tachometer/local` capture and appends previously unseen observations to `tachometer_rows.jsonl`, which streams like the rest. A local disk-backed identity index handles snapshot overlap, rotation and compaction without assuming timestamp order.
+Streaming is opt-in with `reporting.status.logging-stream-interval`. The sweep
+uploads new bytes from `.out`, `.err`, `.log`, `.csv` and `.jsonl` files, using
+persistent HTTP connections and chunks of at most 1 MiB. Shutdown gives the
+worker up to five seconds for a final best-effort flush.
 
-```json
-{"metadata": {"cluster": "b200"}, "chunks": [{"file": "power/samples.csv", "offset": 4096, "size": 512, "data": "..."}]}
+```http
+POST /api/jobs/12345/logs?file=worker.out&offset=4096&cluster=b200
+Content-Type: application/octet-stream
+Authorization: Bearer <token>
+
+<raw file bytes>
 ```
 
-`file` is a relative path under the log directory; `offset` is its source byte position and `size` is its positive byte length. `data` is decoded as UTF-8, preserving characters split across chunks or appends; invalid source bytes are replaced. Failed requests retry the exact same bytes even if the file has grown. An exact resend is a no-op; a conflicting or overlapping chunk returns HTTP 409 and rolls back the whole request. Response: `{"job_id": "12345", "stored": 1}` (`stored: 0` for an exact resend). The sender validates the acknowledgment before advancing its offset. Files must be append-only; offsets are maintained for the running streamer, not persisted across process restarts.
+`file` is a relative path and `offset` is the source byte position. The API
+stores the bytes and decodes UTF-8 when read, including characters split across
+chunks. `final=1` marks EOF at shutdown; an empty body can finalize bytes already
+sent. Response: `{"job_id": "12345", "stored": 1}` (`stored: 0` for a resend).
+Exact retries are idempotent; conflicting overlaps return 409. The legacy JSON
+`{"chunks": [{"file", "offset", "size", "data"}], "metadata": {"cluster": "b200"}}`
+format is also accepted.
 
-When `cluster` is configured, every log request includes `metadata.cluster`. Shared collectors must use `(cluster, job_id)` for identity. The built-in collector continues to key jobs and logs by job ID alone. Streaming requires a collector implementing these log routes; a lifecycle-only collector needs separate log storage/read support.
+Files must be append-only. Uploader offsets are in memory; delivery across
+uploader restarts is not guaranteed. Logs remain on disk if uploads fail.
+
+### POST /api/jobs/{job_id}/captures
+
+Tachometer captures are sent unchanged from `tachometer/local`:
+
+```http
+POST /api/jobs/12345/captures?file=tachometer/local/current.arrow&generation=<uuid-hex>&offset=0&total=8192&cluster=b200
+Content-Type: application/octet-stream
+Authorization: Bearer <token>
+
+<raw Arrow or Parquet bytes>
+```
+
+`generation` identifies one file version; `total` is its byte length. Chunks are
+sequential and exact retries are idempotent. The response is
+`{"job_id": "12345", "next_offset": 8192, "complete": true}` once the complete
+capture has been processed. Incomplete generations never produce metric rows.
+
+The collector decodes captures, removes observations repeated by snapshots or
+compaction, and exposes the result as `tachometer_rows.jsonl` through the log
+read API. The cluster does no decoding, row hashing, JSON conversion, or local
+indexing for streaming. Tachometer publishes Arrow snapshots atomically so an
+open upload can finish even when the next snapshot replaces the file.
+Unchanged captures are skipped; changed Arrow snapshots are uploaded in full,
+so polling still uses disk bandwidth and network bandwidth.
+
+When configured, `cluster` accompanies every raw upload. Shared collectors must
+use `(cluster, job_id)` for identity; the built-in collector retains its existing
+job-ID scope. Custom collectors must implement both binary upload routes before
+enabling streaming. These routes use the existing write bearer token.
 
 ### GET /api/jobs/{job_id}/logs
 

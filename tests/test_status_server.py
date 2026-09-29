@@ -972,8 +972,13 @@ class TestLogStreaming:
         assert tail["data"] == "ready\n"
 
         # A resend of a stored chunk is a no-op.
-        chunk = {"file": "node-01_decode_w0.out", "offset": 0, "size": 8, "data": "loading\n"}
-        resent = requests.post(f"{base_url}/api/jobs/7/logs", json={"chunks": [chunk]}, timeout=5)
+        resent = requests.post(
+            f"{base_url}/api/jobs/7/logs",
+            params={"file": "node-01_decode_w0.out", "offset": 0},
+            data=b"loading\n",
+            headers={"Content-Type": "application/octet-stream"},
+            timeout=5,
+        )
         assert resent.json()["stored"] == 0
 
     def test_unknown_job_logs_404(self, base_url):
@@ -1007,6 +1012,8 @@ class TestLogStreaming:
 
         log = _get(base_url, f"/api/jobs/8/logs?file={TACHOMETER_STREAM_FILE}").json()
         assert [json.loads(line)["metric_value"] for line in log["data"].splitlines()] == [1.0, 2.0]
+        assert not (log_dir / TACHOMETER_STREAM_FILE).exists()
+        assert not (log_dir / ".tachometer-stream.sqlite3").exists()
 
     def test_lost_response_retries_identical_bytes_after_file_grows(self, base_url, tmp_path, monkeypatch):
         from srtctl.core.status import LogStreamer
@@ -1014,17 +1021,17 @@ class TestLogStreaming:
         path = tmp_path / "worker.log"
         path.write_text("abc")
         streamer = LogStreamer(StatusReporter(job_id="retry", api_endpoints=(base_url,)), tmp_path, 60)
-        real_post = requests.post
+        real_post = requests.Session.post
         sent = []
 
-        def lose_first_response(url, **kwargs):
-            sent.append(kwargs["json"]["chunks"][0])
-            response = real_post(url, **kwargs)
+        def lose_first_response(session, url, **kwargs):
+            sent.append({"offset": int(kwargs["params"]["offset"]), "data": kwargs["data"].decode()})
+            response = real_post(session, url, **kwargs)
             if len(sent) == 1:
                 raise requests.Timeout("response lost after commit")
             return response
 
-        monkeypatch.setattr(requests, "post", lose_first_response)
+        monkeypatch.setattr(requests.Session, "post", lose_first_response)
         streamer.flush()
         with path.open("a") as out:
             out.write("def")
@@ -1053,8 +1060,9 @@ class TestLogStreaming:
             out.write("€".encode()[2:] + "文\n".encode())
         streamer.flush()
         log = _get(base_url, "/api/jobs/utf8/logs?file=worker.log").json()
-        assert log["data"] == prefix + "€文\n"
-        assert log["next_offset"] == len(path.read_bytes())
+        tail = _get(base_url, f"/api/jobs/utf8/logs?file=worker.log&offset={log['next_offset']}").json()
+        assert log["data"] + tail["data"] == prefix + "€文\n"
+        assert tail["next_offset"] == len(path.read_bytes())
 
     def test_stream_authenticates_and_includes_cluster_on_each_chunk(self, auth_url, tmp_path, monkeypatch):
         from srtctl.core.status import LogStreamer
@@ -1063,23 +1071,20 @@ class TestLogStreaming:
         monkeypatch.setattr("srtctl.core.status._cluster_setting", lambda: "mi300x-amd")
         path = tmp_path / "worker.log"
         path.write_text("first\n")
-        real_post = requests.post
+        real_post = requests.Session.post
         payloads = []
 
-        def record(url, **kwargs):
-            payloads.append(kwargs["json"])
-            return real_post(url, **kwargs)
+        def record(session, url, **kwargs):
+            payloads.append(dict(kwargs["params"]))
+            return real_post(session, url, **kwargs)
 
-        monkeypatch.setattr(requests, "post", record)
+        monkeypatch.setattr(requests.Session, "post", record)
         streamer = LogStreamer(StatusReporter(job_id="cluster", api_endpoints=(auth_url,)), tmp_path, 60)
         streamer.flush()
         with path.open("a") as out:
             out.write("second\n")
         streamer.flush()
-        assert [payload["metadata"] for payload in payloads] == [
-            {"cluster": "mi300x-amd"},
-            {"cluster": "mi300x-amd"},
-        ]
+        assert [payload["cluster"] for payload in payloads] == ["mi300x-amd", "mi300x-amd"]
         response = requests.get(
             f"{auth_url}/api/jobs/cluster/logs?file=worker.log",
             headers=_bearer(READ),
@@ -1098,7 +1103,7 @@ class TestLogStreaming:
             release.wait(timeout=5)
             raise requests.Timeout("stalled collector")
 
-        monkeypatch.setattr(requests, "post", stalled_post)
+        monkeypatch.setattr(requests.Session, "post", stalled_post)
         monkeypatch.setattr("srtctl.core.status.STREAM_SHUTDOWN_SECONDS", 0.02)
         streamer = LogStreamer(StatusReporter(job_id="stalled", api_endpoints=("https://collector",)), tmp_path, 0.001)
         streamer.start()
@@ -1122,3 +1127,125 @@ class TestLogStreaming:
         log = _get(base_url, "/api/jobs/final/logs?file=worker.log").json()
         assert log["data"] == "last line\n\ufffd"
         assert log["next_offset"] == 11
+
+    def test_shutdown_finalizes_an_already_uploaded_partial_character(self, base_url, tmp_path):
+        from srtctl.core.status import LogStreamer
+
+        (tmp_path / "worker.log").write_bytes(b"done\xe2")
+        streamer = LogStreamer(StatusReporter(job_id="eof", api_endpoints=(base_url,)), tmp_path, 60)
+        streamer.flush()
+        first = _get(base_url, "/api/jobs/eof/logs?file=worker.log").json()
+        assert (first["data"], first["next_offset"]) == ("done", 4)
+        streamer.start()
+        streamer.stop()
+        final = _get(base_url, "/api/jobs/eof/logs?file=worker.log&offset=4").json()
+        assert (final["data"], final["next_offset"]) == ("\ufffd", 5)
+
+    def test_capture_retry_keeps_raw_bytes_after_compaction_unlinks_source(self, base_url, tmp_path, monkeypatch):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from srtctl.core.status import LogStreamer
+
+        capture = tmp_path / "tachometer" / "local"
+        capture.mkdir(parents=True)
+        path = capture / "out-1.parquet"
+        pq.write_table(pa.table({"metric_name": ["x"], "metric_value": [3.0]}), path)
+        original = path.read_bytes()
+        sent = []
+        real_post = requests.Session.post
+
+        def lose_response(session, url, **kwargs):
+            if url.endswith("/captures"):
+                sent.append((dict(kwargs["params"]), kwargs["data"]))
+                response = real_post(session, url, **kwargs)
+                if len(sent) == 1:
+                    path.unlink()
+                    raise requests.Timeout("lost capture acknowledgment")
+                return response
+            return real_post(session, url, **kwargs)
+
+        monkeypatch.setattr(requests.Session, "post", lose_response)
+        streamer = LogStreamer(StatusReporter(job_id="capture-retry", api_endpoints=(base_url,)), tmp_path, 60, capture)
+        streamer.flush()
+        streamer.flush()
+        assert len(sent) == 2
+        assert sent[0] == sent[1]
+        assert sent[0][1] == original
+        log = _get(base_url, "/api/jobs/capture-retry/logs?file=tachometer_rows.jsonl").json()
+        assert len(log["data"].splitlines()) == 1
+        assert not streamer._captures
+
+    def test_capture_replacement_finishes_old_generation_without_copying(self, base_url, tmp_path, monkeypatch):
+        import pyarrow as pa
+        from pyarrow import ipc
+
+        from srtctl.core.status import LogStreamer
+
+        capture = tmp_path / "tachometer" / "local"
+        capture.mkdir(parents=True)
+        path = capture / "current.arrow"
+
+        def write_snapshot(destination, value):
+            table = pa.table({"metric_name": ["x"], "metric_value": [value]})
+            with ipc.new_stream(destination, table.schema) as writer:
+                writer.write_table(table)
+
+        write_snapshot(path, 1.0)
+        original = path.read_bytes()
+        replacement = capture / "next.tmp"
+        write_snapshot(replacement, 2.0)
+        real_post = requests.Session.post
+        raw_chunks = []
+
+        def replace_during_upload(session, url, **kwargs):
+            if url.endswith("/captures"):
+                raw_chunks.append(kwargs["data"])
+                if len(raw_chunks) == 1:
+                    replacement.replace(path)
+            return real_post(session, url, **kwargs)
+
+        monkeypatch.setattr("srtctl.core.status.STREAM_REQUEST_BYTES", 128)
+        monkeypatch.setattr(requests.Session, "post", replace_during_upload)
+        streamer = LogStreamer(StatusReporter(job_id="replace", api_endpoints=(base_url,)), tmp_path, 60, capture)
+        streamer.flush()
+        assert b"".join(raw_chunks) == original
+        streamer.flush()
+        log = _get(base_url, "/api/jobs/replace/logs?file=tachometer_rows.jsonl").json()
+        assert [json.loads(row)["metric_value"] for row in log["data"].splitlines()] == [1.0, 2.0]
+
+    def test_rewritten_capture_never_commits_mixed_generations(self, base_url, tmp_path, monkeypatch):
+        import pyarrow as pa
+        from pyarrow import ipc
+
+        from srtctl.core.status import LogStreamer
+
+        capture = tmp_path / "tachometer" / "local"
+        capture.mkdir(parents=True)
+        path = capture / "current.arrow"
+
+        def write_snapshot(value):
+            table = pa.table({"metric_name": ["x"], "metric_value": [value]})
+            with ipc.new_stream(path, table.schema) as writer:
+                writer.write_table(table)
+
+        write_snapshot(1.0)
+        real_post = requests.Session.post
+        sent = []
+
+        def rewrite_during_upload(session, url, **kwargs):
+            if url.endswith("/captures"):
+                sent.append(dict(kwargs["params"]))
+                if len(sent) == 1:
+                    write_snapshot(2.0)
+            return real_post(session, url, **kwargs)
+
+        monkeypatch.setattr("srtctl.core.status.STREAM_REQUEST_BYTES", 128)
+        monkeypatch.setattr(requests.Session, "post", rewrite_during_upload)
+        streamer = LogStreamer(StatusReporter(job_id="rewrite", api_endpoints=(base_url,)), tmp_path, 60, capture)
+        streamer.flush()
+        assert _get(base_url, "/api/jobs/rewrite/logs?file=tachometer_rows.jsonl").json()["data"] == ""
+        streamer.flush()
+        assert sent[0]["generation"] != sent[1]["generation"]
+        log = _get(base_url, "/api/jobs/rewrite/logs?file=tachometer_rows.jsonl").json()
+        assert [json.loads(row)["metric_value"] for row in log["data"].splitlines()] == [2.0]

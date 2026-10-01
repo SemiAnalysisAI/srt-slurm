@@ -750,7 +750,7 @@ frontend:
 
 | Field                       | Type | Default       | Description                         |
 | --------------------------- | ---- | ------------- | ----------------------------------- |
-| `type`                      | str  | dynamo        | `dynamo`; static routers `sglang-router`, `vllm-router`; direct (one aggregate worker binds the public port, no router process) `sglang`, `vllm`, `trtllm_serve` |
+| `type`                      | str  | dynamo        | `dynamo`; static routers `sglang-router`, `vllm-router`, `smg` (any backend, see [SMG](smg.md)); direct (one aggregate worker binds the public port, no router process) `sglang`, `vllm`, `trtllm_serve` |
 | `placement.node`            | str  | head          | `head`, `first_decode`, or `dedicated`; see [placement](#placement) |
 | `enable_multiple_frontends` | bool | true          | Scale with nginx + multiple routers |
 | `num_additional_frontends`  | int  | 9             | Additional routers beyond master    |

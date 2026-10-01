@@ -1700,6 +1700,7 @@
                 "atom",
                 "sglang",
                 "tilert",
+                "tokenspeed",
                 "trtllm",
                 "vllm",
                 "mocker"
@@ -1715,6 +1716,9 @@
               "$ref": "#/$defs/TileRTBackend"
             },
             {
+              "$ref": "#/$defs/TokenSpeedBackend"
+            },
+            {
               "$ref": "#/$defs/TRTLLMBackend"
             },
             {
@@ -1727,7 +1731,7 @@
               "type": "null"
             }
           ],
-          "description": "The engine type (`atom`, `sglang`, `tilert`, `trtllm`, `vllm`, `mocker`) as a string, or a mapping with `type` plus the engine-wide knobs listed under [Engine types](#engine-types).",
+          "description": "The engine type (`atom`, `sglang`, `tilert`, `tokenspeed`, `trtllm`, `vllm`, `mocker`) as a string, or a mapping with `type` plus the engine-wide knobs listed under [Engine types](#engine-types).",
           "default": null
         },
         "roles": {
@@ -1916,6 +1920,7 @@
                 "atom",
                 "sglang",
                 "tilert",
+                "tokenspeed",
                 "trtllm",
                 "vllm",
                 "mocker"
@@ -1931,6 +1936,9 @@
               "$ref": "#/$defs/TileRTBackend"
             },
             {
+              "$ref": "#/$defs/TokenSpeedBackend"
+            },
+            {
               "$ref": "#/$defs/TRTLLMBackend"
             },
             {
@@ -1943,7 +1951,7 @@
               "type": "null"
             }
           ],
-          "description": "The engine type (`atom`, `sglang`, `tilert`, `trtllm`, `vllm`, `mocker`) as a string, or a mapping with `type` plus the engine-wide knobs listed under [Engine types](#engine-types).",
+          "description": "The engine type (`atom`, `sglang`, `tilert`, `tokenspeed`, `trtllm`, `vllm`, `mocker`) as a string, or a mapping with `type` plus the engine-wide knobs listed under [Engine types](#engine-types).",
           "default": null
         },
         "roles": {
@@ -2347,6 +2355,7 @@
                 "atom",
                 "sglang",
                 "tilert",
+                "tokenspeed",
                 "trtllm",
                 "vllm",
                 "mocker"
@@ -2360,6 +2369,9 @@
             },
             {
               "$ref": "#/$defs/TileRTBackend"
+            },
+            {
+              "$ref": "#/$defs/TokenSpeedBackend"
             },
             {
               "$ref": "#/$defs/TRTLLMBackend"
@@ -3391,6 +3403,20 @@
         }
       },
       "description": "Launch TileRT's decode server with recipe-owned model and transport settings."
+    },
+    "TokenSpeedBackend": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "enum": [
+            "tokenspeed"
+          ],
+          "description": "Engine type discriminator.",
+          "default": "tokenspeed"
+        }
+      },
+      "description": "Launch ``python3 -m dynamo.tokenspeed`` workers behind the Dynamo frontend."
     },
     "VLLMBackend": {
       "type": "object",

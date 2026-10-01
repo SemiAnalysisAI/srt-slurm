@@ -43,6 +43,7 @@ from srtctl.backends import (
     MockerProtocol,
     SGLangProtocol,
     TileRTProtocol,
+    TokenSpeedProtocol,
     TRTLLMProtocol,
     VLLMMooncakeKVStoreConfig,
     VLLMProtocol,
@@ -483,7 +484,14 @@ class BackendConfigField(fields.Field):
             return SGLangProtocol()
 
         if isinstance(
-            value, AtomProtocol | SGLangProtocol | TileRTProtocol | TRTLLMProtocol | VLLMProtocol | MockerProtocol
+            value,
+            AtomProtocol
+            | SGLangProtocol
+            | TileRTProtocol
+            | TokenSpeedProtocol
+            | TRTLLMProtocol
+            | VLLMProtocol
+            | MockerProtocol,
         ):
             return value
 
@@ -507,6 +515,8 @@ class BackendConfigField(fields.Field):
             return AtomProtocol.Schema().load(value)
         elif backend_type == "tilert":
             return TileRTProtocol.Schema().load(value)
+        elif backend_type == "tokenspeed":
+            return TokenSpeedProtocol.Schema().load(value)
         elif backend_type == "sglang":
             schema = SGLangProtocol.Schema()
             return schema.load(value)
@@ -521,7 +531,7 @@ class BackendConfigField(fields.Field):
             return schema.load(value)
         else:
             raise ValidationError(
-                f"Unknown engine type: {backend_type!r}. Supported types: atom, sglang, tilert, trtllm, vllm, mocker"
+                f"Unknown engine type: {backend_type!r}. Supported types: atom, sglang, tilert, tokenspeed, trtllm, vllm, mocker"
             )
 
     def _serialize(self, value: Any | None, attr: str | None, obj: Any, **kwargs) -> Any:
@@ -538,6 +548,8 @@ class BackendConfigField(fields.Field):
             return AtomProtocol.Schema().dump(value)
         if isinstance(value, TileRTProtocol):
             return TileRTProtocol.Schema().dump(value)
+        if isinstance(value, TokenSpeedProtocol):
+            return TokenSpeedProtocol.Schema().dump(value)
         if isinstance(value, SGLangProtocol):
             return SGLangProtocol.Schema().dump(value)
         if isinstance(value, TRTLLMProtocol):

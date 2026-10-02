@@ -144,6 +144,10 @@ class MockerProtocol:
         """
         return {}
 
+    def is_grpc_mode(self, mode: str) -> bool:
+        """Mocker workers serve HTTP only."""
+        return False
+
     def get_served_model_name(self, default: str) -> str:
         """Get served model name — mocker uses default (model path basename)."""
         return default

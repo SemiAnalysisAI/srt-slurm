@@ -229,6 +229,10 @@ class TRTLLMProtocol:
         """
         return {}
 
+    def is_grpc_mode(self, mode: str) -> bool:
+        """TRT-LLM workers serve HTTP only."""
+        return False
+
     def get_served_model_name(self, default: str) -> str:
         """Get the configured served model name, or return default."""
         return self.served_model_name or default

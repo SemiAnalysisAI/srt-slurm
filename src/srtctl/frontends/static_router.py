@@ -307,7 +307,10 @@ class StaticRouterFrontend:
             deadline = time.monotonic() + timeout
             ready = all(
                 wait_for_port(
-                    str(target.hostname), int(target.port or 0), timeout=max(deadline - time.monotonic(), 0.0)
+                    str(target.hostname),
+                    int(target.port or 0),
+                    timeout=max(deadline - time.monotonic(), 0.0),
+                    stop_event=stop_event,
                 )
                 for target in grpc_targets
             ) and wait_for_http_endpoints(

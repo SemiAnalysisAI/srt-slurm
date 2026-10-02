@@ -71,6 +71,7 @@ class MockerProtocol:
     """
 
     type: Literal["mocker"] = "mocker"
+    native_metrics_path: ClassVar[str] = "/metrics"
 
     # Simulation parameters
     engine_type: str = "vllm"

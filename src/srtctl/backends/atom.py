@@ -32,6 +32,7 @@ class AtomProtocol:
     """Launch ``atom.entrypoints.openai_server`` on ROCm workers."""
 
     type: Literal["atom"] = "atom"
+    native_metrics_path: ClassVar[str] = "/metrics"
     # The roles this engine runs (`roles.<role>` of the recipe), bound by SrtConfig and
     # never written on `engine:`. Per-role env and native ATOM CLI args are read from here.
     roles: Mapping[str, RoleSettings] = field(default_factory=dict, metadata={"marshmallow_field": BoundRolesField()})

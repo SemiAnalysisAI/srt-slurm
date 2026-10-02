@@ -8,7 +8,7 @@ Base types and protocols for backend configurations.
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Optional, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Optional, Protocol
 
 from marshmallow import ValidationError, fields
 
@@ -141,6 +141,11 @@ class BackendProtocol(Protocol):
     def type(self) -> str:
         """Backend type identifier."""
         ...
+
+    #: Path where the engine's own OpenAI server (a ``direct`` worker) serves
+    #: Prometheus text on its HTTP port. Frontends whose workers are the engine's
+    #: own server read it for the metrics URLs (``worker_metrics_path``).
+    native_metrics_path: ClassVar[str]
 
     @property
     def mooncake_kv_store(self) -> "MooncakeKVStoreConfig | VLLMMooncakeKVStoreConfig | None":

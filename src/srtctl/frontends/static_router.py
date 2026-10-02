@@ -95,6 +95,10 @@ class StaticRouterFrontend:
 
     metrics_path: ClassVar[str] = "/metrics"
 
+    def worker_metrics_path(self, backend: Any) -> str:
+        """A routed worker is the engine's own server."""
+        return backend.native_metrics_path
+
     def worker_metrics_port(self, process: Process, runtime: RuntimeContext) -> int | None:
         """A native server's leader rank binds the HTTP server that carries /metrics; followers serve nothing."""
         if process.is_leader and process.http_port > 0:

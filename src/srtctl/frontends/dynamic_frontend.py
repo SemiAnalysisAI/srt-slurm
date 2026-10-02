@@ -43,6 +43,10 @@ class DynamicFrontend:
     expands_node_local_dp: ClassVar[bool] = False
     metrics_path: ClassVar[str] = "/metrics"
 
+    def worker_metrics_path(self, backend: Any) -> str:
+        """Every rank's Dynamo system server answers ``/metrics``, whatever the engine."""
+        return self.metrics_path
+
     @property
     def health_endpoint(self) -> str:
         """The frontend reports its registered workers here; ``parse_health`` counts them."""

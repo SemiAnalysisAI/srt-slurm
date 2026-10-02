@@ -147,3 +147,27 @@ def test_examples_launch_smg_through_the_orchestrator(recipe: str) -> None:
     expected = "--pd-disaggregation --prefill" if "disagg" in recipe else "--worker-urls"
     assert expected in launch
     assert f"--prometheus-port {SMG_METRICS_PORT}" in launch
+
+
+@pytest.mark.parametrize(
+    ("engine", "path"),
+    [(SGLangProtocol(), "/metrics"), (VLLMProtocol(), "/metrics"), (TRTLLMProtocol(), "/prometheus/metrics")],
+)
+def test_workers_are_scraped_on_their_engine_metrics_route(engine, path: str) -> None:
+    """A routed worker is the engine's own server; trtllm-serve's /metrics is JSON iteration stats."""
+    assert SMGFrontend().worker_metrics_path(engine) == path
+    assert SMGFrontend.metrics_path == "/metrics"
+
+
+def test_trtllm_example_launches_smg_in_front_of_trtllm_serve() -> None:
+    """Each trtllm-serve worker binds its allocated port; SMG owns the public one."""
+    path = EXAMPLES_DIR / "trtllm/smg-agg.yaml"
+    assert load_config(path).frontend.type == "smg"
+    plan = render_launch_plan(path)
+
+    assert "# exit_code: 0" in plan
+    workers = [line.strip() for line in plan.splitlines() if "trtllm-serve /model" in line]
+    assert len(workers) == 2
+    assert all("--port 8000" not in line for line in workers)
+    launch = next(line.strip() for line in plan.splitlines() if line.strip().startswith("smg launch"))
+    assert launch.startswith("smg launch --worker-urls http://127.0.0.1:6100 http://127.0.0.1:6132 ")

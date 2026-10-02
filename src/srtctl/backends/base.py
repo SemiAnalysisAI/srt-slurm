@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Optional
 
 from marshmallow import ValidationError, fields
 
@@ -124,6 +124,11 @@ class Backend(ABC):
     2. Converting endpoints to physical processes
     3. Building commands to start those processes
     """
+
+    #: Path where the engine's own OpenAI server (a ``direct`` worker) serves
+    #: Prometheus text on its HTTP port. Frontends whose workers are the engine's
+    #: own server read it for the metrics URLs (``worker_metrics_path``).
+    native_metrics_path: ClassVar[str] = "/metrics"
 
     @property
     @abstractmethod

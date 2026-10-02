@@ -14,6 +14,7 @@ Upstream references below are pinned to SMG
 | --- | --- | --- |
 | Aggregated | any engine whose workers serve HTTP (`sglang`, `vllm`, `trtllm`, ...) | `smg launch --worker-urls <url> ...` |
 | Prefill/decode | `sglang` | `smg launch --pd-disaggregation --prefill <url> <bootstrap-port> --decode <url>` |
+| Prefill/decode | `vllm` with `grpc: true` and `connector: nixl` | `smg launch --pd-disaggregation --prefill grpc://<host:port> ... --decode grpc://<host:port>` |
 
 SMG detects each HTTP worker's engine itself (`/v1/models` `owned_by`, then `/version`
 and `/server_info`) and reads the served model name from the worker
@@ -24,13 +25,47 @@ serving the model it names
 ([`router.rs`](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/model_gateway/src/routers/http/router.rs#L249-L252)),
 so clients send the workers' served model name, as srtctl's benchmarks do.
 
-P/D is listed for SGLang only. SMG's HTTP P/D router hands the KV cache over through
+SGLang P/D runs over HTTP. SMG's HTTP P/D router hands the KV cache over through
 SGLang's bootstrap rendezvous (`bootstrap_host` / `bootstrap_port` / `bootstrap_room`,
 [`pd_router.rs`](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/model_gateway/src/routers/http/pd_router.rs#L303-L305)).
 A vLLM worker registered by URL carries no KV connector, so SMG sends the request through
 and the decode worker recomputes the prompt
 ([upstream test note](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/e2e_test/router/test_pd_topologies.py#L105-L110)).
 srtctl does not reject that layout, but it is not a KV-disaggregated run.
+
+vLLM P/D therefore runs over gRPC. With `grpc: true` in both roles' `args` each worker is
+`vllm serve --grpc`, vLLM's gRPC server, which the `smg-grpc-servicer` package provides
+(vLLM's `grpc` extra), and srtctl advertises it as `grpc://`. The servicer reports the
+worker's `kv_transfer_config` connector in `GetServerInfo`
+([`servicer.py`](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/grpc_servicer/smg_grpc_servicer/vllm/servicer.py#L702-L709)), so for
+`NixlConnector` SMG tags the prefill leg with `do_remote_decode` and relays the
+`kv_transfer_params` the prefill returns to the decode leg, which pulls the KV cache over
+NIXL
+([`request_execution.rs`](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/model_gateway/src/routers/grpc/common/stages/request_execution.rs#L962-L1010),
+[`kv_transfer.rs`](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/model_gateway/src/routers/common/kv_transfer.rs#L16-L19),
+[upstream test](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/e2e_test/router/test_pd_nixl.py#L1-L11)). `engine.connector: nixl`
+gives both roles `NixlConnector` and the per-worker NIXL side channel. In gRPC mode SMG
+tokenizes and applies the chat template itself; pass `tool-call-parser` /
+`reasoning-parser` in `frontend.args` when the model needs them. vLLM's gRPC server
+starts no HTTP listener, so these workers serve no Prometheus `/metrics`; SMG's own
+metrics stay on its Prometheus port. See
+[`examples/vllm/smg-disagg-grpc.yaml`](../examples/vllm/smg-disagg-grpc.yaml).
+
+## vLLM data parallel
+
+A vLLM aggregated role with `data-parallel-size` (DP, optionally with
+`enable-expert-parallel`) is one `vllm serve` that load-balances its DP ranks itself.
+Across nodes, the leader node serves the API and the other nodes run headless engine
+ranks (`--nnodes`/`--node-rank`), so SMG receives one worker URL per DP deployment.
+This is the layout `frontend.type: vllm` uses, with the API on an allocated port.
+
+SMG's `--dp-aware` rank pinning is not used: it discovers `dp_size` over HTTP only
+from SGLang workers and registers any other HTTP worker as a plain worker
+([`discover_dp.rs`](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/model_gateway/src/workflow/steps/local/discover_dp.rs#L145-L156));
+for vLLM it needs gRPC workers
+([`discover_dp.rs`](https://github.com/smg-project/smg/blob/3be823a700fabaff3add8a390cf78f163479d686/model_gateway/src/workflow/steps/local/discover_dp.rs#L127-L141)),
+which srtctl does not configure. See
+[`examples/vllm/smg-dep16.yaml`](../examples/vllm/smg-dep16.yaml).
 
 ## Configuration
 
@@ -54,7 +89,8 @@ frontend:
 - `enable_multiple_frontends` / `num_additional_frontends`: as for every router,
   several SMG replicas behind nginx, or one SMG on the public port.
 
-See [`examples/vllm/smg-agg.yaml`](../examples/vllm/smg-agg.yaml) (vLLM, aggregated)
+See [`examples/vllm/smg-agg.yaml`](../examples/vllm/smg-agg.yaml) (vLLM, aggregated),
+[`examples/vllm/smg-dep16.yaml`](../examples/vllm/smg-dep16.yaml) (vLLM, two-node DP16 with EP)
 and [`examples/sglang/smg-disagg.yaml`](../examples/sglang/smg-disagg.yaml) (SGLang, P/D).
 
 ## Launch and readiness

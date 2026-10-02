@@ -270,3 +270,11 @@ class BackendProtocol(Protocol):
     def get_served_model_name(self, default: str) -> str:
         """Get served model name from backend config, or return default."""
         ...
+
+    def is_grpc_mode(self, mode: str) -> bool:
+        """Whether the mode's workers serve gRPC instead of HTTP.
+
+        A static router reads it to advertise ``grpc://`` worker URLs. False for
+        an engine without a gRPC server.
+        """
+        ...

@@ -172,8 +172,8 @@ class StaticRouterFrontend:
         return []
 
     def worker_scheme(self, backend: Any, mode: str) -> str:
-        """Return the protocol used to reach one worker endpoint."""
-        return "http"
+        """Return the protocol used to reach one worker endpoint: gRPC when the backend's mode serves it."""
+        return "grpc" if backend.is_grpc_mode(mode) else "http"
 
     def worker_bootstrap_port(self, backend: Any, process: Process) -> int | None:
         """Return the optional P/D bootstrap port advertised for a worker."""

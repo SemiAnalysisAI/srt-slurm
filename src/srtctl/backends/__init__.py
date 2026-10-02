@@ -14,11 +14,14 @@ from .base import BackendProtocol, BackendType, RoleSettings, SrunConfig
 from .mocker import MockerProtocol
 from .sglang import MooncakeKVStoreConfig, SGLangProtocol
 from .tilert import TileRTProtocol
+from .tokenspeed import TokenSpeedProtocol
 from .trtllm import TRTLLMProtocol
 from .vllm import VLLMFailoverConfig, VLLMMooncakeKVStoreConfig, VLLMProtocol
 
 # Union type for all backend configs
-BackendConfig = AtomProtocol | SGLangProtocol | TileRTProtocol | TRTLLMProtocol | VLLMProtocol | MockerProtocol
+BackendConfig = (
+    AtomProtocol | SGLangProtocol | TileRTProtocol | TokenSpeedProtocol | TRTLLMProtocol | VLLMProtocol | MockerProtocol
+)
 
 __all__ = [
     # ATOM
@@ -38,6 +41,8 @@ __all__ = [
     "TRTLLMProtocol",
     # TileRT
     "TileRTProtocol",
+    # TokenSpeed
+    "TokenSpeedProtocol",
     # vLLM
     "VLLMFailoverConfig",
     "VLLMMooncakeKVStoreConfig",

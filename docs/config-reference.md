@@ -43,6 +43,15 @@ This page is the prose guide: what each block means, how the pieces interact, an
 
 ## Overview
 
+### TokenSpeed with Dynamo
+
+Use `engine: tokenspeed` with `frontend.type: dynamo` to launch
+`python3 -m dynamo.tokenspeed` workers, aggregated or prefill/decode. TokenSpeed flags
+go under `roles.<role>.args`; srtctl sets the model, host, ports and multi-node
+rendezvous. See [TokenSpeed](tokenspeed.md) and the
+[aggregated](../examples/tokenspeed/dynamo-agg.yaml) and
+[prefill/decode](../examples/tokenspeed/dynamo-disagg.yaml) recipes.
+
 ### ATOM with AToMesh
 
 Use `engine: atom` with `frontend.type: atomesh` to launch native

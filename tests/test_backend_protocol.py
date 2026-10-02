@@ -21,13 +21,14 @@ from srtctl.backends import (
     SGLangProtocol,
     TRTLLMProtocol,
     TileRTProtocol,
+    TokenSpeedProtocol,
     VLLMFailoverConfig,
     VLLMProtocol,
 )
 from srtctl.core.topology import Process
 from srtctl.ports import MOONCAKE_MASTER_PORT
 
-BACKENDS = [SGLangProtocol, TRTLLMProtocol, VLLMProtocol, MockerProtocol, TileRTProtocol]
+BACKENDS = [SGLangProtocol, TRTLLMProtocol, VLLMProtocol, MockerProtocol, TileRTProtocol, TokenSpeedProtocol]
 SRC = Path(__file__).resolve().parents[1] / "src" / "srtctl"
 DUCK_TYPED_BACKEND = re.compile(r"\b(getattr|hasattr)\((self\.|config\.|self\.config\.)?backend\b")
 
@@ -114,7 +115,9 @@ def test_every_backend_names_its_fatal_log_patterns(backend_cls, mode):
 
 
 @pytest.mark.parametrize(
-    "backend_cls", [SGLangProtocol, VLLMProtocol, MockerProtocol, AtomProtocol, TileRTProtocol], ids=lambda c: c.__name__
+    "backend_cls",
+    [SGLangProtocol, VLLMProtocol, MockerProtocol, AtomProtocol, TileRTProtocol, TokenSpeedProtocol],
+    ids=lambda c: c.__name__,
 )
 def test_engines_whose_step_exits_with_the_engine_watch_nothing(backend_cls):
     assert backend_cls().fatal_log_patterns("decode") == ()

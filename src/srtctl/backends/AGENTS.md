@@ -17,6 +17,7 @@ Rules for `src/srtctl/backends/`. Every consumer asks a backend through `Backend
    - `failover` / `get_failover_environment(...)` - shadow engine recovery; `None` / `{}` without it
    - `should_set_visible_devices()` - `True` unless the engine takes its devices on the command line; the variable is the cluster's `visible_devices_env`
    - `get_served_model_name(default)`
+   - `native_metrics_path` - where the engine's own OpenAI server serves Prometheus text (`/metrics`, trtllm-serve `/prometheus/metrics`)
    - `is_grpc_mode(mode)` - whether the mode's workers serve gRPC; static routers advertise `grpc://` from it. `False` for an HTTP-only engine
 3. Export from `backends/__init__.py`
 4. Add polymorphic deserialization in `BackendConfigField` in `schema.py`

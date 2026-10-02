@@ -30,6 +30,7 @@ class TileRTProtocol:
     """Launch TileRT's decode server with recipe-owned model and transport settings."""
 
     type: Literal["tilert"] = "tilert"
+    native_metrics_path: ClassVar[str] = "/metrics"
     served_model_name: str | None = None
     # The roles this engine runs (`roles.<role>` of the recipe), bound by SrtConfig and
     # never written on `engine:`. The decode role's env and args are read from here.

@@ -60,6 +60,9 @@ class TRTLLMProtocol:
     """
 
     type: Literal["trtllm"] = "trtllm"
+    # trtllm-serve serves Prometheus text at /prometheus/metrics (mounted when
+    # return_perf_metrics is true); its /metrics route is JSON iteration stats.
+    native_metrics_path: ClassVar[str] = "/prometheus/metrics"
 
     # The roles this engine runs (`roles.<role>` of the recipe), bound by SrtConfig and
     # never written on `engine:`. Per-role env and args (the engine YAML) are read from

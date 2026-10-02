@@ -318,6 +318,7 @@ class VLLMProtocol:
     """
 
     type: Literal["vllm"] = "vllm"
+    native_metrics_path: ClassVar[str] = "/metrics"
 
     # The roles this engine runs (`roles.<role>` of the recipe), bound by SrtConfig and
     # never written on `engine:`. Per-role env, args and kv_events are read from here.

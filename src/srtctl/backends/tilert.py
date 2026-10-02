@@ -56,6 +56,10 @@ class TileRTProtocol:
     def fatal_log_patterns(self, mode: str) -> tuple[str, ...]:
         return ()
 
+    def is_grpc_mode(self, mode: str) -> bool:
+        """TileRT workers serve HTTP only."""
+        return False
+
     def get_served_model_name(self, default: str) -> str:
         return self.served_model_name or default
 

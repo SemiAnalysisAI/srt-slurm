@@ -60,6 +60,10 @@ class AtomProtocol:
     def get_process_environment(self, process: Process) -> dict[str, str]:
         return {}
 
+    def is_grpc_mode(self, mode: str) -> bool:
+        """ATOM workers serve HTTP only."""
+        return False
+
     def get_served_model_name(self, default: str) -> str:
         """The name ATOM serves: a role's ``served-model-name``, else its literal ``--model``."""
         for mode in ("prefill", "agg", "decode"):

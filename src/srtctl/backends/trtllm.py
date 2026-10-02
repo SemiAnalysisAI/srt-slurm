@@ -60,6 +60,9 @@ class TRTLLMProtocol:
     """
 
     type: Literal["trtllm"] = "trtllm"
+    # trtllm-serve serves Prometheus text at /prometheus/metrics (mounted when
+    # return_perf_metrics is true); its /metrics route is JSON iteration stats.
+    native_metrics_path: ClassVar[str] = "/prometheus/metrics"
 
     # The roles this engine runs (`roles.<role>` of the recipe), bound by SrtConfig and
     # never written on `engine:`. Per-role env and args (the engine YAML) are read from
@@ -225,6 +228,10 @@ class TRTLLMProtocol:
         TRTLLM doesn't currently require process-specific env vars.
         """
         return {}
+
+    def is_grpc_mode(self, mode: str) -> bool:
+        """TRT-LLM workers serve HTTP only."""
+        return False
 
     def get_served_model_name(self, default: str) -> str:
         """Get the configured served model name, or return default."""

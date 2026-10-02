@@ -71,6 +71,7 @@ class MockerProtocol:
     """
 
     type: Literal["mocker"] = "mocker"
+    native_metrics_path: ClassVar[str] = "/metrics"
 
     # Simulation parameters
     engine_type: str = "vllm"
@@ -142,6 +143,10 @@ class MockerProtocol:
         The mocker does not need per-process env vars (no NIXL ports, etc.).
         """
         return {}
+
+    def is_grpc_mode(self, mode: str) -> bool:
+        """Mocker workers serve HTTP only."""
+        return False
 
     def get_served_model_name(self, default: str) -> str:
         """Get served model name — mocker uses default (model path basename)."""

@@ -51,6 +51,10 @@ class VLLMFrontend:
 
     metrics_path: ClassVar[str] = "/metrics"
 
+    def worker_metrics_path(self, backend: Any) -> str:
+        """The worker is the engine's own server."""
+        return backend.native_metrics_path
+
     def worker_metrics_port(self, process: Process, runtime: RuntimeContext) -> int | None:
         """The aggregate leader binds the public port; its followers serve nothing."""
         if process.endpoint_mode == "agg" and process.is_leader:

@@ -8,7 +8,7 @@ Base types and protocols for backend configurations.
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Optional, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Optional, Protocol
 
 from marshmallow import ValidationError, fields
 
@@ -142,6 +142,11 @@ class BackendProtocol(Protocol):
         """Backend type identifier."""
         ...
 
+    #: Path where the engine's own OpenAI server (a ``direct`` worker) serves
+    #: Prometheus text on its HTTP port. Frontends whose workers are the engine's
+    #: own server read it for the metrics URLs (``worker_metrics_path``).
+    native_metrics_path: ClassVar[str]
+
     @property
     def mooncake_kv_store(self) -> "MooncakeKVStoreConfig | VLLMMooncakeKVStoreConfig | None":
         """The recipe's Mooncake KV store block, or None when the engine has none.
@@ -269,4 +274,12 @@ class BackendProtocol(Protocol):
 
     def get_served_model_name(self, default: str) -> str:
         """Get served model name from backend config, or return default."""
+        ...
+
+    def is_grpc_mode(self, mode: str) -> bool:
+        """Whether the mode's workers serve gRPC instead of HTTP.
+
+        A static router reads it to advertise ``grpc://`` worker URLs. False for
+        an engine without a gRPC server.
+        """
         ...

@@ -123,6 +123,7 @@ class SGLangProtocol:
     """
 
     type: Literal["sglang"] = "sglang"
+    native_metrics_path: ClassVar[str] = "/metrics"
     gpu_type: str | None = None
 
     # Mooncake KV store - launches mooncake_master on infra node and injects

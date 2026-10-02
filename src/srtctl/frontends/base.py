@@ -38,7 +38,8 @@ class FrontendProtocol(Protocol):
        (``worker_launch``, ``worker_api_port``, ``expands_node_local_dp``)
     3. Which rank serves metrics, an endpoint, or profiler control, and where
        (``worker_metrics_port``, ``worker_endpoint_port``, ``profiling_control_port``,
-       ``direct_endpoint_nodes``, ``worker_ready_port``, ``metrics_path``)
+       ``direct_endpoint_nodes``, ``worker_ready_port``, ``metrics_path``,
+       ``worker_metrics_path``)
     4. How readiness is probed and counted (``probe_ready``, ``health_expectations``,
        ``get_backend_health_urls``)
     5. What it brings along (``implied_services``, ``frontend_metrics_port``)
@@ -84,11 +85,19 @@ class FrontendProtocol(Protocol):
         """
         ...
 
-    #: Path where this frontend's workers and router serve Prometheus metrics.
+    #: Path where this frontend's router (or its direct endpoint) serves Prometheus metrics.
     metrics_path: ClassVar[str]
 
+    def worker_metrics_path(self, backend: Any) -> str:
+        """Path a worker serves Prometheus metrics at on ``worker_metrics_port``.
+
+        A Dynamo worker's system server answers ``/metrics`` for every engine; a
+        direct worker is the engine's own server, so ``backend.native_metrics_path``.
+        """
+        ...
+
     def worker_metrics_port(self, process: "Process", runtime: "RuntimeContext") -> int | None:
-        """Port on ``process.node`` serving Prometheus metrics at ``metrics_path`` for this rank.
+        """Port on ``process.node`` serving Prometheus metrics at ``worker_metrics_path`` for this rank.
 
         ``None`` when the rank serves none: a follower of a native multi-node
         server, or a layout the frontend does not scrape. Every rank of a Dynamo

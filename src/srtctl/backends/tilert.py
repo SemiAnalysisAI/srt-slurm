@@ -30,6 +30,7 @@ class TileRTProtocol:
     """Launch TileRT's decode server with recipe-owned model and transport settings."""
 
     type: Literal["tilert"] = "tilert"
+    native_metrics_path: ClassVar[str] = "/metrics"
     served_model_name: str | None = None
     # The roles this engine runs (`roles.<role>` of the recipe), bound by SrtConfig and
     # never written on `engine:`. The decode role's env and args are read from here.
@@ -55,6 +56,10 @@ class TileRTProtocol:
 
     def fatal_log_patterns(self, mode: str) -> tuple[str, ...]:
         return ()
+
+    def is_grpc_mode(self, mode: str) -> bool:
+        """TileRT workers serve HTTP only."""
+        return False
 
     def get_served_model_name(self, default: str) -> str:
         return self.served_model_name or default

@@ -32,6 +32,7 @@ class AtomProtocol:
     """Launch ``atom.entrypoints.openai_server`` on ROCm workers."""
 
     type: Literal["atom"] = "atom"
+    native_metrics_path: ClassVar[str] = "/metrics"
     # The roles this engine runs (`roles.<role>` of the recipe), bound by SrtConfig and
     # never written on `engine:`. Per-role env and native ATOM CLI args are read from here.
     roles: Mapping[str, RoleSettings] = field(default_factory=dict, metadata={"marshmallow_field": BoundRolesField()})
@@ -59,6 +60,10 @@ class AtomProtocol:
 
     def get_process_environment(self, process: Process) -> dict[str, str]:
         return {}
+
+    def is_grpc_mode(self, mode: str) -> bool:
+        """ATOM workers serve HTTP only."""
+        return False
 
     def get_served_model_name(self, default: str) -> str:
         """The name ATOM serves: a role's ``served-model-name``, else its literal ``--model``."""

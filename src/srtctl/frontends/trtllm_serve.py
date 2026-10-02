@@ -58,9 +58,13 @@ class TRTLLMServeFrontend:
         """The aggregate worker is the endpoint; P/D workers sit behind the disaggregated orchestrator."""
         return "public" if mode == "agg" else "allocated"
 
-    # trtllm-serve (worker and disaggregated orchestrator alike) serves Prometheus
-    # text at /prometheus/metrics; GET /metrics on a worker is JSON iteration stats.
+    # The disaggregated orchestrator serves Prometheus text at /prometheus/metrics, as
+    # its trtllm-serve workers do (TRTLLMProtocol.native_metrics_path).
     metrics_path: ClassVar[str] = "/prometheus/metrics"
+
+    def worker_metrics_path(self, backend: Any) -> str:
+        """The workers are the engine's own servers."""
+        return backend.native_metrics_path
 
     def worker_metrics_port(self, process: "Process", runtime: "RuntimeContext") -> int | None:
         """P/D leaders serve Prometheus on their OpenAI port; followers bind nothing. Aggregate is out of scope."""

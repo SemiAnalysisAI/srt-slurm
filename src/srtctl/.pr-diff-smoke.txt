@@ -1,3 +1,0 @@
-Temporary source diff fixture.
-Create a comment for these source changes.
-Remove it when these lines are reverted.

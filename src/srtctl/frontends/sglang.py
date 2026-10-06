@@ -8,7 +8,8 @@ The router-free single-replica mode is `frontend.type: sglang`; see sglang_direc
 
 from typing import Any, ClassVar
 
-from srtctl.core.slurm import get_hostname_ip, start_srun_process
+from srtctl.core.launcher import LaunchSpec, launch
+from srtctl.core.slurm import get_hostname_ip
 from srtctl.core.topology import Process
 from srtctl.frontends.base import register_frontend
 from srtctl.frontends.static_router import StaticRouterFrontend
@@ -70,4 +71,4 @@ class SGLangRouterFrontend(StaticRouterFrontend):
         return get_hostname_ip(node, network_interface)
 
     def start_process(self, **kwargs: Any) -> Any:
-        return start_srun_process(**kwargs)
+        return launch(LaunchSpec(**kwargs))

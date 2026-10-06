@@ -74,10 +74,10 @@ def _run_eval(config: SrtConfig, tmp_path: Path, env: dict[str, str]) -> dict:
     with (
         patch.dict(os.environ, env, clear=False),
         patch("srtctl.cli.do_sweep.wait_for_port", return_value=True),
-        patch("srtctl.cli.do_sweep.start_srun_process", return_value=proc) as srun,
+        patch("srtctl.cli.do_sweep.launch", return_value=proc) as srun,
     ):
         assert orchestrator._run_post_eval(threading.Event()) == 0
-    return srun.call_args.kwargs
+    return vars(srun.call_args.args[0])
 
 
 def test_defaults_are_empty() -> None:

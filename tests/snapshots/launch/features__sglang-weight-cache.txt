@@ -17,7 +17,6 @@ env_to_set:
     PYTHONUNBUFFERED: 1
     SGLANG_WEIGHT_CACHE_READY_TEMPLATE: /dev/shm/sglang-wc/{device_uuid}.ready
     SGLANG_WEIGHT_CACHE_SOCKET_TEMPLATE: /dev/shm/sglang-wc/{device_uuid}.sock
-use_bash_wrapper: True
 bash_preamble: |
     mkdir -p /dev/shm/sglang-wc
 command: |
@@ -38,7 +37,6 @@ env_to_set:
     PYTHONUNBUFFERED: 1
     SGLANG_WEIGHT_CACHE_READY_TEMPLATE: /dev/shm/sglang-wc/{device_uuid}.ready
     SGLANG_WEIGHT_CACHE_SOCKET_TEMPLATE: /dev/shm/sglang-wc/{device_uuid}.sock
-use_bash_wrapper: True
 bash_preamble: |
     mkdir -p /dev/shm/sglang-wc
 command: |

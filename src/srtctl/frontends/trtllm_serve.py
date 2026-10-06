@@ -19,7 +19,8 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal
 import yaml
 
 from srtctl.core.health import WorkerHealthResult, probe_http_ok, wait_for_health
-from srtctl.core.slurm import get_hostname_ip, start_srun_process
+from srtctl.core.launcher import LaunchSpec, launch
+from srtctl.core.slurm import get_hostname_ip
 from srtctl.frontends.base import (
     Frontend,
     frontend_args_to_cli,
@@ -212,18 +213,20 @@ class TRTLLMServeFrontend(Frontend):
         # so log collection that globs *_frontend_*.out treats both frontends identically.
         orch_log = runtime.log_dir / f"{frontend_node}_frontend_0.out"
         step_name = "trtllm_serve_orchestrator"
-        proc = start_srun_process(
-            command=cmd,
-            nodelist=[frontend_node],
-            output=str(orch_log),
-            container_image=str(runtime.container_image),
-            container_mounts=runtime.container_mounts,
-            env_to_set=env_to_set if env_to_set else None,
-            # trtllm-serve imports tensorrt_llm, which requires an MPI launcher even
-            # for the single-rank orchestrator (same reason the dynamo frontend uses it).
-            mpi="pmix",
-            het_group=runtime.nodes.het_group_for(frontend_node),
-            step_name=step_name,
+        proc = launch(
+            LaunchSpec(
+                command=cmd,
+                nodelist=[frontend_node],
+                output=str(orch_log),
+                container_image=str(runtime.container_image),
+                container_mounts=runtime.container_mounts,
+                env_to_set=env_to_set if env_to_set else None,
+                # trtllm-serve imports tensorrt_llm, which requires an MPI launcher even
+                # for the single-rank orchestrator (same reason the dynamo frontend uses it).
+                mpi="pmix",
+                het_group=runtime.nodes.het_group_for(frontend_node),
+                step_name=step_name,
+            )
         )
 
         return [

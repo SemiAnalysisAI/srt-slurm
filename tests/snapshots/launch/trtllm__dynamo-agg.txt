@@ -11,7 +11,6 @@ container_mounts:
     <repo>/src/srtctl/runtime_scripts: /srtctl-runtime
     <model>: /model
     <output>/logs: /logs
-use_bash_wrapper: True
 bash_preamble: |
     rm -rf /tmp/etcd && mkdir -p /tmp/etcd
 command: |
@@ -27,8 +26,6 @@ command: |
     configs/otelcol-contrib --config <output>/logs/otel-collector.yaml
 
 ## agg_0_node-01
-nodes: 1
-ntasks: 1
 nodelist: node-01
 output: <output>/logs/node-01_agg_w0.out
 container_image: trtllm
@@ -70,8 +67,6 @@ command: |
     trtllm-llmapi-launch python3 -m dynamo.trtllm --model-path /model --served-model-name Qwen/Qwen3-0.6B --extra-engine-args /logs/trtllm_config_agg.yaml --request-plane tcp --publish-metrics
 
 ## agg_1_node-01
-nodes: 1
-ntasks: 1
 nodelist: node-01
 output: <output>/logs/node-01_agg_w1.out
 container_image: trtllm

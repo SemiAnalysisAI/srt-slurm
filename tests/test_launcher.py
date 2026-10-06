@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for ``core/launcher.py``: launcher selection, the Docker launcher, and its validation."""
+"""Tests for the launchers: selection (``core/launcher.py``), the Docker launcher (``core/docker.py``), and validation."""
 
 from __future__ import annotations
 
@@ -16,10 +16,10 @@ import yaml
 
 from srtctl.core import launcher as launcher_mod
 from srtctl.core.docker import DockerLauncher
-from srtctl.core.launcher import LaunchSpec, SlurmLauncher, get_launcher
+from srtctl.core.launcher import LaunchSpec, get_launcher, launch
 from srtctl.core.runtime import Nodes
 from srtctl.core.schema import SrtConfig
-from srtctl.core.slurm import get_hostname_ip, start_srun_process
+from srtctl.core.slurm import SlurmLauncher, get_hostname_ip
 from srtctl.mock import MockOptions, run_mock_sweep
 
 SINGLE_NODE_DISAGG = {
@@ -78,10 +78,10 @@ class TestSelection:
         ):
             get_launcher()
 
-    def test_start_srun_process_goes_through_the_launcher(self):
+    def test_launch_goes_through_the_selected_launcher(self):
         fake = MagicMock()
         with patch.object(launcher_mod, "get_launcher", return_value=fake):
-            start_srun_process(["echo", "hi"], step_name="s", env_to_set={"A": "1"})
+            launch(LaunchSpec(["echo", "hi"], step_name="s", env_to_set={"A": "1"}))
         spec = fake.launch.call_args.args[0]
         assert spec == LaunchSpec(command=["echo", "hi"], step_name="s", env_to_set={"A": "1"})
 

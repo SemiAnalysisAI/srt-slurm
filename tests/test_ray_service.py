@@ -21,7 +21,7 @@ from srtctl.services.config import HttpProbe, LogProbe
 from srtctl.services.ray import RayService
 
 IPS = {"node0": "10.0.0.10", "node1": "10.0.0.11", "node2": "10.0.0.12", "node3": "10.0.0.13"}
-SRUN = "srtctl.cli.mixins.service_stage.start_srun_process"
+SRUN = "srtctl.cli.mixins.service_stage.launch"
 WAIT = "srtctl.cli.mixins.service_stage.wait_until_ready"
 STAGE_HOST_IP = "srtctl.cli.mixins.service_stage.get_hostname_ip"
 KIND_HOST_IP = "srtctl.services.ray.get_hostname_ip"
@@ -259,17 +259,17 @@ def test_stage_launches_head_then_workers_with_per_instance_probes(tmp_path: Pat
 
     assert len(procs) == 3
     calls = srun.call_args_list
-    assert calls[0].kwargs["nodelist"] == ["node1"]
-    assert calls[0].kwargs["command"][:3] == ["ray", "start", "--head"]
+    assert vars(calls[0].args[0])["nodelist"] == ["node1"]
+    assert vars(calls[0].args[0])["command"][:3] == ["ray", "start", "--head"]
     for call, node in zip(calls[1:], ("node2", "node3"), strict=True):
-        assert call.kwargs["nodelist"] == [node]
-        assert call.kwargs["command"][:2] == ["bash", "-c"]
-        assert "--address=10.0.0.11:6379" in call.kwargs["command"][2]
+        assert vars(call.args[0])["nodelist"] == [node]
+        assert vars(call.args[0])["command"][:2] == ["bash", "-c"]
+        assert "--address=10.0.0.11:6379" in vars(call.args[0])["command"][2]
     for call in calls:
-        assert call.kwargs["container_image"] == "/miles.sqsh"
-        assert call.kwargs["container_mounts"] == {Path("/data"): Path("/data")}
-        assert call.kwargs["env_to_set"]["CUDA_VISIBLE_DEVICES"] == "0,1,2,3,4,5,6,7"
-        assert call.kwargs["step_name"].startswith("service_train")
+        assert vars(call.args[0])["container_image"] == "/miles.sqsh"
+        assert vars(call.args[0])["container_mounts"] == {Path("/data"): Path("/data")}
+        assert vars(call.args[0])["env_to_set"]["CUDA_VISIBLE_DEVICES"] == "0,1,2,3,4,5,6,7"
+        assert vars(call.args[0])["step_name"].startswith("service_train")
     # Head probed over http, workers over their logs; then one fleet gate for the service.
     probes = [call.args[0] for call in wait.call_args_list]
     assert isinstance(probes[0], HttpProbe)

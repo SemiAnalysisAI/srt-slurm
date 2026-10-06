@@ -154,7 +154,6 @@ container_mounts:
     <output>/logs: /logs
 env_to_set:
     ETCD_ENDPOINTS: http://127.0.0.1:2379
-use_bash_wrapper: True
 command: |
     sleep infinity
 
@@ -169,7 +168,6 @@ container_mounts:
     <output>/logs: /logs
 env_to_set:
     ETCD_ENDPOINTS: http://127.0.0.1:2379
-use_bash_wrapper: True
 command: |
     sleep infinity
 
@@ -184,7 +182,6 @@ container_mounts:
     <output>/logs: /logs
 env_to_set:
     ETCD_ENDPOINTS: http://127.0.0.1:2379
-use_bash_wrapper: True
 command: |
     sleep infinity
 
@@ -199,7 +196,6 @@ container_mounts:
     <output>/logs: /logs
 env_to_set:
     ETCD_ENDPOINTS: http://127.0.0.1:2379
-use_bash_wrapper: True
 command: |
     sleep infinity
 
@@ -214,7 +210,6 @@ container_mounts:
     <output>/logs: /logs
 env_to_set:
     ETCD_ENDPOINTS: http://127.0.0.1:2379
-use_bash_wrapper: True
 command: |
     sleep infinity
 

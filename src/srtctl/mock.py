@@ -23,10 +23,12 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
+
+from srtctl.core.launcher import LaunchSpec
 
 __all__ = [
     "FakePopen",
@@ -223,15 +225,15 @@ def mock_infrastructure(*, options: MockOptions, output_dir: Path):
         }
     )
 
-    def _fake_srun(*args, **kwargs) -> FakePopen:
-        cmd = kwargs.get("command") or (args[0] if args else [])
-        if not isinstance(cmd, list):
-            cmd = [str(cmd)]
+    def _fake_launch(spec: LaunchSpec) -> FakePopen:
+        # The fields the call site set, as the srun-call kwargs ``on_srun`` records.
+        kwargs = {f.name: getattr(spec, f.name) for f in fields(spec) if getattr(spec, f.name) != f.default}
+        cmd = list(spec.command)
         if options.on_srun is not None:
             options.on_srun({**kwargs, "command": cmd})
         return FakePopen(
             cmd=cmd,
-            output=kwargs.get("output"),
+            output=spec.output,
             duration_s=options.child_duration_s,
         )
 
@@ -263,19 +265,18 @@ def mock_infrastructure(*, options: MockOptions, output_dir: Path):
 
     # Patches go onto every module that imported these symbols by name.
     patch_targets: list[tuple[str, Any]] = [
-        # srun process starters.
-        ("srtctl.core.slurm.start_srun_process", _fake_srun),
-        ("srtctl.cli.do_sweep.start_srun_process", _fake_srun),
-        ("srtctl.cli.mixins.worker_stage.start_srun_process", _fake_srun),
-        ("srtctl.cli.mixins.frontend_stage.start_srun_process", _fake_srun),
-        ("srtctl.cli.mixins.telemetry_stage.start_srun_process", _fake_srun),
-        ("srtctl.cli.mixins.benchmark_stage.start_srun_process", _fake_srun),
-        ("srtctl.cli.mixins.postprocess_stage.start_srun_process", _fake_srun),
-        ("srtctl.cli.mixins.service_stage.start_srun_process", _fake_srun),
-        ("srtctl.frontends.dynamo.start_srun_process", _fake_srun),
-        ("srtctl.frontends.sglang.start_srun_process", _fake_srun),
-        ("srtctl.frontends.static_router.start_srun_process", _fake_srun),
-        ("srtctl.frontends.trtllm_serve.start_srun_process", _fake_srun),
+        # Process launches.
+        ("srtctl.cli.do_sweep.launch", _fake_launch),
+        ("srtctl.cli.mixins.worker_stage.launch", _fake_launch),
+        ("srtctl.cli.mixins.frontend_stage.launch", _fake_launch),
+        ("srtctl.cli.mixins.telemetry_stage.launch", _fake_launch),
+        ("srtctl.cli.mixins.benchmark_stage.launch", _fake_launch),
+        ("srtctl.cli.mixins.postprocess_stage.launch", _fake_launch),
+        ("srtctl.cli.mixins.service_stage.launch", _fake_launch),
+        ("srtctl.frontends.dynamo.launch", _fake_launch),
+        ("srtctl.frontends.sglang.launch", _fake_launch),
+        ("srtctl.frontends.static_router.launch", _fake_launch),
+        ("srtctl.frontends.trtllm_serve.launch", _fake_launch),
         # Hostname / IP resolution.
         ("srtctl.core.slurm.get_hostname_ip", _fake_hostname_ip),
         ("srtctl.core.slurm.get_slurm_nodelist", _fake_nodelist),

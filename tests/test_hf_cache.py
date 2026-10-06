@@ -304,7 +304,7 @@ resources:
         )
         orch = _make_orchestrator(str(config_file))
 
-        with patch("srtctl.cli.do_sweep.start_srun_process") as mock_srun:
+        with patch("srtctl.cli.do_sweep.launch") as mock_srun:
             orch._ensure_model_cached()
             mock_srun.assert_not_called()
 
@@ -340,7 +340,7 @@ resources:
 
         import logging
 
-        with patch("srtctl.cli.do_sweep.start_srun_process") as mock_srun:
+        with patch("srtctl.cli.do_sweep.launch") as mock_srun:
             with caplog.at_level(logging.WARNING):
                 orch._ensure_model_cached()
             mock_srun.assert_not_called()
@@ -389,7 +389,7 @@ resources:
         import sys
 
         with (
-            patch("srtctl.cli.do_sweep.start_srun_process") as mock_srun,
+            patch("srtctl.cli.do_sweep.launch") as mock_srun,
             patch.dict(sys.modules, {"huggingface_hub": fake_hf_hub}),
         ):
             orch._ensure_model_cached()
@@ -431,11 +431,11 @@ resources:
         mock_proc = MagicMock()
         mock_proc.wait.return_value = 0
 
-        with patch("srtctl.cli.do_sweep.start_srun_process", return_value=mock_proc) as mock_srun:
+        with patch("srtctl.cli.do_sweep.launch", return_value=mock_proc) as mock_srun:
             orch._ensure_model_cached()
 
             mock_srun.assert_called_once()
-            kwargs = mock_srun.call_args.kwargs
+            kwargs = vars(mock_srun.call_args.args[0])
 
             # Should run on exactly one node (first worker node)
             assert kwargs["nodelist"] == ["node-01"]
@@ -492,10 +492,10 @@ resources:
         mock_proc = MagicMock()
         mock_proc.wait.return_value = 0
 
-        with patch("srtctl.cli.do_sweep.start_srun_process", return_value=mock_proc) as mock_srun:
+        with patch("srtctl.cli.do_sweep.launch", return_value=mock_proc) as mock_srun:
             orch._ensure_model_cached()
 
-            kwargs = mock_srun.call_args.kwargs
+            kwargs = vars(mock_srun.call_args.args[0])
             assert kwargs["env_to_set"]["HF_TOKEN"] == "hf_secret_token_123"
 
     def test_handles_download_timeout_gracefully(self, tmp_path: Path):
@@ -533,7 +533,7 @@ resources:
         mock_proc = MagicMock()
         mock_proc.wait.side_effect = [subprocess.TimeoutExpired("srun", 3600), None]
 
-        with patch("srtctl.cli.do_sweep.start_srun_process", return_value=mock_proc):
+        with patch("srtctl.cli.do_sweep.launch", return_value=mock_proc):
             # Should NOT raise
             orch._ensure_model_cached()
             # Should have killed the process
@@ -574,12 +574,12 @@ resources:
         mock_proc = MagicMock()
         mock_proc.wait.return_value = 1  # Non-zero = failure
 
-        with patch("srtctl.cli.do_sweep.start_srun_process", return_value=mock_proc):
+        with patch("srtctl.cli.do_sweep.launch", return_value=mock_proc):
             # Should NOT raise, just log a warning
             orch._ensure_model_cached()
 
     def test_handles_srun_launch_exception_gracefully(self, tmp_path: Path):
-        """Exception from start_srun_process should be caught, not abort the sweep."""
+        """Exception from launch should be caught, not abort the sweep."""
         config_file = tmp_path / "config.yaml"
         config_file.write_text(
             f"""
@@ -610,7 +610,7 @@ resources:
         )
         orch = _make_orchestrator(str(config_file))
 
-        with patch("srtctl.cli.do_sweep.start_srun_process", side_effect=OSError("srun not found")):
+        with patch("srtctl.cli.do_sweep.launch", side_effect=OSError("srun not found")):
             # Should NOT raise - best-effort pre-download
             orch._ensure_model_cached()
 

@@ -13,8 +13,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from srtctl.core.launcher import LaunchSpec, launch
 from srtctl.core.processes import ManagedProcess
-from srtctl.core.slurm import get_hostname_ip, start_srun_process
+from srtctl.core.slurm import get_hostname_ip
 from srtctl.frontends import get_frontend
 from srtctl.ports import FRONTEND_INTERNAL_PORT, FRONTEND_PUBLIC_PORT
 
@@ -154,18 +155,20 @@ class FrontendStageMixin:
         )
         cmd = ["bash", "-c", inner]
 
-        proc = start_srun_process(
-            command=cmd,
-            nodelist=[topology.nginx_node],
-            output=str(nginx_log),
-            container_image=self.config.frontend.nginx_container,
-            container_mounts=self.runtime.container_mounts,
-            use_bash_wrapper=False,  # Already wrapped in bash -c
-            srun_options={
-                "container-remap-root": "",
-            },
-            het_group=self.runtime.nodes.het_group_for(topology.nginx_node),
-            step_name="nginx",
+        proc = launch(
+            LaunchSpec(
+                command=cmd,
+                nodelist=[topology.nginx_node],
+                output=str(nginx_log),
+                container_image=self.config.frontend.nginx_container,
+                container_mounts=self.runtime.container_mounts,
+                use_bash_wrapper=False,  # Already wrapped in bash -c
+                srun_options={
+                    "container-remap-root": "",
+                },
+                het_group=self.runtime.nodes.het_group_for(topology.nginx_node),
+                step_name="nginx",
+            )
         )
 
         return ManagedProcess(

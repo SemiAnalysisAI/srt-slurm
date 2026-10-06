@@ -73,7 +73,6 @@ from .slurm import (
     get_slurm_job_id,
     get_slurm_nodelist,
     run_command,
-    start_srun_process,
 )
 from .topology import (
     Endpoint,
@@ -140,7 +139,6 @@ __all__ = [
     "run_command",
     "setup_signal_handlers",
     "start_process_monitor",
-    "start_srun_process",
     "wait_for_etcd",
     "wait_for_health",
     "wait_for_http_endpoints",

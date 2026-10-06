@@ -3,8 +3,6 @@
 # srun calls: 9
 
 ## agg_0_node-01
-nodes: 1
-ntasks: 1
 nodelist: node-01
 output: <output>/logs/node-01_agg_w0.out
 container_image: trtllm

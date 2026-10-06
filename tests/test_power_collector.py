@@ -987,7 +987,7 @@ class TestSessionOwnership:
         harness = self._harness(tmp_path, None)
 
         with (
-            patch("srtctl.cli.mixins.telemetry_stage.start_srun_process", return_value=_running_exporter()),
+            patch("srtctl.cli.mixins.telemetry_stage.launch", return_value=_running_exporter()),
             patch.object(PowerTelemetrySession, method, side_effect=error("startup blew up")),
             pytest.raises(error),
         ):
@@ -1015,7 +1015,7 @@ class TestSessionOwnership:
         harness = self._harness(tmp_path, None)
 
         with patch(
-            "srtctl.cli.mixins.telemetry_stage.start_srun_process",
+            "srtctl.cli.mixins.telemetry_stage.launch",
             side_effect=RuntimeError("srun refused"),
         ):
             session = harness.start_power_telemetry(ProcessRegistry(job_id="12345"))
@@ -1243,7 +1243,7 @@ class TestBenchmarkChildReaping:
         harness, runner = self._benchmark_harness(tmp_path)
 
         with (
-            patch("srtctl.cli.mixins.benchmark_stage.start_srun_process", return_value=proc),
+            patch("srtctl.cli.mixins.benchmark_stage.launch", return_value=proc),
             patch("srtctl.cli.mixins.benchmark_stage.time.sleep", side_effect=SystemExit(1)),
             pytest.raises(SystemExit),
         ):
@@ -1262,7 +1262,7 @@ class TestBenchmarkChildReaping:
         stop_event.set()
 
         with (
-            patch("srtctl.cli.mixins.benchmark_stage.start_srun_process", return_value=proc),
+            patch("srtctl.cli.mixins.benchmark_stage.launch", return_value=proc),
         ):
             exit_code = harness._run_benchmark_script(runner, tmp_path / "benchmark.out", stop_event)
 
@@ -1278,7 +1278,7 @@ class TestBenchmarkChildReaping:
         harness, runner = self._benchmark_harness(tmp_path)
 
         with (
-            patch("srtctl.cli.mixins.benchmark_stage.start_srun_process", return_value=proc),
+            patch("srtctl.cli.mixins.benchmark_stage.launch", return_value=proc),
             patch("srtctl.cli.mixins.benchmark_stage.time.sleep", side_effect=SystemExit(1)),
             pytest.raises(SystemExit),
         ):
@@ -1293,7 +1293,7 @@ class TestBenchmarkChildReaping:
         harness, runner = self._benchmark_harness(tmp_path)
 
         with (
-            patch("srtctl.cli.mixins.benchmark_stage.start_srun_process", return_value=proc),
+            patch("srtctl.cli.mixins.benchmark_stage.launch", return_value=proc),
             patch("srtctl.cli.mixins.benchmark_stage.time.sleep", side_effect=SystemExit(1)),
             pytest.raises(SystemExit),
         ):

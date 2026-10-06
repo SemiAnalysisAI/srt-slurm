@@ -1172,7 +1172,7 @@ class TestTachometerConfigGeneration:
 class TestTachometerStageMixin:
     """Tachometer stage startup."""
 
-    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
+    @patch("srtctl.cli.mixins.telemetry_stage.launch")
     @patch("srtctl.cli.mixins.telemetry_stage.generate_tachometer_config", return_value='storage = "/run/tachometer"\n')
     def test_start_tachometer_starts_only_the_scraper(self, _mock_config, mock_srun, tmp_path):
         class Harness(TelemetryStageMixin):
@@ -1237,7 +1237,7 @@ class TestTachometerStageMixin:
         assert (tmp_path / "tachometer" / "local").exists()
         assert mock_srun.call_count == 1
         scraper_call = mock_srun.call_args_list[-1]
-        assert scraper_call.kwargs["command"] == [
+        assert vars(scraper_call.args[0])["command"] == [
             "tachometer-scraper",
             "--config",
             str(tmp_path / "tachometer_config.toml"),
@@ -1246,16 +1246,16 @@ class TestTachometerStageMixin:
             "--sync-interval",
             "120",
         ]
-        assert "container_image" not in scraper_call.kwargs
-        assert "container_mounts" not in scraper_call.kwargs
+        assert vars(scraper_call.args[0])["container_image"] is None
+        assert vars(scraper_call.args[0])["container_mounts"] is None
         # Shell-less launch is load-bearing for graceful shutdown: srun
         # forwards SIGTERM to the task it launched, and the scraper only
         # compacts final.parquet if IT is that task. Under the bash wrapper
         # the signal dies with bash and the capture is lost to step SIGKILL
         # (hecate job 487539). Env must ride --export, not a bash `export`.
-        assert scraper_call.kwargs["use_bash_wrapper"] is False
-        assert scraper_call.kwargs["srun_export_env"] == {"POLARS_MAX_THREADS": "4"}
-        assert "env_to_set" not in scraper_call.kwargs
+        assert vars(scraper_call.args[0])["use_bash_wrapper"] is False
+        assert vars(scraper_call.args[0])["srun_export_env"] == {"POLARS_MAX_THREADS": "4"}
+        assert vars(scraper_call.args[0])["env_to_set"] is None
         # Telemetry is best-effort by contract: a dead scraper must never
         # tear down the benchmark via the critical-process check.
         assert procs[-1].name == "tachometer"
@@ -1269,7 +1269,7 @@ class TestTachometerStageMixin:
             ),
         )
         harness.start_tachometer()
-        assert mock_srun.call_args_list[-1].kwargs["command"][-2:] == [
+        assert vars(mock_srun.call_args_list[-1].args[0])["command"][-2:] == [
             "--outbox-dir",
             str(tmp_path.parent / "tachometer-outbox"),
         ]
@@ -1289,7 +1289,7 @@ class TestTachometerStageMixin:
         monkeypatch.setenv("SRTCTL_SOURCE_DIR", str(tmp_path))
         assert stage._resolve_tachometer_binary("tachometer-scraper") == str(binary)
 
-    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
+    @patch("srtctl.cli.mixins.telemetry_stage.launch")
     def test_tachometer_auto_starts_under_observability_enabled(self, mock_srun, tmp_path):
         """observability.enabled alone starts Tachometer — no tachometer: block needed."""
         import dataclasses
@@ -1349,7 +1349,7 @@ class TestTachometerStageMixin:
         assert 'name = "dcgm_node-a"' in config_text
         assert 'name = "process_exporter_node-a"' in config_text
 
-    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
+    @patch("srtctl.cli.mixins.telemetry_stage.launch")
     def test_tachometer_explicit_false_opts_out(self, mock_srun, tmp_path):
         """An explicit tachometer.enabled: false wins over observability.enabled."""
         import dataclasses
@@ -1368,7 +1368,7 @@ class TestTachometerStageMixin:
         assert procs == []
         assert mock_srun.call_count == 0
 
-    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
+    @patch("srtctl.cli.mixins.telemetry_stage.launch")
     def test_start_tachometer_reuses_the_power_dcgm_exporter(self, mock_srun, tmp_path):
         class Harness(TelemetryStageMixin):
             def __init__(self):
@@ -1423,7 +1423,7 @@ class TestTachometerStageMixin:
         assert mock_srun.call_count == 1
         assert 'name = "dcgm_node-a"' in (tmp_path / "tachometer_config.toml").read_text()
 
-    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
+    @patch("srtctl.cli.mixins.telemetry_stage.launch")
     def test_cpu_only_telemetry_leaves_tachometers_dcgm_exporter_running(self, mock_srun, tmp_path):
         """The CPU leg configures no DCGM exporter, so there is nothing to reuse."""
 
@@ -1630,7 +1630,7 @@ def _worker(node, gpus, mode="agg", index=0, het_group=None):
 class TestDcgmPowerExporterLaunch:
     """One exporter task per allocated physical node, owned before the next launch."""
 
-    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
+    @patch("srtctl.cli.mixins.telemetry_stage.launch")
     def test_single_node_launches_one_task_without_a_bash_wrapper(self, mock_srun, tmp_path):
         mock_srun.return_value = _running_exporter()
         harness = _power_harness(tmp_path, [_worker("node-a", range(4))])
@@ -1639,7 +1639,7 @@ class TestDcgmPowerExporterLaunch:
         session = harness.start_power_telemetry(registry)
 
         assert mock_srun.call_count == 1
-        kwargs = mock_srun.call_args.kwargs
+        kwargs = vars(mock_srun.call_args.args[0])
         assert kwargs["nodes"] == 1
         assert kwargs["ntasks"] == 1
         assert kwargs["nodelist"] == ["node-a"]
@@ -1650,7 +1650,7 @@ class TestDcgmPowerExporterLaunch:
         assert all(proc.critical is False for proc in registry.get_all_processes().values())
         session.stop_and_finalize()
 
-    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
+    @patch("srtctl.cli.mixins.telemetry_stage.launch")
     def test_manifest_records_the_command_that_actually_ran(self, mock_srun, tmp_path):
         """A custom exporter command must not be misreported as the default."""
         mock_srun.return_value = _running_exporter()
@@ -1672,27 +1672,27 @@ class TestDcgmPowerExporterLaunch:
         session = harness.start_power_telemetry(ProcessRegistry(job_id="12345"))
         session.stop_and_finalize()
 
-        launched = " ".join(mock_srun.call_args.kwargs["command"])
+        launched = " ".join(vars(mock_srun.call_args.args[0])["command"])
         recorded = json.loads((tmp_path / "power" / "manifest.json").read_text())["dcgm_exporter"]["command"]
         assert launched == recorded
         assert "--collect-interval=50" in recorded
         assert "--address :9401" in recorded
 
-    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
+    @patch("srtctl.cli.mixins.telemetry_stage.launch")
     def test_two_nodes_launch_two_tasks_in_one_srun(self, mock_srun, tmp_path):
         mock_srun.return_value = _running_exporter()
         harness = _power_harness(tmp_path, [_worker("node-a", range(4)), _worker("node-b", range(4), index=1)])
 
         session = harness.start_power_telemetry(ProcessRegistry(job_id="12345"))
 
-        kwargs = mock_srun.call_args.kwargs
+        kwargs = vars(mock_srun.call_args.args[0])
         assert mock_srun.call_count == 1
         assert kwargs["nodes"] == 2
         assert kwargs["ntasks"] == 2
         assert kwargs["nodelist"] == ["node-a", "node-b"]
         session.stop_and_finalize()
 
-    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
+    @patch("srtctl.cli.mixins.telemetry_stage.launch")
     def test_duplicate_processes_on_one_node_launch_one_exporter(self, mock_srun, tmp_path):
         mock_srun.return_value = _running_exporter()
         harness = _power_harness(
@@ -1703,10 +1703,10 @@ class TestDcgmPowerExporterLaunch:
         session = harness.start_power_telemetry(ProcessRegistry(job_id="12345"))
 
         assert mock_srun.call_count == 1
-        assert mock_srun.call_args.kwargs["nodelist"] == ["node-a"]
+        assert vars(mock_srun.call_args.args[0])["nodelist"] == ["node-a"]
         session.stop_and_finalize()
 
-    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
+    @patch("srtctl.cli.mixins.telemetry_stage.launch")
     def test_heterogeneous_groups_launch_once_per_group(self, mock_srun, tmp_path):
         mock_srun.return_value = _running_exporter()
         harness = _power_harness(
@@ -1723,12 +1723,15 @@ class TestDcgmPowerExporterLaunch:
         session = harness.start_power_telemetry(registry)
 
         assert mock_srun.call_count == 2
-        launched = [(call.kwargs["nodelist"], call.kwargs["het_group"]) for call in mock_srun.call_args_list]
+        launched = [
+            (vars(call.args[0])["nodelist"], vars(call.args[0])["het_group"])
+            for call in mock_srun.call_args_list
+        ]
         assert launched == [(["node-a"], 0), (["node-b"], 1)]
         assert registry.process_count == 2
         session.stop_and_finalize()
 
-    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
+    @patch("srtctl.cli.mixins.telemetry_stage.launch")
     def test_second_group_failure_leaves_the_first_group_owned(self, mock_srun, tmp_path):
         registry = ProcessRegistry(job_id="12345")
         owned_at_launch = []
@@ -1776,7 +1779,7 @@ class TestCpuPowerExporterLaunch:
         )
         return harness
 
-    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
+    @patch("srtctl.cli.mixins.telemetry_stage.launch")
     def test_none_returned_when_not_configured(self, mock_srun, tmp_path):
         harness = _power_harness(tmp_path, [_worker("node-a", range(4))])
         registry = ProcessRegistry(job_id="12345")
@@ -1786,7 +1789,7 @@ class TestCpuPowerExporterLaunch:
         assert collector is None
         mock_srun.assert_not_called()
 
-    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
+    @patch("srtctl.cli.mixins.telemetry_stage.launch")
     def test_uses_the_bundled_binary_when_present_and_executable(self, mock_srun, tmp_path):
         mock_srun.return_value = _running_exporter()
         harness = self._with_cpu_power_exporter(tmp_path)
@@ -1799,12 +1802,12 @@ class TestCpuPowerExporterLaunch:
         collector = harness.start_cpu_power_telemetry(registry)
 
         assert collector is not None
-        kwargs = mock_srun.call_args.kwargs
+        kwargs = vars(mock_srun.call_args.args[0])
         assert kwargs["command"] == [str(resolved), "--port", "9405", "--source", "auto"]
         assert kwargs["use_bash_wrapper"] is False
         collector.stop_and_finalize()
 
-    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
+    @patch("srtctl.cli.mixins.telemetry_stage.launch")
     def test_passes_source_through_to_the_bundled_binary(self, mock_srun, tmp_path):
         mock_srun.return_value = _running_exporter()
         harness = _power_harness(tmp_path, [_worker("node-a", range(4)), _worker("node-b", range(4), index=1)])
@@ -1826,11 +1829,11 @@ class TestCpuPowerExporterLaunch:
         collector = harness.start_cpu_power_telemetry(registry)
 
         assert collector is not None
-        kwargs = mock_srun.call_args.kwargs
+        kwargs = vars(mock_srun.call_args.args[0])
         assert kwargs["command"] == [str(resolved), "--port", "9405", "--source", "acpi"]
         collector.stop_and_finalize()
 
-    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
+    @patch("srtctl.cli.mixins.telemetry_stage.launch")
     def test_warns_when_a_non_auto_source_cannot_be_honored_by_the_fallback(self, mock_srun, tmp_path, caplog):
         import logging
 
@@ -1852,12 +1855,12 @@ class TestCpuPowerExporterLaunch:
             collector = harness.start_cpu_power_telemetry(registry)
 
         assert collector is not None
-        kwargs = mock_srun.call_args.kwargs
+        kwargs = vars(mock_srun.call_args.args[0])
         assert kwargs["command"] == ["python3", "-m", "srtctl.core.cpu_power_exporter", "--port", "9405"]
         assert "cannot be honored" in caplog.text
         collector.stop_and_finalize()
 
-    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
+    @patch("srtctl.cli.mixins.telemetry_stage.launch")
     def test_falls_back_to_the_python_exporter_when_the_binary_is_absent(self, mock_srun, tmp_path):
         mock_srun.return_value = _running_exporter()
         harness = self._with_cpu_power_exporter(tmp_path)
@@ -1867,11 +1870,11 @@ class TestCpuPowerExporterLaunch:
         collector = harness.start_cpu_power_telemetry(registry)
 
         assert collector is not None
-        kwargs = mock_srun.call_args.kwargs
+        kwargs = vars(mock_srun.call_args.args[0])
         assert kwargs["command"] == ["python3", "-m", "srtctl.core.cpu_power_exporter", "--port", "9405"]
         collector.stop_and_finalize()
 
-    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
+    @patch("srtctl.cli.mixins.telemetry_stage.launch")
     def test_launch_failure_is_absorbed_not_raised(self, mock_srun, tmp_path):
         mock_srun.side_effect = RuntimeError("srun refused")
         harness = self._with_cpu_power_exporter(tmp_path)
@@ -1883,7 +1886,7 @@ class TestCpuPowerExporterLaunch:
         assert collector is not None
         assert registry.process_count == 0
 
-    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
+    @patch("srtctl.cli.mixins.telemetry_stage.launch")
     def test_unresolvable_het_node_is_absorbed_not_raised(self, mock_srun, tmp_path):
         """Regression: het-group resolution failures must not escape as an unabsorbed RuntimeError."""
         harness = _power_harness(
@@ -1915,7 +1918,7 @@ class TestCpuPowerHostCollectorLaunch:
     """The host-side Python collector runs once per backend node on the bare host."""
 
     @patch("srtctl.cli.mixins.telemetry_stage.CpuPowerTelemetrySession.wait_for_readiness", return_value=True)
-    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
+    @patch("srtctl.cli.mixins.telemetry_stage.launch")
     def test_multinode_launches_native_collectors(self, mock_srun, _mock_ready, tmp_path):
         mock_srun.return_value = _running_exporter()
         harness = _power_harness(
@@ -1937,19 +1940,19 @@ class TestCpuPowerHostCollectorLaunch:
 
         assert session is not None
         assert mock_srun.call_count == 1
-        kwargs = mock_srun.call_args.kwargs
+        kwargs = vars(mock_srun.call_args.args[0])
         assert kwargs["nodes"] == 2
         assert kwargs["ntasks"] == 2
         assert kwargs["nodelist"] == ["node-a", "node-b"]
         assert kwargs["use_bash_wrapper"] is False
-        assert "container_image" not in kwargs
+        assert kwargs["container_image"] is None
         assert kwargs["command"][1:3] == ["-m", "srtctl.core.cpu_power"]
         assert "--source" in kwargs["command"]
         assert registry.process_count == 1
         assert all(proc.critical is False for proc in registry.get_all_processes().values())
         assert (tmp_path / "cpu_power" / "manifest.json").is_file()
 
-    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
+    @patch("srtctl.cli.mixins.telemetry_stage.launch")
     def test_disabled_block_is_a_noop(self, mock_srun, tmp_path):
         harness = _power_harness(tmp_path, [_worker("node-a", range(4))])
         harness.config = _make_config(

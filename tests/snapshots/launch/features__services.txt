@@ -159,7 +159,6 @@ container_mounts:
     <repo>/src/srtctl/runtime_scripts: /srtctl-runtime
     <model>: /model
     <output>/logs: /logs
-use_bash_wrapper: True
 command: |
     python3 -m http.server 9911 --directory /logs
 

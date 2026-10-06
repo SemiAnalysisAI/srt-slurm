@@ -148,16 +148,16 @@ def test_every_dynamo_frontend_is_wrapped_and_gets_shutdown_budget(tmp_path, ena
         container_mounts={},
         environment={},
     )
-    with patch("srtctl.frontends.dynamo.start_srun_process", return_value=MagicMock()) as launch:
+    with patch("srtctl.frontends.dynamo.launch", return_value=MagicMock()) as launch:
         processes = DynamoFrontend().start_frontends(topology, runtime, cfg, MagicMock(), [])
     assert len(processes) == launch.call_count == 2
     for index, (call, proc) in enumerate(zip(launch.call_args_list, processes, strict=True)):
-        command = call.kwargs["command"]
+        command = vars(call.args[0])["command"]
         if enabled:
             spec = json.loads(command[4])
             assert "dynamo.frontend" in command and "--sample=system-wide" in spec["start_args"]
             assert spec["output"].endswith(f"frontend/node-{'ab'[index]}_frontend_{index}")
-            assert call.kwargs["env_to_set"]["SRT_NSYS_REPORT_EXPECTED"] == "1"
+            assert vars(call.args[0])["env_to_set"]["SRT_NSYS_REPORT_EXPECTED"] == "1"
             assert proc.terminate_timeout == 210
             assert not proc.signal_full
         else:
@@ -188,10 +188,10 @@ def test_worker_launch_profiles_every_task_with_unique_report_names(tmp_path, mp
         ),
         patch("srtctl.cli.mixins.worker_stage.get_hostname_ip", return_value="10.0.0.2"),
         patch("srtctl.cli.mixins.worker_stage.generate_capture_script", return_value="true"),
-        patch("srtctl.cli.mixins.worker_stage.start_srun_process", return_value=MagicMock()) as launch,
+        patch("srtctl.cli.mixins.worker_stage.launch", return_value=MagicMock()) as launch,
     ):
         managed = stage.start_endpoint_worker([process, second]) if mpi else stage.start_worker(process, [process])
-    args = launch.call_args.kwargs
+    args = vars(launch.call_args.args[0])
     spec = json.loads(args["command"][4])
     assert "--sample=system-wide" in spec["start_args"]
     assert args["env_to_set"]["SRT_NSYS_REPORT_EXPECTED"] == ("16" if mpi else "1")
@@ -268,7 +268,7 @@ def test_benchmark_success_requires_a_completed_capture(tmp_path, completed):
     if completed:
         write_json(tmp_path / "profiles/.control/client.json", {"active": False, "completed": 1})
     with (
-        patch("srtctl.cli.mixins.benchmark_stage.start_srun_process", return_value=proc),
+        patch("srtctl.cli.mixins.benchmark_stage.launch", return_value=proc),
         patch("srtctl.analysis.host_sampler.try_start_host_sampler", return_value=None),
     ):
         result = stage._run_benchmark_script(runner, tmp_path / "benchmark.out", threading.Event())

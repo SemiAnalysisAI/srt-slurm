@@ -74,10 +74,10 @@ def test_mixed_workers_use_concrete_engines_images_and_gpu_masks(tmp_path: Path)
     orchestrator = _orchestrator(config, tmp_path, ("n0",))
     with (
         patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"),
-        patch("srtctl.cli.mixins.worker_stage.start_srun_process") as srun,
+        patch("srtctl.cli.mixins.worker_stage.launch") as srun,
     ):
         orchestrator.start_all_workers()
-    prefill, decode = [call.kwargs for call in srun.call_args_list]
+    prefill, decode = [vars(call.args[0]) for call in srun.call_args_list]
     assert prefill["container_image"] == "/images/prefill.sqsh"
     assert decode["container_image"] == "/images/decode.sqsh"
     assert prefill["env_to_set"]["ROCR_VISIBLE_DEVICES"] == "0,1,2,3"

@@ -17,10 +17,11 @@ from typing import TYPE_CHECKING, Any, Literal
 from srtctl.backends.vllm import VLLMBackend, VLLMFailoverConfig
 from srtctl.core.fingerprint import generate_capture_script
 from srtctl.core.health import wait_for_health
+from srtctl.core.launcher import LaunchSpec, launch
 from srtctl.core.observability_nsys import wrap_observability_nsys
 from srtctl.core.processes import ManagedProcess, NamedProcesses, ProcessRegistry
 from srtctl.core.schema import build_otel_env, installs_dynamo
-from srtctl.core.slurm import CONTAINER_REMAP_ROOT_EXPORT, get_hostname_ip, start_srun_process
+from srtctl.core.slurm import CONTAINER_REMAP_ROOT_EXPORT, get_hostname_ip
 from srtctl.core.supervisor import EndpointKey, WorkerSupervisor
 from srtctl.frontends import get_frontend
 from srtctl.services.implicit import discovery_env
@@ -430,23 +431,25 @@ class WorkerStageMixin:
         env_to_unset = ["VLLM_PORT"] if backend.type == "vllm" and len(endpoint_nodes) > 1 else None
 
         step_name = worker_step_name(mode, index, process.node, attempt, getattr(process, "engine_id", 0))
-        proc = start_srun_process(
-            command=cmd,
-            nodelist=[process.node],
-            output=str(worker_log),
-            container_image=(
-                self.config.worker_container_for_role(mode)
-                if mode in self.config.role_containers
-                else str(self.runtime.container_image)
-            ),
-            container_mounts=self.runtime.container_mounts,
-            env_to_set=env_to_set,
-            env_to_unset=env_to_unset,
-            bash_preamble=bash_preamble,
-            srun_options={**self.runtime.srun_options, **self.config.roles[mode].srun_options},
-            srun_export_env=CONTAINER_REMAP_ROOT_EXPORT if installs_dynamo(self.config) else None,
-            het_group=process.het_group,
-            step_name=step_name,
+        proc = launch(
+            LaunchSpec(
+                command=cmd,
+                nodelist=[process.node],
+                output=str(worker_log),
+                container_image=(
+                    self.config.worker_container_for_role(mode)
+                    if mode in self.config.role_containers
+                    else str(self.runtime.container_image)
+                ),
+                container_mounts=self.runtime.container_mounts,
+                env_to_set=env_to_set,
+                env_to_unset=env_to_unset,
+                bash_preamble=bash_preamble,
+                srun_options={**self.runtime.srun_options, **self.config.roles[mode].srun_options},
+                srun_export_env=CONTAINER_REMAP_ROOT_EXPORT if installs_dynamo(self.config) else None,
+                het_group=process.het_group,
+                step_name=step_name,
+            )
         )
 
         return ManagedProcess(
@@ -653,31 +656,33 @@ class WorkerStageMixin:
             srun_options["kill-on-bad-exit"] = "1"
 
         step_name = worker_step_name(mode, index, leader.node, attempt)
-        proc = start_srun_process(
-            command=cmd,
-            nodes=num_nodes,
-            ntasks=total_gpus,
-            nodelist=endpoint_nodes,
-            output=str(worker_log),
-            container_image=(
-                self.config.worker_container_for_role(mode)
-                if mode in self.config.role_containers
-                else str(self.runtime.container_image)
-            ),
-            container_mounts=self.runtime.container_mounts,
-            env_to_set=env_to_set,
-            bash_preamble=bash_preamble,
-            srun_export_env=CONTAINER_REMAP_ROOT_EXPORT if installs_dynamo(self.config) else None,
-            mpi=srun_config.mpi,
-            oversubscribe=srun_config.oversubscribe,
-            cpu_bind=srun_config.cpu_bind,
-            # Endpoint (MPI) workers were the only srun path that dropped the
-            # recipe-level srun_options; the per-process worker, benchmark and
-            # telemetry paths all forward it. Needed so a cluster can express
-            # per-rank CPU/NUMA binding, which srun_config.cpu_bind cannot.
-            srun_options=srun_options,
-            het_group=leader.het_group,
-            step_name=step_name,
+        proc = launch(
+            LaunchSpec(
+                command=cmd,
+                nodes=num_nodes,
+                ntasks=total_gpus,
+                nodelist=endpoint_nodes,
+                output=str(worker_log),
+                container_image=(
+                    self.config.worker_container_for_role(mode)
+                    if mode in self.config.role_containers
+                    else str(self.runtime.container_image)
+                ),
+                container_mounts=self.runtime.container_mounts,
+                env_to_set=env_to_set,
+                bash_preamble=bash_preamble,
+                srun_export_env=CONTAINER_REMAP_ROOT_EXPORT if installs_dynamo(self.config) else None,
+                mpi=srun_config.mpi,
+                oversubscribe=srun_config.oversubscribe,
+                cpu_bind=srun_config.cpu_bind,
+                # Endpoint (MPI) workers were the only srun path that dropped the
+                # recipe-level srun_options; the per-process worker, benchmark and
+                # telemetry paths all forward it. Needed so a cluster can express
+                # per-rank CPU/NUMA binding, which srun_config.cpu_bind cannot.
+                srun_options=srun_options,
+                het_group=leader.het_group,
+                step_name=step_name,
+            )
         )
 
         return ManagedProcess(

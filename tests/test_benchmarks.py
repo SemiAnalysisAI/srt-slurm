@@ -1838,7 +1838,7 @@ class TestRunPostEval:
 
         with patch.dict(os.environ, {"EVAL_ONLY": "false"}, clear=False):
             with patch("srtctl.cli.do_sweep.wait_for_port", return_value=True):
-                with patch("srtctl.cli.do_sweep.start_srun_process", return_value=mock_proc):
+                with patch("srtctl.cli.do_sweep.launch", return_value=mock_proc):
                     result = orch._run_post_eval(stop)
         assert result == 0
 
@@ -1857,7 +1857,7 @@ class TestRunPostEval:
 
         with patch.dict(os.environ, {"EVAL_ONLY": "true"}, clear=False):
             with patch.object(orch, "_wait_for_service_ready", return_value=True):
-                with patch("srtctl.cli.do_sweep.start_srun_process", return_value=mock_proc):
+                with patch("srtctl.cli.do_sweep.launch", return_value=mock_proc):
                     result = orch._run_post_eval(stop)
         assert result == 0
 
@@ -1884,13 +1884,13 @@ class TestRunPostEval:
 
         captured_kwargs = {}
 
-        def capture_srun(**kwargs):
-            captured_kwargs.update(kwargs)
+        def capture_srun(spec):
+            captured_kwargs.update(vars(spec))
             return mock_proc
 
         with patch.dict(os.environ, env_vars, clear=False):
             with patch("srtctl.cli.do_sweep.wait_for_port", return_value=True):
-                with patch("srtctl.cli.do_sweep.start_srun_process", side_effect=capture_srun):
+                with patch("srtctl.cli.do_sweep.launch", side_effect=capture_srun):
                     orch._run_post_eval(stop)
 
         env_to_set = captured_kwargs["env_to_set"]
@@ -1915,13 +1915,13 @@ class TestRunPostEval:
 
         captured_kwargs = {}
 
-        def capture_srun(**kwargs):
-            captured_kwargs.update(kwargs)
+        def capture_srun(spec):
+            captured_kwargs.update(vars(spec))
             return mock_proc
 
         with patch.dict(os.environ, {"EVAL_ONLY": "false", "EVAL_CONC": "64"}, clear=False):
             with patch("srtctl.cli.do_sweep.wait_for_port", return_value=True):
-                with patch("srtctl.cli.do_sweep.start_srun_process", side_effect=capture_srun):
+                with patch("srtctl.cli.do_sweep.launch", side_effect=capture_srun):
                     orch._run_post_eval(stop)
 
         assert captured_kwargs["env_to_set"]["EVAL_CONC"] == "64"
@@ -1941,8 +1941,8 @@ class TestRunPostEval:
 
         captured_kwargs = {}
 
-        def capture_srun(**kwargs):
-            captured_kwargs.update(kwargs)
+        def capture_srun(spec):
+            captured_kwargs.update(vars(spec))
             return mock_proc
 
         env = {"EVAL_ONLY": "false"}
@@ -1950,7 +1950,7 @@ class TestRunPostEval:
         with patch.dict(os.environ, env, clear=False):
             os.environ.pop("EVAL_CONC", None)
             with patch("srtctl.cli.do_sweep.wait_for_port", return_value=True):
-                with patch("srtctl.cli.do_sweep.start_srun_process", side_effect=capture_srun):
+                with patch("srtctl.cli.do_sweep.launch", side_effect=capture_srun):
                     orch._run_post_eval(stop)
 
         # concurrencies="128x256x512", max is 512
@@ -1971,7 +1971,7 @@ class TestRunPostEval:
 
         with patch.dict(os.environ, {"EVAL_ONLY": "false"}, clear=False):
             with patch("srtctl.cli.do_sweep.wait_for_port", return_value=True):
-                with patch("srtctl.cli.do_sweep.start_srun_process", return_value=mock_proc):
+                with patch("srtctl.cli.do_sweep.launch", return_value=mock_proc):
                     result = orch._run_post_eval(stop)
 
         assert result == 1

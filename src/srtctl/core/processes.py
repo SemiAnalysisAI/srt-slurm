@@ -84,7 +84,7 @@ class ManagedProcess:
             cleanup. Processes that flush state on SIGTERM (tachometer
             compacting parquet) need more than the default.
         step_name: The Slurm step name this srun was launched with
-            (``start_srun_process(step_name=...)``). When set, ``terminate()``
+            (``LaunchSpec(step_name=...)``). When set, ``terminate()``
             delivers SIGTERM to the task with ``scancel --signal=TERM --full``
             on that step, because SIGTERM to the srun process itself only
             aborts the step and the task is SIGKILLed without warning.

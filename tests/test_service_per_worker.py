@@ -19,7 +19,7 @@ from srtctl.core.topology import Process
 from srtctl.services import ServiceConfig, ServicePlacementConfig
 from srtctl.services.registry import ServiceLaunchContext
 
-SRUN = "srtctl.cli.mixins.service_stage.start_srun_process"
+SRUN = "srtctl.cli.mixins.service_stage.launch"
 WAIT = "srtctl.cli.mixins.service_stage.wait_until_ready"
 HOST_IP = "srtctl.cli.mixins.service_stage.get_hostname_ip"
 
@@ -159,7 +159,7 @@ services:
         procs = orchestrator.start_services("before_workers")
 
     assert [p.name for p in procs] == ["service_gpu-watch_agg_0_node1", "service_gpu-watch_agg_1_node1"]
-    calls = [call.kwargs for call in srun.call_args_list]
+    calls = [vars(call.args[0]) for call in srun.call_args_list]
     assert calls[0]["command"] == ["nvidia-smi", "dmon", "-i", "0", "--tag", "agg-0"]
     assert calls[1]["command"] == ["nvidia-smi", "dmon", "-i", "1", "--tag", "agg-1"]
     assert calls[0]["env_to_set"]["CUDA_VISIBLE_DEVICES"] == "0"
@@ -182,7 +182,7 @@ def test_full_node_workers_are_not_pinned(tmp_path: Path) -> None:
     with patch(SRUN, return_value=_proc()) as srun, patch(WAIT, return_value=True), patch(HOST_IP, return_value="ip"):
         procs = orchestrator.start_services("before_workers")
     assert [p.name for p in procs] == ["service_w_agg_0_node1"]
-    assert "CUDA_VISIBLE_DEVICES" not in srun.call_args.kwargs["env_to_set"]
+    assert "CUDA_VISIBLE_DEVICES" not in vars(srun.call_args.args[0])["env_to_set"]
 
 
 def test_per_node_services_are_unchanged(tmp_path: Path) -> None:
@@ -193,4 +193,4 @@ def test_per_node_services_are_unchanged(tmp_path: Path) -> None:
     with patch(SRUN, return_value=_proc()) as srun, patch(WAIT, return_value=True), patch(HOST_IP, return_value="ip"):
         procs = orchestrator.start_services("before_workers")
     assert [p.name for p in procs] == ["service_n"]
-    assert "CUDA_VISIBLE_DEVICES" not in srun.call_args.kwargs["env_to_set"]
+    assert "CUDA_VISIBLE_DEVICES" not in vars(srun.call_args.args[0])["env_to_set"]

@@ -36,7 +36,7 @@ from srtctl.cli.mixins import (
 from srtctl.core.config import get_srtslurm_setting, load_config
 from srtctl.core.health import wait_for_port
 from srtctl.core.launch_plan import configure_launch_plan
-from srtctl.core.launcher import get_launcher
+from srtctl.core.launcher import LaunchSpec, get_launcher, launch
 from srtctl.core.lockfile import write_lockfile
 from srtctl.core.processes import (
     ProcessRegistry,
@@ -46,7 +46,6 @@ from srtctl.core.processes import (
 from srtctl.core.resource_snapshot import record_resource_snapshot
 from srtctl.core.runtime import RuntimeContext
 from srtctl.core.schema import SrtConfig
-from srtctl.core.slurm import start_srun_process
 from srtctl.core.status import JobStage, JobStatus, LogStreamer, StatusReporter, tachometer_outbox
 from srtctl.core.supervisor import WORKER_RESTARTS_FILENAME
 from srtctl.core.topology import Endpoint, NodePortAllocator, Process, allocate_endpoints_het
@@ -260,12 +259,14 @@ class SweepOrchestrator(
         procs = []
         for node in nodes:
             log = self.runtime.log_dir / f"host_{phase}_{node}.out"
-            proc = start_srun_process(
-                command=["bash", "-c", script],
-                nodelist=[node],
-                output=str(log),
-                container_image=None,  # bare host, not the job container
-                het_group=self.runtime.nodes.het_group_for(node),
+            proc = launch(
+                LaunchSpec(
+                    command=["bash", "-c", script],
+                    nodelist=[node],
+                    output=str(log),
+                    container_image=None,  # bare host, not the job container
+                    het_group=self.runtime.nodes.het_group_for(node),
+                )
             )
             procs.append((node, proc, log))
 
@@ -347,13 +348,15 @@ class SweepOrchestrator(
         procs = []
         for node in worker_nodes:
             log = self.runtime.log_dir / f"stage_model_{node}.out"
-            proc = start_srun_process(
-                command=["bash", "/srtctl-runtime/stage_model.sh", src, dest],
-                nodelist=[node],
-                output=str(log),
-                container_image=str(self.runtime.container_image),
-                container_mounts=self.runtime.container_mounts,
-                het_group=self.runtime.nodes.het_group_for(node),
+            proc = launch(
+                LaunchSpec(
+                    command=["bash", "/srtctl-runtime/stage_model.sh", src, dest],
+                    nodelist=[node],
+                    output=str(log),
+                    container_image=str(self.runtime.container_image),
+                    container_mounts=self.runtime.container_mounts,
+                    het_group=self.runtime.nodes.het_group_for(node),
+                )
             )
             procs.append((node, proc, log))
         failures = []
@@ -446,15 +449,17 @@ class SweepOrchestrator(
         hf_env = self._get_hf_env()
 
         try:
-            proc = start_srun_process(
-                command=download_cmd,
-                nodelist=[download_node],
-                output=str(download_log),
-                container_image=str(self.runtime.container_image),
-                container_mounts=self.runtime.container_mounts,
-                env_to_set=hf_env,
-                use_bash_wrapper=False,  # command is already bash -c
-                het_group=self.runtime.nodes.het_group_for(download_node),
+            proc = launch(
+                LaunchSpec(
+                    command=download_cmd,
+                    nodelist=[download_node],
+                    output=str(download_log),
+                    container_image=str(self.runtime.container_image),
+                    container_mounts=self.runtime.container_mounts,
+                    env_to_set=hf_env,
+                    use_bash_wrapper=False,  # command is already bash -c
+                    het_group=self.runtime.nodes.het_group_for(download_node),
+                )
             )
 
             timeout_sec = 60 * 60  # 1 hour; large models can take a while
@@ -572,15 +577,17 @@ class SweepOrchestrator(
                 env_to_set["EVAL_CONC"] = str(max(conc_list))
                 logger.info("Eval concurrency (max of %s): %s", conc_list, env_to_set["EVAL_CONC"])
 
-        proc = start_srun_process(
-            command=cmd,
-            nodelist=[self.runtime.nodes.head],
-            output=str(eval_log),
-            container_image=str(self.runtime.container_image),
-            container_mounts=self.runtime.container_mounts,
-            env_to_set=env_to_set,
-            srun_options=self.runtime.srun_options,
-            het_group=self.runtime.nodes.het_group_for(self.runtime.nodes.head),
+        proc = launch(
+            LaunchSpec(
+                command=cmd,
+                nodelist=[self.runtime.nodes.head],
+                output=str(eval_log),
+                container_image=str(self.runtime.container_image),
+                container_mounts=self.runtime.container_mounts,
+                env_to_set=env_to_set,
+                srun_options=self.runtime.srun_options,
+                het_group=self.runtime.nodes.het_group_for(self.runtime.nodes.head),
+            )
         )
 
         while proc.poll() is None:

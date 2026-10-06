@@ -445,7 +445,7 @@ class ClusterConfig:
     # --no-preflight had been passed. The framework still fails loudly at
     # runtime if a path is genuinely missing on the compute node.
     preflight: bool = True
-    # Where processes run: `slurm` (srun steps inside an sbatch allocation) or `local`
+    # Where processes run: `slurm` (srun steps inside an sbatch allocation) or `docker`
     # (one job on this machine, containers under `docker run`). See docs/cluster-config.md#launcher.
     launcher: Literal["slurm", "docker"] = "slurm"
     # Extra `docker run` arguments for every container under `launcher: docker`, e.g. `["--user", "1000:1000"]`.

@@ -262,8 +262,8 @@ class TestNginxConfigGeneration:
 class TestStartFrontendIntegration:
     """Integration tests for start_frontend method."""
 
-    @patch("srtctl.frontends.dynamo.start_srun_process")
-    @patch("srtctl.cli.mixins.frontend_stage.start_srun_process")
+    @patch("srtctl.frontends.dynamo.launch")
+    @patch("srtctl.cli.mixins.frontend_stage.launch")
     def test_single_node_starts_one_dynamo_frontend(self, mock_mixin_srun, mock_dynamo_srun):
         """Single node starts one dynamo frontend, no nginx."""
         mock_mixin_srun.return_value = MagicMock()
@@ -280,8 +280,8 @@ class TestStartFrontendIntegration:
         assert processes[0].name == "frontend_0"
         assert processes[0].node == "node0"
 
-    @patch("srtctl.frontends.sglang.start_srun_process")
-    @patch("srtctl.cli.mixins.frontend_stage.start_srun_process")
+    @patch("srtctl.frontends.sglang.launch")
+    @patch("srtctl.cli.mixins.frontend_stage.launch")
     def test_single_node_starts_one_sglang_router(self, mock_mixin_srun, mock_sglang_srun):
         """Single node starts one sglang router, no nginx."""
         mock_mixin_srun.return_value = MagicMock()
@@ -299,8 +299,8 @@ class TestStartFrontendIntegration:
         assert processes[0].name == "sglang_router_0"
         assert processes[0].node == "node0"
 
-    @patch("srtctl.frontends.dynamo.start_srun_process")
-    @patch("srtctl.cli.mixins.frontend_stage.start_srun_process")
+    @patch("srtctl.frontends.dynamo.launch")
+    @patch("srtctl.cli.mixins.frontend_stage.launch")
     def test_multi_node_starts_nginx_and_frontends(self, mock_mixin_srun, mock_dynamo_srun, tmp_path):
         """Multi-node starts nginx on head + frontends on other nodes."""
         mock_mixin_srun.return_value = MagicMock()
@@ -347,12 +347,12 @@ class TestStartFrontendIntegration:
         assert (tmp_path / "nginx.conf").exists()
 
         # Default: no shell ulimit before nginx (restricted clusters)
-        nginx_cmd = mock_mixin_srun.call_args_list[0].kwargs["command"]
+        nginx_cmd = vars(mock_mixin_srun.call_args_list[0].args[0])["command"]
         assert nginx_cmd[0] == "bash" and nginx_cmd[1] == "-c"
         assert "ulimit" not in nginx_cmd[2]
 
-    @patch("srtctl.frontends.dynamo.start_srun_process")
-    @patch("srtctl.cli.mixins.frontend_stage.start_srun_process")
+    @patch("srtctl.frontends.dynamo.launch")
+    @patch("srtctl.cli.mixins.frontend_stage.launch")
     def test_multi_node_nginx_ulimit_when_opt_in(self, mock_mixin_srun, mock_dynamo_srun, tmp_path):
         mock_mixin_srun.return_value = MagicMock()
         mock_dynamo_srun.return_value = MagicMock()
@@ -381,11 +381,11 @@ class TestStartFrontendIntegration:
 
         orchestrator.start_frontend(MagicMock())
 
-        nginx_cmd = mock_mixin_srun.call_args_list[0].kwargs["command"]
+        nginx_cmd = vars(mock_mixin_srun.call_args_list[0].args[0])["command"]
         assert "ulimit -n 1048576" in nginx_cmd[2]
 
-    @patch("srtctl.frontends.sglang.start_srun_process")
-    @patch("srtctl.cli.mixins.frontend_stage.start_srun_process")
+    @patch("srtctl.frontends.sglang.launch")
+    @patch("srtctl.cli.mixins.frontend_stage.launch")
     def test_multi_node_sglang_with_nginx(self, mock_mixin_srun, mock_sglang_srun, tmp_path):
         """Multi-node with sglang router starts nginx + routers."""
         mock_mixin_srun.return_value = MagicMock()
@@ -421,8 +421,8 @@ class TestStartFrontendIntegration:
         assert "sglang_router_0" in names
         assert "sglang_router_1" in names
 
-    @patch("srtctl.frontends.dynamo.start_srun_process")
-    @patch("srtctl.cli.mixins.frontend_stage.start_srun_process")
+    @patch("srtctl.frontends.dynamo.launch")
+    @patch("srtctl.cli.mixins.frontend_stage.launch")
     def test_frontends_disabled_single_frontend_only(self, mock_mixin_srun, mock_dynamo_srun):
         """enable_multiple_frontends=False: only one frontend, no nginx."""
         mock_mixin_srun.return_value = MagicMock()

@@ -1,0 +1,3 @@
+Temporary source diff workflow demonstration.
+Keep the generated comment visible for review.
+This fixture will not be merged.

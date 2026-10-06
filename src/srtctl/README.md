@@ -1,4 +1,4 @@
-# srtctl - Python-first SLURM Orchestration
+# Source diff workflow demonstration
 
 This package provides Python-first orchestration for LLM inference benchmarks
 on SLURM clusters, replacing the previous Jinja/bash-heavy approach.

@@ -1,0 +1,1 @@
+Outside src/srtctl; source counts must not change.

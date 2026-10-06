@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import shlex
+import signal
 import socket
 import subprocess
 import time
@@ -254,7 +255,7 @@ class TestMultiHost:
             )
         script = popen.call_args.args[0][2]
         assert script.endswith(" & wait")
-        assert f"'exec exporter' > {tmp_path}/x.{host}.out 2>&1 & ssh -n -o BatchMode=yes node-b " in script
+        assert f"'exec exporter' > {tmp_path}/x.{host}.out 2>&1 & ssh -n -o BatchMode=yes -tt node-b " in script
         assert f"> {tmp_path}/x.node-b.out 2>&1" in script
 
     def test_remote_container_is_killed_over_ssh(self, docker, cluster):
@@ -276,13 +277,24 @@ class TestMultiHost:
             "docker kill --signal=TERM srtctl_docker-test_w",
         ]
 
-    def test_remote_host_process_falls_back_to_the_caller(self, docker, cluster):
+    def test_remote_host_process_runs_under_a_terminal_and_stops_with_its_ssh_client(self, docker, cluster):
         cluster(launcher="docker", docker_hosts=[socket.gethostname(), "node-b"])
-        popen = MagicMock()
+        popen = MagicMock(pid=4242)
         popen.poll.return_value = None
-        with patch("srtctl.core.docker.subprocess.Popen", return_value=popen):
+        with patch("srtctl.core.docker.subprocess.Popen", return_value=popen) as start:
             docker.launch(LaunchSpec(command=["sleep", "60"], nodelist=["node-b"], step_name="h"))
-        assert not docker.signal_step("h", "TERM")
+        assert shlex.split(start.call_args.args[0][2])[:7] == [
+            "exec",
+            "ssh",
+            "-n",
+            "-o",
+            "BatchMode=yes",
+            "-tt",
+            "node-b",
+        ]
+        with patch("srtctl.core.docker.os.killpg") as killpg:
+            assert docker.signal_step("h", "TERM")
+        killpg.assert_called_once_with(4242, signal.SIGTERM)
 
     def test_node_ip_is_resolved_on_the_node(self, docker, cluster):
         cluster(launcher="docker", docker_hosts=["node-a", "node-b"])

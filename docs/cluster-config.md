@@ -75,7 +75,7 @@ Under `launcher: docker`, `srtctl apply` renders the same job script, stages `ou
 | One launch on several nodes (exporters) | one srun task per node | one container per node, started in parallel; `%N` in the log path becomes the node name |
 | Host command (`host_setup`, no container) | `srun` on each node | `bash` on the node (through ssh off this machine) |
 | GPU subset per worker | `CUDA_VISIBLE_DEVICES` from the bash wrapper | same |
-| Graceful stop of a named step | `scancel --signal=TERM --full <job>.<step>` | `docker kill --signal=TERM srtctl_<job>_<step>` on its node (or `killpg` for a host command on this machine) |
+| Graceful stop of a named step | `scancel --signal=TERM --full <job>.<step>` | `docker kill --signal=TERM srtctl_<job>_<step>` on its node; a host command gets `killpg` here, or SIGHUP through its ssh terminal on another node |
 | Node address | IP on `network_interface`, resolved on the node | the same lookup, run on the node over ssh; `127.0.0.1` with a single host |
 
 Every container sees every GPU and shares the host network, so the per-worker GPU masks and the ports `NodePortAllocator` hands out keep processes apart, on one node or across several. A sweep runs its points one after another. Ctrl+C stops the orchestrator, which stops its containers the same way it stops Slurm steps; when the job script exits, any container still labelled with the job (`srtctl.job=<job_id>`) is removed on every node.

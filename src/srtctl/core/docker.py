@@ -59,9 +59,14 @@ def _is_this_host(host: str) -> bool:
     return host in (name, name.split(".")[0], "localhost")
 
 
-def _on(host: str, cmd: list[str]) -> list[str]:
-    """``cmd`` as run on ``host``: as is here, through ssh elsewhere."""
-    return cmd if _is_this_host(host) else [*_SSH, host, shlex.join(cmd)]
+def _on(host: str, cmd: list[str], *, tty: bool = False) -> list[str]:
+    """``cmd`` as run on ``host``: as is here, through ssh elsewhere.
+
+    ``tty`` gives the remote command a terminal, so it gets SIGHUP when its ssh client dies.
+    """
+    if _is_this_host(host):
+        return cmd
+    return [*_SSH, *(["-tt"] if tty else []), host, shlex.join(cmd)]
 
 
 class DockerLauncher(Launcher):
@@ -170,7 +175,9 @@ class DockerLauncher(Launcher):
         # One shell line per node; several run in parallel, like srun's tasks.
         lines = []
         for host in hosts:
-            line = shlex.join(_on(host, cmd))
+            # A host process on another node has no container to `docker kill`: it runs
+            # under a terminal and stops when its ssh client is signalled.
+            line = shlex.join(_on(host, cmd, tty=container is None))
             if spec.output:
                 output = Path(spec.output.replace("%N", host))
                 output.parent.mkdir(parents=True, exist_ok=True)
@@ -205,12 +212,12 @@ class DockerLauncher(Launcher):
     def signal_step(
         self, step_name: str, sig: str = "TERM", *, step_ids: dict[str, str] | None = None, full: bool = True
     ) -> bool:
-        """``docker kill --signal`` on each node for a container, ``killpg`` for a host process here.
+        """``docker kill --signal`` on each node for a container, ``killpg`` for a host process.
 
         ``docker kill`` reaches the container even when its ``docker run`` (or ssh)
         client is gone, and killing the client alone does not stop the container. A
-        host process on another node returns False: the caller then signals the ssh
-        client.
+        host process here gets ``sig``; one on another node gets SIGHUP when ``killpg``
+        stops its ssh client.
         """
         with self._lock:
             step = self._steps.get(step_name)
@@ -230,14 +237,12 @@ class DockerLauncher(Launcher):
                         "docker kill --signal=%s %s on %s failed: %s", sig, step.container, host, result.stderr.strip()
                     )
                     return False
-        elif all(_is_this_host(host) for host in step.hosts):
+        else:
             try:
                 os.killpg(step.popen.pid, signal.Signals[f"SIG{sig}"])
             except (ProcessLookupError, PermissionError, KeyError) as exc:
                 logger.warning("killpg SIG%s %s failed: %s", sig, step_name, exc)
                 return False
-        else:
-            return False
         logger.info("Sent SIG%s to %s", sig, step_name)
         return True
 

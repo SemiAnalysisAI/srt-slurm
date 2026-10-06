@@ -1,4 +1,4 @@
-# Source diff workflow smoke test
+# srtctl - Python-first SLURM Orchestration
 
 This package provides Python-first orchestration for LLM inference benchmarks
 on SLURM clusters, replacing the previous Jinja/bash-heavy approach.

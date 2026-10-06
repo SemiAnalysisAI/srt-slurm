@@ -1,2 +1,3 @@
 Source diff workflow smoke fixture.
 This file will not be merged.
+A push must update the existing comment.

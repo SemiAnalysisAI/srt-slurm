@@ -53,9 +53,10 @@ default_time_limit: "04:00:00"
 #   timeout_seconds: 300
 
 # Where jobs run. `slurm` (default): srun steps inside an sbatch allocation.
-# `docker`: the whole job on this machine (a single GPU VM without Slurm), each
-# container under `docker run --gpus all --network host`. See docs/cluster-config.md#launcher.
+# `docker`: each process is a `docker run --gpus all --network host` container on
+# its node (over ssh unless it is this machine). See docs/cluster-config.md#launcher.
 # launcher: docker
+# docker_hosts: [gpu-0, gpu-1]   # default: this machine
 # docker_args: ["--user", "1000:1000"]
 
 # SLURM directive compatibility

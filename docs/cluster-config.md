@@ -58,28 +58,33 @@ reporting:
 
 ### Launcher
 
-`launcher` picks where a job's processes run. `slurm` (the default) runs each process as an `srun` step inside the allocation `sbatch` hands out. `docker` runs the whole job on the machine you type `srtctl apply` on, for a single GPU VM without Slurm. It needs Docker with the NVIDIA Container Toolkit (`docker run --gpus all` must work) and the binaries `make setup ARCH=x86_64` (or `aarch64`) installs:
+`launcher` picks where a job's processes run. `slurm` (the default) runs each process as an `srun` step inside the allocation `sbatch` hands out. `docker` runs each process as a `docker run` container on its node, for GPU machines with Docker but no Slurm. Every node needs Docker with the NVIDIA Container Toolkit (`docker run --gpus all` must work), and the machine you run `srtctl apply` on needs the binaries `make setup ARCH=x86_64` (or `aarch64`) installs:
 
 ```yaml
 launcher: docker
+# docker_hosts: [gpu-0, gpu-1]           # the job's nodes; default: this machine
 # docker_args: ["--user", "1000:1000"]   # extra `docker run` arguments for every container
 ```
 
-Under `launcher: docker`, `srtctl apply` renders the same job script, stages `outputs/<job_id>/` the same way, and runs the script in the foreground with `SRTCTL_JOB_ID=docker-<timestamp>` in place of `SLURM_JOB_ID`; its output is teed to `logs/sweep_<job_id>.log`. The orchestrator, health checks, benchmarks and postprocessing are unchanged; only the launcher underneath differs:
+Under `launcher: docker`, `srtctl apply` renders the same job script, stages `outputs/<job_id>/` the same way, and runs the script in the foreground on this machine with `SRTCTL_JOB_ID=docker-<timestamp>` in place of `SLURM_JOB_ID`; its output is teed to `logs/sweep_<job_id>.log`. The orchestrator, health checks, benchmarks and postprocessing are unchanged; only the launcher underneath differs:
 
 | | `slurm` | `docker` |
 |---|---|---|
-| Container launch | `srun --container-image ...` (pyxis/enroot) | `docker run --rm --gpus all --network host --ipc host -v <mounts> ...` |
-| Host command (`host_setup`, no container) | `srun` on each node | `bash` on this machine, in its own process group |
+| Nodes | the allocation's nodelist | `docker_hosts`, carved into roles the same way |
+| Container launch | `srun --container-image ...` (pyxis/enroot) | `docker run --rm --gpus all --network host --ipc host -v <mounts> ...` on the node, through `ssh <node>` unless it is this machine |
+| One launch on several nodes (exporters) | one srun task per node | one container per node, started in parallel; `%N` in the log path becomes the node name |
+| Host command (`host_setup`, no container) | `srun` on each node | `bash` on the node (through ssh off this machine) |
 | GPU subset per worker | `CUDA_VISIBLE_DEVICES` from the bash wrapper | same |
-| Graceful stop of a named step | `scancel --signal=TERM --full <job>.<step>` | `docker kill --signal=TERM srtctl_<job>_<step>` (or `killpg` for a host command) |
-| Node and address | the allocation's nodelist, IP on `network_interface` | this host, `127.0.0.1` |
+| Graceful stop of a named step | `scancel --signal=TERM --full <job>.<step>` | `docker kill --signal=TERM srtctl_<job>_<step>` on its node (or `killpg` for a host command on this machine) |
+| Node address | IP on `network_interface`, resolved on the node | the same lookup, run on the node over ssh; `127.0.0.1` with a single host |
 
-Every container sees every GPU and shares the host network, so the per-worker GPU masks and the ports `NodePortAllocator` already hands out to colocated workers keep processes apart. A sweep runs its points one after another. Ctrl+C stops the orchestrator, which stops its containers the same way it stops Slurm steps.
+Every container sees every GPU and shares the host network, so the per-worker GPU masks and the ports `NodePortAllocator` hands out keep processes apart, on one node or across several. A sweep runs its points one after another. Ctrl+C stops the orchestrator, which stops its containers the same way it stops Slurm steps; when the job script exits, any container still labelled with the job (`srtctl.job=<job_id>`) is removed on every node.
 
-[`examples/docker/vllm-agg-1gpu.yaml`](https://github.com/NVIDIA/srt-slurm/blob/main/examples/docker/vllm-agg-1gpu.yaml) is a one-GPU recipe tested this way.
+With more than one host, this machine needs passwordless ssh (`BatchMode`) to every other host, and every path the job mounts (the model, `outputs/`, the srtctl checkout) must exist at the same path on every host, as on a Slurm cluster's shared filesystem. A container on another node takes `HF_TOKEN` and other passed-through variables from that node's login environment.
 
-`launcher: docker` checks the recipe before running it and refuses one that needs more than this machine: more than one node, `resources.het_jobs`, a dedicated frontend, benchmark or infra node, service pools (`services[].nodes`), an engine that launches each endpoint as one multi-task MPI step (TRT-LLM), or a `model.container` / `roles.<role>.container` that is an enroot image file (`.sqsh`) rather than a Docker image name. Enroot URIs such as `nvcr.io#nvidia/x:tag` are rewritten to `nvcr.io/nvidia/x:tag`. Containers run as root unless `docker_args` sets `--user`, so files they write under `outputs/` are root-owned. `srtctl monitor` and the MCP job tools read Slurm and do not see Docker-launcher jobs.
+[`examples/docker/vllm-agg-1gpu.yaml`](https://github.com/NVIDIA/srt-slurm/blob/main/examples/docker/vllm-agg-1gpu.yaml) is a one-GPU recipe; multi-node aggregated and disaggregated recipes run unchanged once `docker_hosts` lists enough nodes.
+
+`launcher: docker` checks the recipe before running it and refuses one it cannot place: more nodes than `docker_hosts` lists, `resources.het_jobs`, an engine that launches each endpoint as one multi-task MPI step (TRT-LLM), or a `model.container` / `roles.<role>.container` that is an enroot image file (`.sqsh`) rather than a Docker image name. Enroot URIs such as `nvcr.io#nvidia/x:tag` are rewritten to `nvcr.io/nvidia/x:tag`. Containers run as root unless `docker_args` sets `--user`, so files they write under `outputs/` are root-owned. `srtctl monitor` and the MCP job tools read Slurm and do not see Docker-launcher jobs.
 
 ### Running without `srtslurm.yaml`
 

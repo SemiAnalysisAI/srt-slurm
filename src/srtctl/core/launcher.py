@@ -1,15 +1,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Where the orchestrator's processes run: a Slurm allocation, or Docker on this machine.
+"""Where the orchestrator's processes run: Slurm steps, or Docker containers.
 
-The ``SweepOrchestrator`` asks a ``Launcher`` for everything it used to ask Slurm
-for directly: start a process (``launch``), signal a named step (``signal_step``),
-list running steps (``list_step_ids``), the job's nodes (``nodes``) and their
-addresses (``node_ip``), the job id (``job_id``), and how a rendered job script is
-submitted (``submit`` / ``start``). ``SlurmLauncher`` is the default and keeps the
-srun/sbatch/scancel behavior; ``DockerLauncher`` (``core/docker.py``) runs one
-job on the current machine, with containers under ``docker run``.
+The ``SweepOrchestrator`` asks a ``Launcher`` for everything that depends on where
+it runs: start a process (``launch``), signal a named step (``signal_step``), list
+running steps (``list_step_ids``), the job's nodes (``nodes``) and their addresses
+(``node_ip``), the job id (``job_id``), and how a rendered job script is submitted
+(``submit`` / ``start``). ``SlurmLauncher`` (``core/slurm.py``) is the default:
+srun steps inside an sbatch allocation. ``DockerLauncher`` (``core/docker.py``)
+runs each process as a ``docker run`` container on its node, over ssh when the
+node is not this machine.
 
 The launcher is picked by the ``launcher`` key of ``srtslurm.yaml``
 (``get_launcher``). Nothing outside the launcher modules branches on that name.
@@ -19,7 +20,6 @@ from __future__ import annotations
 
 import logging
 import shlex
-import shutil
 import subprocess
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
@@ -27,9 +27,6 @@ from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
-
-from srtctl.core import slurm as _slurm
-from srtctl.core.launch_plan import record_srun_command
 
 if TYPE_CHECKING:
     from srtctl.core.runtime import Nodes, RuntimeContext
@@ -40,9 +37,39 @@ logger = logging.getLogger(__name__)
 DEFAULT_LAUNCHER = "slurm"
 
 
+def _get_cluster_bash_preamble() -> str | None:
+    """The cluster-wide ``default_bash_preamble`` from ``srtslurm.yaml``, if set."""
+    from srtctl.core.config import get_srtslurm_setting
+
+    value = get_srtslurm_setting("default_bash_preamble")
+    return value if isinstance(value, str) and value else None
+
+
 @dataclass(frozen=True)
 class LaunchSpec:
-    """One process launch, independent of where it runs. Fields mirror ``start_srun_process``."""
+    """One process launch, independent of where it runs.
+
+    Fields:
+        command: Command to run
+        nodes, ntasks: Node and task counts; ``nodelist`` names the nodes
+        cpus_per_task: CPUs per task
+        output: File that receives the task's stdout and stderr
+        container_image, container_mounts: Container to run in (host path -> container path)
+        env_to_pass_through: Environment variable names to pass through
+        env_to_set: Environment variables to export inside the task before the command
+        env_to_unset: Environment variable names to unset before the preamble and command
+        bash_preamble: Bash commands to run before the main command
+        srun_options: Additional srun options (Slurm only)
+        srun_export_env: Env vars the container runtime sees at creation time
+            (``srun --export=ALL,K=V``, ``docker run -e``); ENROOT_REMAP_ROOT and the
+            like must be set here rather than in ``env_to_set``
+        overlap: ``srun --overlap`` (Slurm only)
+        use_bash_wrapper: Wrap the command in the bash wrapper (``build_task_command``)
+        mpi, oversubscribe, cpu_bind: MPI launch options (TRT-LLM; Slurm only)
+        het_group: Component of a Slurm heterogeneous job
+        step_name: Names the step so it can be found and signalled later
+            (``signal_step``); signalling the tracking process itself only aborts it
+    """
 
     command: list[str]
     nodes: int = 1
@@ -81,7 +108,7 @@ class Launcher(ABC):
         hold the signal until its child exited, so the child was only ever SIGKILLed
         at the cleanup timeout.
         """
-        cluster_preamble = _slurm._get_cluster_bash_preamble()
+        cluster_preamble = _get_cluster_bash_preamble()
         if not spec.use_bash_wrapper:
             if cluster_preamble:
                 logger.warning(
@@ -164,206 +191,11 @@ class Launcher(ABC):
         return []
 
 
-class SlurmLauncher(Launcher):
-    """Processes are Slurm steps (``srun``) inside an ``sbatch`` allocation."""
-
-    name = "slurm"
-
-    def launch(self, spec: LaunchSpec) -> subprocess.Popen:
-        srun_cmd = ["srun"]
-
-        # Run in the same job context.
-        slurm_job_id = _slurm.get_slurm_job_id()
-        if slurm_job_id:
-            srun_cmd.extend(["--jobid", slurm_job_id])
-
-        if spec.overlap:
-            srun_cmd.append("--overlap")
-
-        # MPI options (for TRTLLM)
-        if spec.mpi:
-            srun_cmd.extend(["--mpi", spec.mpi])
-        if spec.oversubscribe:
-            srun_cmd.append("--oversubscribe")
-        if spec.cpu_bind:
-            srun_cmd.append(f"--cpu-bind={spec.cpu_bind}")
-
-        # Arbitrary layouts derive their node count from the repeated host list.
-        if not spec.srun_options or spec.srun_options.get("distribution") != "arbitrary":
-            srun_cmd.extend(["--nodes", str(spec.nodes)])
-        srun_cmd.extend(["--ntasks", str(spec.ntasks)])
-
-        if spec.cpus_per_task:
-            srun_cmd.extend(["--cpus-per-task", str(spec.cpus_per_task)])
-
-        if spec.nodelist:
-            srun_cmd.extend(["--nodelist", ",".join(spec.nodelist)])
-
-        # Route this srun to a specific component of a SLURM heterogeneous job.
-        if spec.het_group is not None:
-            srun_cmd.append(f"--het-group={spec.het_group}")
-
-        if spec.output:
-            srun_cmd.extend(["--output", spec.output])
-
-        if spec.container_image:
-            srun_cmd.extend(["--container-image", str(spec.container_image)])
-            srun_cmd.append("--no-container-entrypoint")
-            srun_cmd.append("--no-container-mount-home")
-            if spec.container_mounts:
-                mount_str = ",".join(f"{host}:{container}" for host, container in spec.container_mounts.items())
-                srun_cmd.extend(["--container-mounts", mount_str])
-
-        if spec.srun_options:
-            for key, value in spec.srun_options.items():
-                if value:
-                    srun_cmd.append(f"--{key}={value}")
-                else:
-                    srun_cmd.append(f"--{key}")
-
-        if spec.step_name:
-            srun_cmd.append(f"--job-name={spec.step_name}")
-
-        # Set env vars in the task environment so the container runtime (enroot/pyxis)
-        # sees them at container-creation time. Prefix ALL to preserve srun's normal
-        # full-environment propagation and only add these on top.
-        if spec.srun_export_env:
-            exports = ",".join(f"{k}={v}" for k, v in spec.srun_export_env.items())
-            srun_cmd.append(f"--export=ALL,{exports}")
-
-        srun_cmd.extend(self.build_task_command(spec))
-
-        # Demoted to debug — every worker srun line is multi-KB once the
-        # fingerprint heredoc is inlined (see core/fingerprint.generate_capture_script).
-        logger.debug("srun command: %s", shlex.join(srun_cmd))
-
-        record_srun_command(
-            srun_cmd,
-            label=Path(spec.output).stem if spec.output else Path(spec.command[0]).name,
-            output=spec.output,
-            nodelist=list(spec.nodelist) if spec.nodelist else None,
-            het_group=spec.het_group,
-            container_image=str(spec.container_image) if spec.container_image else None,
-            env_to_set=spec.env_to_set,
-            srun_export_env=spec.srun_export_env,
-        )
-
-        return subprocess.Popen(
-            srun_cmd,
-            stdout=subprocess.PIPE if not spec.output else None,
-            stderr=subprocess.STDOUT if not spec.output else None,
-            env=None,  # Inherit environment
-        )
-
-    def list_step_ids(self, job_id: str | None = None) -> dict[str, str] | None:
-        job_id = job_id or _slurm.get_slurm_job_id()
-        if not job_id or shutil.which("squeue") is None:
-            return None
-        try:
-            result = subprocess.run(
-                ["squeue", "--steps", f"--jobs={job_id}", "--noheader", "--format=%i %j"],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            logger.warning("squeue --steps failed: %s", exc)
-            return None
-        if result.returncode != 0:
-            logger.warning("squeue --steps exited %d: %s", result.returncode, result.stderr.strip())
-            return None
-        steps: dict[str, str] = {}
-        for line in result.stdout.splitlines():
-            parts = line.split()
-            if len(parts) >= 2:
-                steps.setdefault(parts[1], parts[0])
-        return steps
-
-    def signal_step(
-        self, step_name: str, sig: str = "TERM", *, step_ids: dict[str, str] | None = None, full: bool = True
-    ) -> bool:
-        """``scancel --signal=<sig> [--full] <job>.<step>``.
-
-        ``srun`` turns a SIGTERM aimed at itself into a step abort that SIGKILLs the
-        task, so a process that must flush on SIGTERM has to be signalled through
-        Slurm. With ``full=False`` only the tasks receive the signal.
-        """
-        if shutil.which("scancel") is None:
-            return False  # not under Slurm (tests, the mock): the caller signals srun directly
-        if step_ids is not None:
-            step_id = step_ids.get(step_name)
-        else:
-            steps = self.list_step_ids()
-            step_id = steps.get(step_name) if steps else None
-        if step_id is None:
-            logger.warning("No running step named %s found; falling back to signalling srun", step_name)
-            return False
-        try:
-            result = subprocess.run(
-                ["scancel", f"--signal={sig}", *(["--full"] if full else []), step_id],
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            logger.warning("scancel --signal=%s %s failed: %s", sig, step_id, exc)
-            return False
-        if result.returncode != 0:
-            logger.warning(
-                "scancel --signal=%s %s exited %d: %s", sig, step_id, result.returncode, result.stderr.strip()
-            )
-            return False
-        logger.info("Sent SIG%s to step %s (%s)", sig, step_id, step_name)
-        return True
-
-    def nodes(
-        self,
-        *,
-        frontend_dedicated_node: bool = False,
-        client_dedicated_node: bool = False,
-        etcd_nats_dedicated_node: bool = False,
-        colocate_dedicated_nodes: bool = True,
-        engine_nodes: int | None = None,
-        pools: Sequence[tuple[str, int]] = (),
-    ) -> Nodes:
-        from srtctl.core.runtime import Nodes
-
-        return Nodes.from_slurm(
-            frontend_dedicated_node=frontend_dedicated_node,
-            client_dedicated_node=client_dedicated_node,
-            etcd_nats_dedicated_node=etcd_nats_dedicated_node,
-            colocate_dedicated_nodes=colocate_dedicated_nodes,
-            engine_nodes=engine_nodes,
-            pools=pools,
-        )
-
-    def node_ip(self, hostname: str, network_interface: str | None = None) -> str:
-        return _slurm.resolve_slurm_hostname_ip(hostname, network_interface)
-
-    def job_id(self) -> str | None:
-        return _slurm.get_slurm_job_id()
-
-    def submit(self, script_path: Path) -> str:
-        result = subprocess.run(["sbatch", str(script_path)], capture_output=True, text=True, check=True)
-        return result.stdout.strip().split()[-1]
-
-    def shell_command(self, runtime: RuntimeContext, node: str) -> str:
-        container_args = f"--container-image={runtime.container_image}"
-        mounts_str = ",".join(f"{src}:{dst}" for src, dst in runtime.container_mounts.items())
-        if mounts_str:
-            container_args += f" --container-mounts={mounts_str}"
-        return f"srun {container_args} --jobid {runtime.job_id} -w {node} --overlap --pty bash"
-
-    def status_hint(self, job_id: str) -> str:
-        return f"squeue --job {job_id}"
-
-
 @cache
 def launchers() -> dict[str, type[Launcher]]:
     """Every launcher by its ``srtslurm.yaml`` name."""
     from srtctl.core.docker import DockerLauncher
+    from srtctl.core.slurm import SlurmLauncher
 
     return {cls.name: cls for cls in (SlurmLauncher, DockerLauncher)}
 
@@ -381,3 +213,8 @@ def get_launcher() -> Launcher:
     if name not in launchers():
         raise ValueError(f"srtslurm.yaml launcher: {name!r} is not one of {', '.join(sorted(launchers()))}")
     return _launcher(name)
+
+
+def launch(spec: LaunchSpec) -> subprocess.Popen:
+    """Start ``spec`` with the selected launcher; the one entry point for every process the job runs."""
+    return get_launcher().launch(spec)

@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 from srtctl.core.cpu_power_session import CpuPowerSessionSettings as CpuPowerHostSessionSettings
 from srtctl.core.cpu_power_session import CpuPowerTelemetrySession
 from srtctl.core.git_state import head_commit
+from srtctl.core.launcher import LaunchSpec, launch
 from srtctl.core.power.contract import Reason
 from srtctl.core.power.cpu_session import CpuPowerCollector, CpuPowerSessionSettings
 from srtctl.core.power.manifest import ExpectedWindow
@@ -23,7 +24,6 @@ from srtctl.core.power.session import PowerSessionSettings, PowerTelemetrySessio
 from srtctl.core.power.topology import build_expected_devices
 from srtctl.core.processes import ManagedProcess, ProcessRegistry
 from srtctl.core.schema import TelemetryExporterConfig
-from srtctl.core.slurm import start_srun_process
 from srtctl.core.status import log_stream_interval, tachometer_outbox
 from srtctl.core.telemetry import TACHOMETER_STORAGE_PARENT, ServiceMetricsTarget, generate_tachometer_config
 
@@ -143,17 +143,19 @@ class TelemetryStageMixin:
         for group_id, nodes in chunks:
             het_group = group_id if group_id >= 0 else None
             chunk_log = log_file if len(chunks) == 1 else log_file.with_suffix(f".g{group_id}.out")
-            proc = start_srun_process(
-                command=shlex.split(cmd_str),
-                nodes=len(nodes),
-                ntasks=len(nodes),
-                nodelist=nodes,
-                output=str(chunk_log),
-                container_image=None if host_native else exporter_config.container_image,
-                container_mounts=None if host_native else self.runtime.container_mounts,
-                srun_options=self.runtime.srun_options,
-                het_group=het_group,
-                use_bash_wrapper=use_bash_wrapper,
+            proc = launch(
+                LaunchSpec(
+                    command=shlex.split(cmd_str),
+                    nodes=len(nodes),
+                    ntasks=len(nodes),
+                    nodelist=nodes,
+                    output=str(chunk_log),
+                    container_image=None if host_native else exporter_config.container_image,
+                    container_mounts=None if host_native else self.runtime.container_mounts,
+                    srun_options=self.runtime.srun_options,
+                    het_group=het_group,
+                    use_bash_wrapper=use_bash_wrapper,
+                )
             )
             chunk_name = name if len(chunks) == 1 else f"{name}_g{group_id}"
             process = ManagedProcess(
@@ -300,15 +302,17 @@ class TelemetryStageMixin:
             for group_id, nodes in chunks:
                 suffix = "" if len(chunks) == 1 else f".g{group_id}"
                 log_file = self.runtime.log_dir / f"telemetry_cpu_power_exporter{suffix}.%N.out"
-                proc = start_srun_process(
-                    command=exporter_command,
-                    nodes=len(nodes),
-                    ntasks=len(nodes),
-                    nodelist=nodes,
-                    output=str(log_file),
-                    srun_options=self.runtime.srun_options,
-                    het_group=group_id if group_id >= 0 else None,
-                    use_bash_wrapper=False,  # bare host, no container
+                proc = launch(
+                    LaunchSpec(
+                        command=exporter_command,
+                        nodes=len(nodes),
+                        ntasks=len(nodes),
+                        nodelist=nodes,
+                        output=str(log_file),
+                        srun_options=self.runtime.srun_options,
+                        het_group=group_id if group_id >= 0 else None,
+                        use_bash_wrapper=False,  # bare host, no container
+                    )
                 )
                 name = (
                     "telemetry_cpu_power_exporter" if len(chunks) == 1 else f"telemetry_cpu_power_exporter_g{group_id}"
@@ -390,15 +394,17 @@ class TelemetryStageMixin:
             for group_id, nodes in chunks:
                 suffix = "" if len(chunks) == 1 else f".g{group_id}"
                 log_file = self.runtime.log_dir / f"telemetry_cpu_power{suffix}.%N.out"
-                proc = start_srun_process(
-                    command=command,
-                    nodes=len(nodes),
-                    ntasks=len(nodes),
-                    nodelist=nodes,
-                    output=str(log_file),
-                    srun_options=self.runtime.srun_options,
-                    het_group=group_id if group_id >= 0 else None,
-                    use_bash_wrapper=False,  # bare host, no container
+                proc = launch(
+                    LaunchSpec(
+                        command=command,
+                        nodes=len(nodes),
+                        ntasks=len(nodes),
+                        nodelist=nodes,
+                        output=str(log_file),
+                        srun_options=self.runtime.srun_options,
+                        het_group=group_id if group_id >= 0 else None,
+                        use_bash_wrapper=False,  # bare host, no container
+                    )
                 )
                 process = ManagedProcess(
                     name="telemetry_cpu_power" if len(chunks) == 1 else f"telemetry_cpu_power_g{group_id}",
@@ -677,21 +683,23 @@ class TelemetryStageMixin:
         processes.append(
             ManagedProcess(
                 name="tachometer",
-                popen=start_srun_process(
-                    command=cmd,
-                    nodelist=[self.runtime.nodes.head],
-                    output=str(self.runtime.log_dir / "tachometer.out"),
-                    # Shell-less on purpose: the scraper compacts final.parquet
-                    # on SIGTERM, and srun forwards signals to the task it
-                    # launched. Under the bash wrapper the task is bash, which
-                    # exits without signaling its child — the scraper then dies
-                    # by step SIGKILL with the capture stranded in the arrow
-                    # WAL (hecate job 487539). Env goes via --export instead.
-                    use_bash_wrapper=False,
-                    srun_export_env=srun_export_env,
-                    srun_options=self.runtime.srun_options,
-                    het_group=self.runtime.nodes.het_group_for(self.runtime.nodes.head),
-                    step_name=TACHOMETER_STEP_NAME,
+                popen=launch(
+                    LaunchSpec(
+                        command=cmd,
+                        nodelist=[self.runtime.nodes.head],
+                        output=str(self.runtime.log_dir / "tachometer.out"),
+                        # Shell-less on purpose: the scraper compacts final.parquet
+                        # on SIGTERM, and srun forwards signals to the task it
+                        # launched. Under the bash wrapper the task is bash, which
+                        # exits without signaling its child — the scraper then dies
+                        # by step SIGKILL with the capture stranded in the arrow
+                        # WAL (hecate job 487539). Env goes via --export instead.
+                        use_bash_wrapper=False,
+                        srun_export_env=srun_export_env,
+                        srun_options=self.runtime.srun_options,
+                        het_group=self.runtime.nodes.het_group_for(self.runtime.nodes.head),
+                        step_name=TACHOMETER_STEP_NAME,
+                    )
                 ),
                 log_file=self.runtime.log_dir / "tachometer.out",
                 node=self.runtime.nodes.head,

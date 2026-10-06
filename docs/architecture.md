@@ -442,7 +442,7 @@ flowchart TD
         frontend_impls["DynamoFrontend: srun process, /health JSON, dynamo launch<br/>SGLangRouter: srun process, /workers JSON, direct launch<br/>TRTLLMServe: srun process, bare 200, direct launch<br/>VLLMFrontend: no process, /health + /v1/models, direct launch"]
     end
     subgraph INFRA["Infrastructure layer"]
-        slurm["slurm.py<br/>start_srun_process(), get_slurm_nodelist(), get_hostname_ip()"]
+        slurm["slurm.py<br/>SlurmLauncher, get_slurm_nodelist(), get_hostname_ip()"]
         processes["processes.py<br/>ManagedProcess, ProcessRegistry, signal handlers"]
         health["health.py<br/>wait_for_port(), wait_for_model(), health parsers"]
     end
@@ -496,8 +496,8 @@ sequenceDiagram
 ```mermaid
 flowchart TD
     start["SweepOrchestrator.start_all_workers()"] --> each
-    each["For each Process in backend_processes<br/>1. get endpoint_processes<br/>2. build the bash preamble: custom setup script, Dynamo installation<br/>3. build the worker command: backend.build_worker_command()<br/>4. set HEAD_NODE_IP, ETCD_ENDPOINTS, NATS_SERVER, DYN_SYSTEM_PORT, CUDA_VISIBLE_DEVICES<br/>5. start_srun_process()<br/>6. create a ManagedProcess"] --> srun
-    srun["start_srun_process()<br/>1. build the srun command: --overlap, --nodes, --ntasks, --nodelist, --output, --container-image, --container-mounts<br/>2. wrap it in bash -c: export env vars, run the preamble, execute the main command<br/>3. subprocess.Popen()"]
+    each["For each Process in backend_processes<br/>1. get endpoint_processes<br/>2. build the bash preamble: custom setup script, Dynamo installation<br/>3. build the worker command: backend.build_worker_command()<br/>4. set HEAD_NODE_IP, ETCD_ENDPOINTS, NATS_SERVER, DYN_SYSTEM_PORT, CUDA_VISIBLE_DEVICES<br/>5. launch(LaunchSpec(...))<br/>6. create a ManagedProcess"] --> srun
+    srun["SlurmLauncher.launch()<br/>1. build the srun command: --overlap, --nodes, --ntasks, --nodelist, --output, --container-image, --container-mounts<br/>2. wrap it in bash -c: export env vars, run the preamble, execute the main command<br/>3. subprocess.Popen()"]
 ```
 
 ### Health Check Flow

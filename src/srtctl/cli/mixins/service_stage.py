@@ -40,9 +40,10 @@ import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from srtctl.core.launcher import LaunchSpec, launch
 from srtctl.core.processes import ManagedProcess, ProcessRegistry, terminate_and_reap
 from srtctl.core.readiness import ProcessDied, wait_until_ready
-from srtctl.core.slurm import get_hostname_ip, start_srun_process
+from srtctl.core.slurm import get_hostname_ip
 from srtctl.services.config import ServiceReadinessConfig, TcpProbe
 from srtctl.services.implicit import discovery_env, effective_services
 from srtctl.services.registry import ServiceLaunchContext, get_service_kind
@@ -237,12 +238,14 @@ class ServiceStageMixin:
             "fi"
         )
         logger.info("Cloning service %s source %s@%s on %s", service.name, source.git, source.checkout, node)
-        popen = start_srun_process(
-            command=["bash", "-c", clone_script],
-            nodelist=[node],
-            output=str(clone_log),
-            container_image=None,  # bare host: git and network access are host concerns
-            het_group=self.runtime.nodes.het_group_for(node),
+        popen = launch(
+            LaunchSpec(
+                command=["bash", "-c", clone_script],
+                nodelist=[node],
+                output=str(clone_log),
+                container_image=None,  # bare host: git and network access are host concerns
+                het_group=self.runtime.nodes.het_group_for(node),
+            )
         )
         step = ManagedProcess(
             name=f"service_{service.name}.clone", popen=popen, log_file=clone_log, node=node, critical=False
@@ -263,15 +266,17 @@ class ServiceStageMixin:
             return
         build_log = self.runtime.log_dir / f"service_{service.name}.build.out"
         logger.info("Building service %s: %s", service.name, shlex.join(service.build_command))
-        popen = start_srun_process(
-            command=list(service.build_command),
-            nodelist=[node],
-            output=str(build_log),
-            container_image=self._service_container(service),
-            container_mounts=self.runtime.container_mounts,
-            srun_options=self.runtime.srun_options,
-            het_group=self.runtime.nodes.het_group_for(node),
-            bash_preamble=_await_and_cd(self._container_path(work_dir)),
+        popen = launch(
+            LaunchSpec(
+                command=list(service.build_command),
+                nodelist=[node],
+                output=str(build_log),
+                container_image=self._service_container(service),
+                container_mounts=self.runtime.container_mounts,
+                srun_options=self.runtime.srun_options,
+                het_group=self.runtime.nodes.het_group_for(node),
+                bash_preamble=_await_and_cd(self._container_path(work_dir)),
+            )
         )
         step = ManagedProcess(
             name=f"service_{service.name}.build", popen=popen, log_file=build_log, node=node, critical=False
@@ -325,22 +330,24 @@ class ServiceStageMixin:
         logger.info(
             "Starting service %s (%s) on %s%s: %s", service.name, service.type, ctx.node, attached, shlex.join(command)
         )
-        popen = start_srun_process(
-            command=command,
-            nodelist=[ctx.node],
-            output=str(log_file),
-            container_image=None if host_native else self._service_container(service),
-            container_mounts=None if host_native else self.runtime.container_mounts,
-            # Without the bash wrapper there is no `export`; srun --export carries the env instead.
-            env_to_set=env if kind.use_bash_wrapper else None,
-            srun_export_env=None if kind.use_bash_wrapper else env,
-            bash_preamble=("; ".join(preamble_parts) or None) if kind.use_bash_wrapper else None,
-            cpus_per_task=service.cpus_per_task,
-            cpu_bind=service.cpu_bind,
-            srun_options={**self.runtime.srun_options, **service.srun_options},
-            het_group=self.runtime.nodes.het_group_for(ctx.node),
-            use_bash_wrapper=kind.use_bash_wrapper,
-            step_name=step_name,
+        popen = launch(
+            LaunchSpec(
+                command=command,
+                nodelist=[ctx.node],
+                output=str(log_file),
+                container_image=None if host_native else self._service_container(service),
+                container_mounts=None if host_native else self.runtime.container_mounts,
+                # Without the bash wrapper there is no `export`; srun --export carries the env instead.
+                env_to_set=env if kind.use_bash_wrapper else None,
+                srun_export_env=None if kind.use_bash_wrapper else env,
+                bash_preamble=("; ".join(preamble_parts) or None) if kind.use_bash_wrapper else None,
+                cpus_per_task=service.cpus_per_task,
+                cpu_bind=service.cpu_bind,
+                srun_options={**self.runtime.srun_options, **service.srun_options},
+                het_group=self.runtime.nodes.het_group_for(ctx.node),
+                use_bash_wrapper=kind.use_bash_wrapper,
+                step_name=step_name,
+            )
         )
         return ManagedProcess(
             name=step_name,

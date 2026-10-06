@@ -1,10 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for ``core/launcher.py``: launcher selection, the Docker launcher, and its validation."""
+"""Tests for the launchers: selection (``core/launcher.py``), the Docker launcher (``core/docker.py``), and validation."""
 
 from __future__ import annotations
 
+import shlex
 import socket
 import subprocess
 import time
@@ -16,10 +17,10 @@ import yaml
 
 from srtctl.core import launcher as launcher_mod
 from srtctl.core.docker import DockerLauncher
-from srtctl.core.launcher import LaunchSpec, SlurmLauncher, get_launcher
+from srtctl.core.launcher import LaunchSpec, get_launcher, launch
 from srtctl.core.runtime import Nodes
 from srtctl.core.schema import SrtConfig
-from srtctl.core.slurm import get_hostname_ip, start_srun_process
+from srtctl.core.slurm import SlurmLauncher, get_hostname_ip
 from srtctl.mock import MockOptions, run_mock_sweep
 
 SINGLE_NODE_DISAGG = {
@@ -78,19 +79,19 @@ class TestSelection:
         ):
             get_launcher()
 
-    def test_start_srun_process_goes_through_the_launcher(self):
+    def test_launch_goes_through_the_selected_launcher(self):
         fake = MagicMock()
         with patch.object(launcher_mod, "get_launcher", return_value=fake):
-            start_srun_process(["echo", "hi"], step_name="s", env_to_set={"A": "1"})
+            launch(LaunchSpec(["echo", "hi"], step_name="s", env_to_set={"A": "1"}))
         spec = fake.launch.call_args.args[0]
         assert spec == LaunchSpec(command=["echo", "hi"], step_name="s", env_to_set={"A": "1"})
 
-    def test_hostname_resolution_is_loopback_under_docker(self, cluster):
+    def test_hostname_resolution_is_loopback_on_one_docker_host(self, cluster):
         cluster(launcher="docker")
         assert get_hostname_ip("any-host", "ib0") == "127.0.0.1"
 
 
-class TestLocalDockerCommand:
+class TestDockerCommand:
     def test_container_runs_on_host_network_with_every_gpu(self, docker, cluster):
         cluster(launcher="docker", default_bash_preamble="ulimit -n 4096", docker_args=["--user", "1000:1000"])
         spec = LaunchSpec(
@@ -126,13 +127,9 @@ class TestLocalDockerCommand:
     def test_enroot_image_uris_become_docker_references(self, image):
         assert DockerLauncher.docker_image(image) == "nvcr.io/nvidia/x:1"
 
-    def test_multi_task_launch_is_rejected(self, docker):
-        with pytest.raises(ValueError, match="one task per launch"):
+    def test_more_tasks_than_nodes_is_rejected(self, docker):
+        with pytest.raises(ValueError, match="one task per node"):
             docker.launch(LaunchSpec(command=["true"], ntasks=4))
-
-    def test_other_hosts_are_rejected(self, docker):
-        with pytest.raises(ValueError, match="other-node"):
-            docker.launch(LaunchSpec(command=["true"], nodelist=["other-node"]))
 
     def test_container_step_is_signalled_with_docker_kill(self, docker, cluster):
         cluster(launcher="docker")
@@ -140,7 +137,6 @@ class TestLocalDockerCommand:
         popen.poll.return_value = None
         with (
             patch("srtctl.core.docker.subprocess.Popen", return_value=popen),
-            patch("srtctl.core.docker.shutil.which", return_value="/usr/bin/docker"),
             patch("srtctl.core.docker.subprocess.run", return_value=MagicMock(returncode=0)) as run,
         ):
             docker.launch(LaunchSpec(command=["sleep", "60"], container_image="img:1", step_name="tachometer"))
@@ -155,7 +151,8 @@ class TestLocalDockerCommand:
         with patch("srtctl.core.docker.subprocess.Popen", return_value=popen) as run:
             for _ in range(2):
                 docker.launch(LaunchSpec(command=["true"], container_image="img:1", step_name="benchmark"))
-        names = [call.args[0][call.args[0].index("--name") + 1] for call in run.call_args_list]
+        scripts = [shlex.split(call.args[0][2]) for call in run.call_args_list]
+        names = [script[script.index("--name") + 1] for script in scripts]
         assert names[0] == "srtctl_docker-test_benchmark"
         assert names[1] != names[0]
         assert docker.list_step_ids() == {"benchmark": names[1]}
@@ -164,10 +161,10 @@ class TestLocalDockerCommand:
         cluster(launcher="docker")
         with patch("srtctl.core.docker.subprocess.Popen", return_value=MagicMock()), caplog.at_level("INFO"):
             docker.launch(LaunchSpec(command=["true"], container_image="img:1", step_name="w"))
-        assert any("docker launcher command: docker run" in r.getMessage() for r in caplog.records)
+        assert any("docker launcher command: exec docker run" in r.getMessage() for r in caplog.records)
 
 
-class TestLocalHostProcesses:
+class TestHostProcesses:
     def test_host_command_runs_the_wrapper_and_writes_output(self, docker, cluster, tmp_path):
         cluster(launcher="docker")
         out = tmp_path / "logs" / "host.out"
@@ -199,7 +196,7 @@ class TestLocalHostProcesses:
         assert not docker.signal_step("never-launched", "TERM")
 
 
-class TestLocalPlacement:
+class TestPlacement:
     def test_every_role_is_this_host(self, docker):
         nodes = docker.nodes()
         host = socket.gethostname()
@@ -224,12 +221,84 @@ class TestLocalPlacement:
         assert (tmp_path / "logs" / "sweep_docker-1.log").read_text() == "job=docker-1\n"
 
 
-class TestLocalValidation:
+class TestMultiHost:
+    """``docker_hosts`` lists the job's nodes; ssh reaches the ones that are not this machine."""
+
+    def test_nodes_are_the_docker_hosts(self, docker, cluster):
+        cluster(launcher="docker", docker_hosts=["node-a", "node-b", "node-c"])
+        nodes = docker.nodes()
+        assert (nodes.head, nodes.worker) == ("node-a", ("node-a", "node-b", "node-c"))
+
+    def test_remote_container_runs_through_ssh(self, docker, cluster, tmp_path):
+        cluster(launcher="docker", docker_hosts=[socket.gethostname(), "node-b"])
+        out = tmp_path / "w.out"
+        with patch("srtctl.core.docker.subprocess.Popen", return_value=MagicMock()) as popen:
+            docker.launch(LaunchSpec(command=["vllm"], container_image="img:1", nodelist=["node-b"], output=str(out)))
+        script = shlex.split(popen.call_args.args[0][2])
+        assert script[:6] == ["exec", "ssh", "-n", "-o", "BatchMode=yes", "node-b"]
+        assert shlex.split(script[6])[:2] == ["docker", "run"]
+        assert script[-3:] == [">", str(out), "2>&1"]
+
+    def test_one_task_per_node_runs_in_parallel_with_per_node_output(self, docker, cluster, tmp_path):
+        host = socket.gethostname()
+        cluster(launcher="docker", docker_hosts=[host, "node-b"])
+        with patch("srtctl.core.docker.subprocess.Popen", return_value=MagicMock()) as popen:
+            docker.launch(
+                LaunchSpec(
+                    command=["exporter"],
+                    nodes=2,
+                    ntasks=2,
+                    nodelist=[host, "node-b"],
+                    output=str(tmp_path / "x.%N.out"),
+                )
+            )
+        script = popen.call_args.args[0][2]
+        assert script.endswith(" & wait")
+        assert f"'exec exporter' > {tmp_path}/x.{host}.out 2>&1 & ssh -n -o BatchMode=yes node-b " in script
+        assert f"> {tmp_path}/x.node-b.out 2>&1" in script
+
+    def test_remote_container_is_killed_over_ssh(self, docker, cluster):
+        cluster(launcher="docker", docker_hosts=[socket.gethostname(), "node-b"])
+        popen = MagicMock()
+        popen.poll.return_value = None
+        with (
+            patch("srtctl.core.docker.subprocess.Popen", return_value=popen),
+            patch("srtctl.core.docker.subprocess.run", return_value=MagicMock(returncode=0)) as run,
+        ):
+            docker.launch(LaunchSpec(command=["x"], container_image="img:1", nodelist=["node-b"], step_name="w"))
+            assert docker.signal_step("w", "TERM")
+        assert run.call_args.args[0] == [
+            "ssh",
+            "-n",
+            "-o",
+            "BatchMode=yes",
+            "node-b",
+            "docker kill --signal=TERM srtctl_docker-test_w",
+        ]
+
+    def test_remote_host_process_falls_back_to_the_caller(self, docker, cluster):
+        cluster(launcher="docker", docker_hosts=[socket.gethostname(), "node-b"])
+        popen = MagicMock()
+        popen.poll.return_value = None
+        with patch("srtctl.core.docker.subprocess.Popen", return_value=popen):
+            docker.launch(LaunchSpec(command=["sleep", "60"], nodelist=["node-b"], step_name="h"))
+        assert not docker.signal_step("h", "TERM")
+
+    def test_node_ip_is_resolved_on_the_node(self, docker, cluster):
+        cluster(launcher="docker", docker_hosts=["node-a", "node-b"])
+        result = MagicMock(returncode=0, stdout="10.0.0.2\n", stderr="")
+        with patch("srtctl.core.docker.subprocess.run", return_value=result) as run:
+            assert docker.node_ip("node-b", "eth9") == "10.0.0.2"
+        assert run.call_args.args[0] == ["ssh", "-o", "BatchMode=yes", "node-b", "bash", "-s"]
+        assert run.call_args.kwargs["input"].endswith("get_local_ip eth9\n")
+
+
+class TestValidation:
     def test_single_node_disagg_is_accepted(self, tmp_path, cluster):
         cluster(launcher="docker")
         assert DockerLauncher().validate(_config(tmp_path, SINGLE_NODE_DISAGG)) == []
 
-    def test_multi_node_and_enroot_files_are_rejected(self, tmp_path, cluster):
+    def test_more_nodes_than_docker_hosts_and_enroot_files_are_rejected(self, tmp_path, cluster):
         cluster(launcher="docker")
         image = tmp_path / "vllm.sqsh"
         image.write_text("")
@@ -241,6 +310,14 @@ class TestLocalValidation:
         problems = DockerLauncher().validate(_config(tmp_path, data))
         assert any("needs 2 nodes" in p for p in problems)
         assert any("enroot image file" in p for p in problems)
+
+    def test_multi_node_fits_the_docker_hosts(self, tmp_path, cluster):
+        cluster(launcher="docker", docker_hosts=["node-a", "node-b"])
+        data = {
+            **SINGLE_NODE_DISAGG,
+            "roles": {"prefill": {"nodes": 1, "workers": 1}, "decode": {"nodes": 1, "workers": 1}},
+        }
+        assert DockerLauncher().validate(_config(tmp_path, data)) == []
 
     def test_mpi_step_engines_are_rejected(self, tmp_path, cluster):
         cluster(launcher="docker")

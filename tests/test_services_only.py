@@ -243,7 +243,7 @@ def test_start_tachometer_scrapes_every_service_that_serves_metrics(tmp_path: Pa
     orchestrator = SweepOrchestrator(config=config, runtime=runtime)
     with (
         patch("srtctl.cli.mixins.telemetry_stage.generate_tachometer_config", return_value="") as gen,
-        patch("srtctl.cli.mixins.telemetry_stage.start_srun_process"),
+        patch("srtctl.cli.mixins.telemetry_stage.launch"),
         patch.object(TelemetryStageMixin, "_resolve_tachometer_binary", return_value="/bin/tachometer"),
     ):
         orchestrator.start_tachometer()

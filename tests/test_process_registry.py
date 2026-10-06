@@ -367,7 +367,7 @@ class TestTieredCleanup:
     def test_without_slurm_tools_signal_step_declines_quietly(self):
         from srtctl.core.processes import signal_step
 
-        with patch("srtctl.core.launcher.shutil.which", return_value=None):
+        with patch("srtctl.core.slurm.shutil.which", return_value=None):
             assert signal_step("anything") is False
 
 
@@ -375,7 +375,7 @@ def test_profile_wrapper_uses_task_only_step_signal():
     from srtctl.core.processes import signal_step
 
     with (
-        patch("srtctl.core.launcher.shutil.which", return_value="/bin/scancel"),
+        patch("srtctl.core.slurm.shutil.which", return_value="/bin/scancel"),
         patch("srtctl.core.launcher.subprocess.run", return_value=MagicMock(returncode=0)) as run,
     ):
         assert signal_step("profiled", step_ids={"profiled": "123.4"}, full=False)

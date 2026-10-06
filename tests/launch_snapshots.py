@@ -4,7 +4,7 @@
 """Golden srun launch plans for every runnable recipe under ``examples/``.
 
 Each example runs through the real ``SweepOrchestrator`` under
-``srtctl.mock.run_mock_sweep``; every ``start_srun_process`` call is recorded and
+``srtctl.mock.run_mock_sweep``; every ``launch`` call is recorded and
 rendered with run-specific paths replaced by placeholders. The rendered plans
 live in ``tests/snapshots/launch/`` and ``tests/test_launch_snapshots.py``
 fails when one drifts. Regenerate after an intended change with::

@@ -14,7 +14,6 @@ container_mounts:
     /path/to/models/deepseek-r1-nvfp4: /model
     <model>: /model
     <output>/logs: /logs
-use_bash_wrapper: True
 bash_preamble: |
     rm -rf /tmp/etcd && mkdir -p /tmp/etcd
 command: |
@@ -32,14 +31,12 @@ container_mounts:
     /path/to/models/deepseek-r1-nvfp4: /model
     <model>: /model
     <output>/logs: /logs
-use_bash_wrapper: True
 bash_preamble: |
     rm -rf /tmp/nats && mkdir -p /tmp/nats
 command: |
     /configs/nats-server -js -sd /tmp/nats
 
 ## agg_0_node-01
-nodes: 1
 ntasks: 4
 nodelist: node-01
 output: <output>/logs/node-01_agg_w0.out

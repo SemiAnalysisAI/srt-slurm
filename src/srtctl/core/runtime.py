@@ -71,7 +71,7 @@ class Nodes:
         """Return the het component (0 or 1) a node belongs to, or None.
 
         Returns None for non-het jobs so callers can pass the result directly
-        to ``start_srun_process(het_group=...)`` as a no-op fallback.
+        to ``LaunchSpec(het_group=...)`` as a no-op fallback.
         """
         if not self.het:
             return None

@@ -157,23 +157,29 @@ class TestOrchestrator:
     def test_runs_one_container_less_srun_per_node(self, tmp_path):
         orchestrator = SweepOrchestrator(config=_config(commands=[LOCK_CLOCKS]), runtime=_runtime(tmp_path))
 
-        with patch("srtctl.cli.do_sweep.start_srun_process", return_value=_ok_proc()) as srun:
+        with patch("srtctl.cli.do_sweep.launch", return_value=_ok_proc()) as srun:
             orchestrator._run_host_setup()
 
         assert srun.call_count == 3  # head/infra (node0) + node1 + node2
         for call in srun.call_args_list:
-            assert call.kwargs["container_image"] is None, "host_setup must not run inside the job container"
-            assert call.kwargs["command"] == ["bash", "-c", LOCK_CLOCKS]
-        assert [call.kwargs["nodelist"] for call in srun.call_args_list] == [["node0"], ["node1"], ["node2"]]
+            assert vars(call.args[0])["container_image"] is None, (
+                "host_setup must not run inside the job container"
+            )
+            assert vars(call.args[0])["command"] == ["bash", "-c", LOCK_CLOCKS]
+        assert [vars(call.args[0])["nodelist"] for call in srun.call_args_list] == [
+            ["node0"],
+            ["node1"],
+            ["node2"],
+        ]
 
     def test_workers_scope_skips_head(self, tmp_path):
         config = _config(commands=[LOCK_CLOCKS], nodes="workers")
         orchestrator = SweepOrchestrator(config=config, runtime=_runtime(tmp_path))
 
-        with patch("srtctl.cli.do_sweep.start_srun_process", return_value=_ok_proc()) as srun:
+        with patch("srtctl.cli.do_sweep.launch", return_value=_ok_proc()) as srun:
             orchestrator._run_host_setup()
 
-        assert [call.kwargs["nodelist"] for call in srun.call_args_list] == [["node1"], ["node2"]]
+        assert [vars(call.args[0])["nodelist"] for call in srun.call_args_list] == [["node1"], ["node2"]]
 
     def test_head_node_not_run_twice_when_it_also_hosts_workers(self, tmp_path):
         runtime = RuntimeContext(
@@ -192,19 +198,19 @@ class TestOrchestrator:
         )
         orchestrator = SweepOrchestrator(config=_config(commands=[LOCK_CLOCKS]), runtime=runtime)
 
-        with patch("srtctl.cli.do_sweep.start_srun_process", return_value=_ok_proc()) as srun:
+        with patch("srtctl.cli.do_sweep.launch", return_value=_ok_proc()) as srun:
             orchestrator._run_host_setup()
 
-        assert [call.kwargs["nodelist"] for call in srun.call_args_list] == [["node0"], ["node1"]]
+        assert [vars(call.args[0])["nodelist"] for call in srun.call_args_list] == [["node0"], ["node1"]]
 
     def test_multiple_commands_are_chained(self, tmp_path):
         config = _config(commands=[LOCK_CLOCKS, "sudo -n nvidia-smi -pm 1"])
         orchestrator = SweepOrchestrator(config=config, runtime=_runtime(tmp_path))
 
-        with patch("srtctl.cli.do_sweep.start_srun_process", return_value=_ok_proc()) as srun:
+        with patch("srtctl.cli.do_sweep.launch", return_value=_ok_proc()) as srun:
             orchestrator._run_host_setup()
 
-        assert srun.call_args_list[0].kwargs["command"] == [
+        assert vars(srun.call_args_list[0].args[0])["command"] == [
             "bash",
             "-c",
             f"{LOCK_CLOCKS} && sudo -n nvidia-smi -pm 1",
@@ -213,7 +219,7 @@ class TestOrchestrator:
     def test_disabled_block_launches_nothing(self, tmp_path):
         orchestrator = SweepOrchestrator(config=_config(), runtime=_runtime(tmp_path))
 
-        with patch("srtctl.cli.do_sweep.start_srun_process") as srun:
+        with patch("srtctl.cli.do_sweep.launch") as srun:
             orchestrator._run_host_setup()
 
         srun.assert_not_called()
@@ -224,7 +230,7 @@ class TestOrchestrator:
         orchestrator = SweepOrchestrator(config=_config(commands=[LOCK_CLOCKS]), runtime=_runtime(tmp_path))
 
         with (
-            patch("srtctl.cli.do_sweep.start_srun_process", return_value=proc),
+            patch("srtctl.cli.do_sweep.launch", return_value=proc),
             pytest.raises(RuntimeError, match="host_setup failed on"),
         ):
             orchestrator._run_host_setup()
@@ -235,7 +241,7 @@ class TestOrchestrator:
         config = _config(commands=[LOCK_CLOCKS], ignore_failure=True)
         orchestrator = SweepOrchestrator(config=config, runtime=_runtime(tmp_path))
 
-        with patch("srtctl.cli.do_sweep.start_srun_process", return_value=proc):
+        with patch("srtctl.cli.do_sweep.launch", return_value=proc):
             orchestrator._run_host_setup()  # does not raise
 
     def test_timeout_is_killed_and_fails(self, tmp_path):
@@ -253,7 +259,7 @@ class TestOrchestrator:
         orchestrator = SweepOrchestrator(config=config, runtime=_runtime(tmp_path))
 
         with (
-            patch("srtctl.cli.do_sweep.start_srun_process", return_value=proc),
+            patch("srtctl.cli.do_sweep.launch", return_value=proc),
             pytest.raises(RuntimeError, match="host_setup failed on"),
         ):
             orchestrator._run_host_setup()
@@ -265,7 +271,7 @@ class TestOrchestrator:
         orchestrator = SweepOrchestrator(config=config, runtime=_runtime(tmp_path))
         proc = _ok_proc()
 
-        with patch("srtctl.cli.do_sweep.start_srun_process", return_value=proc):
+        with patch("srtctl.cli.do_sweep.launch", return_value=proc):
             orchestrator._run_host_setup()
 
         proc.wait.assert_called_with(timeout=42)
@@ -276,22 +282,22 @@ class TestTeardown:
         config = _config(commands=[LOCK_CLOCKS], teardown=[RESET_CLOCKS])
         orchestrator = SweepOrchestrator(config=config, runtime=_runtime(tmp_path))
 
-        with patch("srtctl.cli.do_sweep.start_srun_process", return_value=_ok_proc()) as srun:
+        with patch("srtctl.cli.do_sweep.launch", return_value=_ok_proc()) as srun:
             orchestrator._run_host_setup()
             srun.reset_mock()
             orchestrator._run_host_teardown()
 
         assert srun.call_count == 3
         for call in srun.call_args_list:
-            assert call.kwargs["command"] == ["bash", "-c", RESET_CLOCKS]
-            assert call.kwargs["container_image"] is None
+            assert vars(call.args[0])["command"] == ["bash", "-c", RESET_CLOCKS]
+            assert vars(call.args[0])["container_image"] is None
 
     def test_skipped_when_setup_never_ran(self, tmp_path):
         """A job that dies before Stage 0 has not touched the nodes."""
         config = _config(commands=[LOCK_CLOCKS], teardown=[RESET_CLOCKS])
         orchestrator = SweepOrchestrator(config=config, runtime=_runtime(tmp_path))
 
-        with patch("srtctl.cli.do_sweep.start_srun_process") as srun:
+        with patch("srtctl.cli.do_sweep.launch") as srun:
             orchestrator._run_host_teardown()
 
         srun.assert_not_called()
@@ -303,9 +309,9 @@ class TestTeardown:
         config = _config(commands=[LOCK_CLOCKS], teardown=[RESET_CLOCKS], ignore_failure=True)
         orchestrator = SweepOrchestrator(config=config, runtime=_runtime(tmp_path))
 
-        with patch("srtctl.cli.do_sweep.start_srun_process", return_value=setup_proc):
+        with patch("srtctl.cli.do_sweep.launch", return_value=setup_proc):
             orchestrator._run_host_setup()
-        with patch("srtctl.cli.do_sweep.start_srun_process", return_value=_ok_proc()) as srun:
+        with patch("srtctl.cli.do_sweep.launch", return_value=_ok_proc()) as srun:
             orchestrator._run_host_teardown()
 
         assert srun.call_count == 3
@@ -315,16 +321,16 @@ class TestTeardown:
         config = _config(commands=[LOCK_CLOCKS], teardown=[RESET_CLOCKS])
         orchestrator = SweepOrchestrator(config=config, runtime=_runtime(tmp_path))
 
-        with patch("srtctl.cli.do_sweep.start_srun_process", return_value=_ok_proc()):
+        with patch("srtctl.cli.do_sweep.launch", return_value=_ok_proc()):
             orchestrator._run_host_setup()
-        with patch("srtctl.cli.do_sweep.start_srun_process", side_effect=OSError("srun gone")):
+        with patch("srtctl.cli.do_sweep.launch", side_effect=OSError("srun gone")):
             orchestrator._run_host_teardown()  # does not raise
 
     def test_teardown_only_block_still_runs(self, tmp_path):
         config = _config(teardown=[RESET_CLOCKS])
         orchestrator = SweepOrchestrator(config=config, runtime=_runtime(tmp_path))
 
-        with patch("srtctl.cli.do_sweep.start_srun_process", return_value=_ok_proc()) as srun:
+        with patch("srtctl.cli.do_sweep.launch", return_value=_ok_proc()) as srun:
             orchestrator._run_host_setup()
             assert srun.call_count == 0
             orchestrator._run_host_teardown()

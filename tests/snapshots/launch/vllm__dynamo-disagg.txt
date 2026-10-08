@@ -11,7 +11,6 @@ container_mounts:
     <repo>/src/srtctl/runtime_scripts: /srtctl-runtime
     <model>: /model
     <output>/logs: /logs
-use_bash_wrapper: True
 bash_preamble: |
     rm -rf /tmp/etcd && mkdir -p /tmp/etcd
 command: |
@@ -201,7 +200,7 @@ use_bash_wrapper: False
 command: |
     tachometer-scraper --config <output>/logs/tachometer_config.toml --local-dir <output>/logs/tachometer/local --sync-interval 120
 
-## <unnamed>
+## benchmark
 nodelist: node-01
 output: <output>/logs/benchmark.out
 container_image: vllm

@@ -505,16 +505,16 @@ def test_sglang_router_starts_only_after_workers_are_healthy(tmp_path, ready):
         probed.append(url)
         return SimpleNamespace(status_code=200 if ready else 503)
 
-    def launch(**kwargs):
+    def launch(spec):
         assert probed == ["http://10.0.0.1:30000/health", "http://10.0.0.2:30000/health"]
-        assert kwargs["srun_options"] == {"mem": "0"}
+        assert spec.srun_options == {"mem": "0"}
         return MagicMock()
 
     with (
         patch("srtctl.frontends.sglang.get_hostname_ip", side_effect=address),
         patch("srtctl.core.health.requests.get", side_effect=probe),
         patch("srtctl.core.health.time.sleep", side_effect=lambda _: stop.set()),
-        patch("srtctl.frontends.sglang.start_srun_process", side_effect=launch) as start,
+        patch("srtctl.frontends.sglang.launch", side_effect=launch) as start,
     ):
         frontend = SGLangRouterFrontend()
         args = (MockTopology(["node0"]), runtime, config, SGLangBackend(), workers)
@@ -531,7 +531,7 @@ def test_sglang_router_starts_only_after_workers_are_healthy(tmp_path, ready):
 class TestSGLangGrpcScheme:
     """Tests for gRPC/HTTP scheme selection in SGLang frontend."""
 
-    @patch("srtctl.frontends.sglang.start_srun_process")
+    @patch("srtctl.frontends.sglang.launch")
     @patch("srtctl.frontends.sglang.get_hostname_ip")
     def test_http_scheme_by_default(self, mock_get_ip, mock_srun):
         """Default scheme is http:// when gRPC not enabled."""
@@ -564,15 +564,15 @@ class TestSGLangGrpcScheme:
 
         frontend.start_frontends(topology, runtime, config, backend, processes)
 
-        # Check the command passed to start_srun_process
+        # Check the command passed to launch
         call_args = mock_srun.call_args
-        cmd = call_args.kwargs["command"]
+        cmd = vars(call_args.args[0])["command"]
 
         # Should use http:// scheme
         assert any("http://10.0.0.1:30000" in arg for arg in cmd)
         assert not any("grpc://" in arg for arg in cmd)
 
-    @patch("srtctl.frontends.sglang.start_srun_process")
+    @patch("srtctl.frontends.sglang.launch")
     @patch("srtctl.frontends.sglang.get_hostname_ip")
     def test_grpc_scheme_when_enabled(self, mock_get_ip, mock_srun):
         """gRPC scheme used when backend has grpc-mode enabled."""
@@ -606,12 +606,12 @@ class TestSGLangGrpcScheme:
         frontend.start_frontends(topology, runtime, config, backend, processes)
 
         call_args = mock_srun.call_args
-        cmd = call_args.kwargs["command"]
+        cmd = vars(call_args.args[0])["command"]
 
         # Should use grpc:// scheme for agg
         assert any("grpc://10.0.0.1:30000" in arg for arg in cmd)
 
-    @patch("srtctl.frontends.sglang.start_srun_process")
+    @patch("srtctl.frontends.sglang.launch")
     @patch("srtctl.frontends.sglang.get_hostname_ip")
     def test_disaggregated_mode_command(self, mock_get_ip, mock_srun):
         """Disaggregated mode uses --pd-disaggregation with --prefill and --decode."""
@@ -646,7 +646,7 @@ class TestSGLangGrpcScheme:
         frontend.start_frontends(topology, runtime, config, backend, processes)
 
         call_args = mock_srun.call_args
-        cmd = call_args.kwargs["command"]
+        cmd = vars(call_args.args[0])["command"]
 
         # Check disaggregated mode flags
         assert "--pd-disaggregation" in cmd
@@ -657,7 +657,7 @@ class TestSGLangGrpcScheme:
         assert "http://10.0.0.1:30000" in cmd
         assert "http://10.0.0.2:30000" in cmd
 
-    @patch("srtctl.frontends.sglang.start_srun_process")
+    @patch("srtctl.frontends.sglang.launch")
     @patch("srtctl.frontends.sglang.get_hostname_ip")
     def test_aggregated_mode_command(self, mock_get_ip, mock_srun):
         """Aggregated mode uses --worker-urls."""
@@ -688,7 +688,7 @@ class TestSGLangGrpcScheme:
         frontend.start_frontends(topology, runtime, config, backend, processes)
 
         call_args = mock_srun.call_args
-        cmd = call_args.kwargs["command"]
+        cmd = vars(call_args.args[0])["command"]
 
         # Check aggregated mode flags
         assert "--worker-urls" in cmd
@@ -703,10 +703,10 @@ class TestSGLangGrpcScheme:
 class TestFrontendEnvHandling:
     """Tests for frontend environment variable handling."""
 
-    @patch("srtctl.frontends.sglang.start_srun_process")
+    @patch("srtctl.frontends.sglang.launch")
     @patch("srtctl.frontends.sglang.get_hostname_ip")
     def test_sglang_env_passed_to_process(self, mock_get_ip, mock_srun):
-        """SGLang frontend passes env dict to start_srun_process."""
+        """SGLang frontend passes env dict to launch."""
         mock_get_ip.return_value = "10.0.0.1"
         mock_srun.return_value = MagicMock()
 
@@ -733,13 +733,13 @@ class TestFrontendEnvHandling:
         frontend.start_frontends(topology, runtime, config, backend, processes)
 
         call_args = mock_srun.call_args
-        env_to_set = call_args.kwargs.get("env_to_set")
+        env_to_set = vars(call_args.args[0]).get("env_to_set")
 
         assert env_to_set is not None
         assert env_to_set["MY_VAR"] == "my_value"
         assert env_to_set["ANOTHER"] == "123"
 
-    @patch("srtctl.frontends.sglang.start_srun_process")
+    @patch("srtctl.frontends.sglang.launch")
     @patch("srtctl.frontends.sglang.get_hostname_ip")
     def test_sglang_runtime_srun_options_passed_to_process(self, mock_get_ip, mock_srun):
         """Static routers inherit runtime-level Slurm launch options."""
@@ -772,9 +772,9 @@ class TestFrontendEnvHandling:
             [MockProcess(node="node1", endpoint_mode="agg", http_port=30000)],
         )
 
-        assert mock_srun.call_args.kwargs["srun_options"] == runtime.srun_options
+        assert vars(mock_srun.call_args.args[0])["srun_options"] == runtime.srun_options
 
-    @patch("srtctl.frontends.sglang.start_srun_process")
+    @patch("srtctl.frontends.sglang.launch")
     @patch("srtctl.frontends.sglang.get_hostname_ip")
     def test_sglang_no_env_when_empty(self, mock_get_ip, mock_srun):
         """SGLang frontend passes None for env when not configured."""
@@ -804,12 +804,12 @@ class TestFrontendEnvHandling:
         frontend.start_frontends(topology, runtime, config, backend, processes)
 
         call_args = mock_srun.call_args
-        env_to_set = call_args.kwargs.get("env_to_set")
+        env_to_set = vars(call_args.args[0]).get("env_to_set")
 
         # Should be None when no env configured
         assert env_to_set is None
 
-    @patch("srtctl.frontends.sglang.start_srun_process")
+    @patch("srtctl.frontends.sglang.launch")
     @patch("srtctl.frontends.sglang.get_hostname_ip")
     def test_sglang_frontend_args_in_command(self, mock_get_ip, mock_srun):
         """SGLang frontend includes args in command."""
@@ -839,7 +839,7 @@ class TestFrontendEnvHandling:
         frontend.start_frontends(topology, runtime, config, backend, processes)
 
         call_args = mock_srun.call_args
-        cmd = call_args.kwargs["command"]
+        cmd = vars(call_args.args[0])["command"]
 
         assert "--policy" in cmd
         assert "cache_aware" in cmd
@@ -849,7 +849,7 @@ class TestFrontendEnvHandling:
 class TestNumaBind:
     """frontend.numa_bind prefixes the frontend process command with numactl."""
 
-    @patch("srtctl.frontends.sglang.start_srun_process")
+    @patch("srtctl.frontends.sglang.launch")
     @patch("srtctl.frontends.sglang.get_hostname_ip")
     def test_static_router_prefixed_when_enabled(self, mock_get_ip, mock_srun):
         mock_get_ip.return_value = "10.0.0.1"
@@ -872,10 +872,10 @@ class TestNumaBind:
 
         frontend.start_frontends(topology, runtime, config, backend, processes)
 
-        cmd = mock_srun.call_args.kwargs["command"]
+        cmd = vars(mock_srun.call_args.args[0])["command"]
         assert cmd[:3] == ["numactl", "--cpunodebind=0", "--membind=0"]
 
-    @patch("srtctl.frontends.sglang.start_srun_process")
+    @patch("srtctl.frontends.sglang.launch")
     @patch("srtctl.frontends.sglang.get_hostname_ip")
     def test_static_router_not_prefixed_by_default(self, mock_get_ip, mock_srun):
         mock_get_ip.return_value = "10.0.0.1"
@@ -898,7 +898,7 @@ class TestNumaBind:
 
         frontend.start_frontends(topology, runtime, config, backend, processes)
 
-        cmd = mock_srun.call_args.kwargs["command"]
+        cmd = vars(mock_srun.call_args.args[0])["command"]
         assert "numactl" not in cmd
 
     def test_dynamo_frontend_prefixed_when_enabled(self):
@@ -920,11 +920,11 @@ class TestNumaBind:
             ),
             setup_script=None,
         )
-        with patch("srtctl.frontends.dynamo.start_srun_process") as mock_srun:
+        with patch("srtctl.frontends.dynamo.launch") as mock_srun:
             mock_srun.return_value = MagicMock()
             frontend.start_frontends(topology, runtime, config, MagicMock(), [])
 
-        cmd = mock_srun.call_args.kwargs["command"]
+        cmd = vars(mock_srun.call_args.args[0])["command"]
         assert cmd[:3] == ["numactl", "--cpunodebind=0", "--membind=0"]
         assert "dynamo.frontend" in cmd
 
@@ -953,10 +953,10 @@ def test_dynamo_frontend_is_a_named_step_with_a_drain_timeout():
         dynamo=SimpleNamespace(install=False, get_install_commands=lambda: "", request_plane="tcp", event_plane=None),
         setup_script=None,
     )
-    with patch("srtctl.frontends.dynamo.start_srun_process") as mock_srun:
+    with patch("srtctl.frontends.dynamo.launch") as mock_srun:
         mock_srun.return_value = MagicMock()
         (proc,) = frontend.start_frontends(topology, runtime, config, MagicMock(), [])
-    assert mock_srun.call_args.kwargs["step_name"] == "frontend_0"
+    assert vars(mock_srun.call_args.args[0])["step_name"] == "frontend_0"
     assert proc.step_name == "frontend_0"
     assert proc.terminate_timeout == FRONTEND_TERMINATE_TIMEOUT_SECONDS
 
@@ -984,7 +984,7 @@ def _dynamo_frontend_call(*, dynamo_install: bool, event_plane: str | None = "zm
         ),
         setup_script=None,
     )
-    with patch("srtctl.frontends.dynamo.start_srun_process") as mock_srun:
+    with patch("srtctl.frontends.dynamo.launch") as mock_srun:
         mock_srun.return_value = MagicMock()
         frontend.start_frontends(topology, runtime, config, MagicMock(), [])
     return mock_srun
@@ -995,11 +995,11 @@ class TestDynamoFrontendRemapRoot:
 
     def test_injects_remap_root_when_install(self):
         mock_srun = _dynamo_frontend_call(dynamo_install=True)
-        assert mock_srun.call_args.kwargs["srun_export_env"] == {"ENROOT_REMAP_ROOT": "yes"}
+        assert vars(mock_srun.call_args.args[0])["srun_export_env"] == {"ENROOT_REMAP_ROOT": "yes"}
 
     def test_no_remap_root_when_install_false(self):
         mock_srun = _dynamo_frontend_call(dynamo_install=False)
-        assert mock_srun.call_args.kwargs["srun_export_env"] is None
+        assert vars(mock_srun.call_args.args[0])["srun_export_env"] is None
 
 
 class TestDynamoFrontendEventPlane:
@@ -1007,17 +1007,17 @@ class TestDynamoFrontendEventPlane:
 
     def test_default_not_injected(self):
         mock_srun = _dynamo_frontend_call(dynamo_install=False, event_plane=None)
-        assert "DYN_EVENT_PLANE" not in mock_srun.call_args.kwargs["env_to_set"]
+        assert "DYN_EVENT_PLANE" not in vars(mock_srun.call_args.args[0])["env_to_set"]
 
     def test_control_plane_uses_routable_infra_ip(self):
-        env = _dynamo_frontend_call(dynamo_install=False, event_plane="nats").call_args.kwargs["env_to_set"]
+        env = vars(_dynamo_frontend_call(dynamo_install=False, event_plane="nats").call_args.args[0])["env_to_set"]
         assert env["NATS_SERVER"] == "nats://10.0.0.9:4222"
         assert env["ETCD_ENDPOINTS"] == "http://10.0.0.9:2379"
 
     @pytest.mark.parametrize("event_plane", ["zmq", "nats"])
     def test_explicit_injected(self, event_plane):
         mock_srun = _dynamo_frontend_call(dynamo_install=False, event_plane=event_plane)
-        assert mock_srun.call_args.kwargs["env_to_set"]["DYN_EVENT_PLANE"] == event_plane
+        assert vars(mock_srun.call_args.args[0])["env_to_set"]["DYN_EVENT_PLANE"] == event_plane
 
 
 def test_dynamo_frontend_materializes_inline_worker_selection(tmp_path):
@@ -1061,13 +1061,13 @@ def test_dynamo_frontend_materializes_inline_worker_selection(tmp_path):
         setup_script=None,
     )
 
-    with patch("srtctl.frontends.dynamo.start_srun_process") as mock_srun:
+    with patch("srtctl.frontends.dynamo.launch") as mock_srun:
         mock_srun.return_value = MagicMock()
         frontend.start_frontends(topology, runtime, config, MagicMock(), [])
 
     policy_path = tmp_path / "router_policy_config.yaml"
     assert yaml.safe_load(policy_path.read_text()) == {"worker_selection": worker_selection}
-    cmd = mock_srun.call_args.kwargs["command"]
+    cmd = vars(mock_srun.call_args.args[0])["command"]
     policy_arg = cmd.index("--router-policy-config")
     assert cmd[policy_arg + 1] == "/logs/router_policy_config.yaml"
     assert cmd[cmd.index("--router-mode") + 1] == "kv"

@@ -13,7 +13,6 @@ container_mounts:
     <output>/logs: /logs
 env_to_set:
     ETCD_ENDPOINTS: http://127.0.0.1:2379
-use_bash_wrapper: True
 bash_preamble: |
     ulimit -l unlimited
 command: |
@@ -30,7 +29,6 @@ container_mounts:
     <output>/logs: /logs
 env_to_set:
     ETCD_ENDPOINTS: http://127.0.0.1:2379
-use_bash_wrapper: True
 bash_preamble: |
     ulimit -l unlimited
 command: |
@@ -47,7 +45,6 @@ container_mounts:
     <output>/logs: /logs
 env_to_set:
     ETCD_ENDPOINTS: http://127.0.0.1:2379
-use_bash_wrapper: True
 bash_preamble: |
     ulimit -l unlimited
 command: |
@@ -176,7 +173,7 @@ use_bash_wrapper: False
 command: |
     tachometer-scraper --config <output>/logs/tachometer_config.toml --local-dir <output>/logs/tachometer/local --sync-interval 120
 
-## <unnamed>
+## benchmark
 nodelist: node-01
 output: <output>/logs/benchmark.out
 container_image: sglang-lmcache

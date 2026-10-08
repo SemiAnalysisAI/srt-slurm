@@ -11,7 +11,6 @@ container_mounts:
     <repo>/src/srtctl/runtime_scripts: /srtctl-runtime
     <model>: /model
     <output>/logs: /logs
-use_bash_wrapper: True
 bash_preamble: |
     rm -rf /tmp/etcd && mkdir -p /tmp/etcd
 command: |
@@ -30,7 +29,6 @@ env_to_set:
     CUDA_VISIBLE_DEVICES: 0
     ETCD_ENDPOINTS: http://127.0.0.1:2379
     GMS_SOCKET_DIR: /dev/shm/srtctl-4242/agg_0
-use_bash_wrapper: True
 command: |
     bash -c 'set -u
     dir=/dev/shm/srtctl-4242/agg_0
@@ -87,7 +85,6 @@ env_to_set:
     CUDA_VISIBLE_DEVICES: 1
     ETCD_ENDPOINTS: http://127.0.0.1:2379
     GMS_SOCKET_DIR: /dev/shm/srtctl-4242/agg_1
-use_bash_wrapper: True
 command: |
     bash -c 'set -u
     dir=/dev/shm/srtctl-4242/agg_1

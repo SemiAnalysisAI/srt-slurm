@@ -21,6 +21,7 @@ from srtctl.backends.trtllm import TRTLLMBackend
 from srtctl.core.fingerprint import format_identity_verification, verify_identity
 from srtctl.core.health import wait_for_model
 from srtctl.core.ip_utils import url_host
+from srtctl.core.launcher import LaunchSpec, launch
 from srtctl.core.lockfile import collect_worker_fingerprints
 from srtctl.core.log_stream import LogOutputStreamer
 from srtctl.core.observability_nsys import benchmark_nsys_env
@@ -29,7 +30,7 @@ from srtctl.core.power.contract import (
     WINDOWS_DIRNAME,
 )
 from srtctl.core.processes import terminate_and_reap
-from srtctl.core.slurm import get_hostname_ip, start_srun_process
+from srtctl.core.slurm import get_hostname_ip
 from srtctl.core.status import JobStage, JobStatus, StatusReporter
 from srtctl.frontends import FRONTEND_NONE, get_frontend
 from srtctl.ports import FRONTEND_PUBLIC_PORT, SGLANG_HTTP_PORT_BASE
@@ -37,6 +38,7 @@ from srtctl.runtime_scripts.nsys_window import finish as finish_nsys_windows
 
 _BENCHMARK_TERMINATE_TIMEOUT = 15.0
 _BENCHMARK_KILL_TIMEOUT = 10.0
+_BENCHMARK_STEP = "benchmark"
 # How often manual mode checks for failures and for terminal services finishing.
 MANUAL_POLL_SECONDS = 5.0
 
@@ -519,15 +521,18 @@ class BenchmarkStageMixin:
             host_sampler = try_start_host_sampler(self.runtime.log_dir, observability, stop_event)
 
         bench_node = self._benchmark_node()
-        proc = start_srun_process(
-            command=cmd,
-            nodelist=[bench_node],
-            output=str(log_file),
-            container_image=str(container_image),
-            container_mounts=container_mounts,
-            env_to_set=env_to_set,
-            srun_options=self.runtime.srun_options,
-            het_group=self.runtime.nodes.het_group_for(bench_node),
+        proc = launch(
+            LaunchSpec(
+                command=cmd,
+                step_name=_BENCHMARK_STEP,
+                nodelist=[bench_node],
+                output=str(log_file),
+                container_image=str(container_image),
+                container_mounts=container_mounts,
+                env_to_set=env_to_set,
+                srun_options=self.runtime.srun_options,
+                het_group=self.runtime.nodes.het_group_for(bench_node),
+            )
         )
 
         # The signal handler raises SystemExit, so only finally can establish
@@ -567,6 +572,7 @@ class BenchmarkStageMixin:
             if proc.poll() is None:
                 outcome = terminate_and_reap(
                     proc,
+                    step_name=_BENCHMARK_STEP,
                     terminate_timeout=_BENCHMARK_TERMINATE_TIMEOUT,
                     kill_timeout=_BENCHMARK_KILL_TIMEOUT,
                 )

@@ -27,9 +27,9 @@ from typing import TYPE_CHECKING, Any
 from srtctl.benchmarks.base import SCRIPTS_DIR
 from srtctl.core.config import load_cluster_config
 from srtctl.core.git_state import GIT_STATE_FILENAME
+from srtctl.core.launcher import LaunchSpec, launch
 from srtctl.core.lockfile import collect_worker_fingerprints, generate_reproduction_report, write_lockfile
 from srtctl.core.schema import DEFAULT_S3_ARCHIVE, DEFAULT_S3_EXCLUDE, AIAnalysisConfig, S3Config
-from srtctl.core.slurm import start_srun_process
 
 if TYPE_CHECKING:
     from srtctl.core.runtime import RuntimeContext
@@ -454,14 +454,16 @@ class PostProcessStageMixin:
 
         try:
             logger.info("Uploading the log directory to %s...", s3_url)
-            proc = start_srun_process(
-                command=["bash", "-c", script],
-                nodelist=[self.runtime.nodes.head],
-                output=str(self.runtime.log_dir / "postprocess.log"),
-                container_image="python:3.11",
-                container_mounts={self.runtime.log_dir: Path("/logs")},
-                env_to_set=env,
-                het_group=self.runtime.nodes.het_group_for(self.runtime.nodes.head),
+            proc = launch(
+                LaunchSpec(
+                    command=["bash", "-c", script],
+                    nodelist=[self.runtime.nodes.head],
+                    output=str(self.runtime.log_dir / "postprocess.log"),
+                    container_image="python:3.11",
+                    container_mounts={self.runtime.log_dir: Path("/logs")},
+                    env_to_set=env,
+                    het_group=self.runtime.nodes.het_group_for(self.runtime.nodes.head),
+                )
             )
             proc.wait(timeout=600)  # 10 min for the awscli install plus a full sync
 
@@ -616,14 +618,16 @@ echo "AI analysis complete."
         logger.info("Starting Claude Code analysis (log: %s)", analysis_log)
 
         try:
-            proc = start_srun_process(
-                command=["bash", "-c", script],
-                nodelist=[self.runtime.nodes.head],
-                output=str(analysis_log),
-                container_image="python:3.11",
-                container_mounts={self.runtime.log_dir: Path("/logs")},
-                env_to_set=env_to_set,
-                het_group=self.runtime.nodes.het_group_for(self.runtime.nodes.head),
+            proc = launch(
+                LaunchSpec(
+                    command=["bash", "-c", script],
+                    nodelist=[self.runtime.nodes.head],
+                    output=str(analysis_log),
+                    container_image="python:3.11",
+                    container_mounts={self.runtime.log_dir: Path("/logs")},
+                    env_to_set=env_to_set,
+                    het_group=self.runtime.nodes.het_group_for(self.runtime.nodes.head),
+                )
             )
 
             # Wait for completion with timeout (15 minutes for install + analysis)

@@ -21,7 +21,8 @@ from srtctl.core.health import (
     wait_for_http_endpoints,
     wait_for_port,
 )
-from srtctl.core.slurm import get_hostname_ip, start_srun_process
+from srtctl.core.launcher import LaunchSpec, launch
+from srtctl.core.slurm import get_hostname_ip
 from srtctl.frontends.base import Frontend, numactl_prefix
 
 if TYPE_CHECKING:
@@ -182,7 +183,7 @@ class StaticRouterFrontend(Frontend):
 
     def start_process(self, **kwargs: Any) -> Any:
         """Launch one router process; split out for adapter-specific tests."""
-        return start_srun_process(**kwargs)
+        return launch(LaunchSpec(**kwargs))
 
     def build_bash_preamble(self, config: Any) -> str | None:
         """Return adapter-specific shell setup to run before the router."""

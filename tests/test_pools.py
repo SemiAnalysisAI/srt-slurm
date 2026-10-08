@@ -271,13 +271,13 @@ def test_pool_placeholders_point_at_the_pool_not_the_job_head(tmp_path: Path) ->
     popen = MagicMock()
     popen.poll.return_value = None
     with (
-        patch("srtctl.cli.mixins.service_stage.start_srun_process", return_value=popen) as srun,
+        patch("srtctl.cli.mixins.service_stage.launch", return_value=popen) as srun,
         patch("srtctl.cli.mixins.service_stage.wait_until_ready", return_value=True),
         patch("srtctl.cli.mixins.service_stage.get_hostname_ip", side_effect=lambda host, iface=None: IPS[host]),
     ):
         orchestrator.start_services("before_workers")
 
-    calls = {call.kwargs["nodelist"][0]: call.kwargs for call in srun.call_args_list}
+    calls = {vars(call.args[0])["nodelist"][0]: vars(call.args[0]) for call in srun.call_args_list}
     assert sorted(calls) == ["n2", "n3"], "one instance per node of the train pool"
     for rank, node in enumerate(("n2", "n3")):
         rendered = " ".join(calls[node]["command"])

@@ -11,15 +11,12 @@ container_mounts:
     <repo>/src/srtctl/runtime_scripts: /srtctl-runtime
     <model>: /model
     <output>/logs: /logs
-use_bash_wrapper: True
 bash_preamble: |
     rm -rf /tmp/etcd && mkdir -p /tmp/etcd
 command: |
     /configs/etcd --data-dir /tmp/etcd --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls http://127.0.0.1:2379
 
 ## prefill_0_node-01
-nodes: 1
-ntasks: 1
 nodelist: node-01
 output: <output>/logs/node-01_prefill_w0.out
 container_image: trtllm
@@ -56,8 +53,6 @@ command: |
     trtllm-llmapi-launch python3 -m dynamo.trtllm --model-path /model --served-model-name Qwen/Qwen3-0.6B --disaggregation-mode prefill --extra-engine-args /logs/trtllm_config_prefill.yaml --request-plane tcp --publish-metrics
 
 ## decode_0_node-02
-nodes: 1
-ntasks: 1
 nodelist: node-02
 output: <output>/logs/node-02_decode_w0.out
 container_image: trtllm
@@ -209,7 +204,7 @@ use_bash_wrapper: False
 command: |
     tachometer-scraper --config <output>/logs/tachometer_config.toml --local-dir <output>/logs/tachometer/local --sync-interval 120
 
-## <unnamed>
+## benchmark
 nodelist: node-01
 output: <output>/logs/benchmark.out
 container_image: trtllm

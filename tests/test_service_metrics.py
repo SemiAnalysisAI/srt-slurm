@@ -257,7 +257,7 @@ def test_implied_gpu_exporter_is_scraped_with_its_power_mapping(tmp_path: Path) 
 def test_generated_config_carries_the_targets(tmp_path: Path) -> None:
     orchestrator = SweepOrchestrator(config=_load(), runtime=_runtime(tmp_path))
     with (
-        patch("srtctl.cli.mixins.telemetry_stage.start_srun_process"),
+        patch("srtctl.cli.mixins.telemetry_stage.launch"),
         patch.object(TelemetryStageMixin, "_resolve_tachometer_binary", return_value="/bin/tachometer"),
     ):
         orchestrator.start_tachometer()

@@ -16,9 +16,10 @@ import yaml
 
 from srtctl.backends.vllm import VLLMBackend
 from srtctl.core.health import WorkerHealthResult, check_dynamo_health
+from srtctl.core.launcher import LaunchSpec, launch
 from srtctl.core.observability_nsys import wrap_observability_nsys
 from srtctl.core.schema import build_otel_env
-from srtctl.core.slurm import CONTAINER_REMAP_ROOT_EXPORT, start_srun_process
+from srtctl.core.slurm import CONTAINER_REMAP_ROOT_EXPORT
 from srtctl.frontends.base import logical_health_expectations, numactl_prefix, register_frontend
 from srtctl.frontends.dynamic_frontend import DynamicFrontend
 from srtctl.services.config import ServiceConfig
@@ -256,22 +257,24 @@ class DynamoFrontend(DynamicFrontend):
             bash_preamble = self._build_preamble(config)
 
             step_name = f"frontend_{idx}"
-            proc = start_srun_process(
-                command=cmd,
-                nodelist=[node],
-                output=str(frontend_log),
-                container_image=str(runtime.container_image),
-                container_mounts=runtime.container_mounts,
-                env_to_set=env_to_set,
-                bash_preamble=bash_preamble,
-                # Frontend container runs the dynamo install (see _build_preamble), whose
-                # cold build needs root inside the container. Remap via enroot env var.
-                srun_export_env=CONTAINER_REMAP_ROOT_EXPORT if config.dynamo.install else None,
-                # TODO(jthomson): I don't have the faintest clue of
-                # why this is needed in later versions of Dynamo, but it is.
-                mpi="pmix",
-                het_group=runtime.nodes.het_group_for(node),
-                step_name=step_name,
+            proc = launch(
+                LaunchSpec(
+                    command=cmd,
+                    nodelist=[node],
+                    output=str(frontend_log),
+                    container_image=str(runtime.container_image),
+                    container_mounts=runtime.container_mounts,
+                    env_to_set=env_to_set,
+                    bash_preamble=bash_preamble,
+                    # Frontend container runs the dynamo install (see _build_preamble), whose
+                    # cold build needs root inside the container. Remap via enroot env var.
+                    srun_export_env=CONTAINER_REMAP_ROOT_EXPORT if config.dynamo.install else None,
+                    # TODO(jthomson): I don't have the faintest clue of
+                    # why this is needed in later versions of Dynamo, but it is.
+                    mpi="pmix",
+                    het_group=runtime.nodes.het_group_for(node),
+                    step_name=step_name,
+                )
             )
 
             processes.append(

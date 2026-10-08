@@ -636,8 +636,8 @@ class TestS3UploadFaultTolerance:
         # Mock S3 config
         mixin._get_s3_config = MagicMock(return_value=S3Config(bucket="test-bucket"))
 
-        # Mock start_srun_process to raise
-        with patch("srtctl.cli.mixins.postprocess_stage.start_srun_process") as mock_srun:
+        # Mock launch to raise
+        with patch("srtctl.cli.mixins.postprocess_stage.launch") as mock_srun:
             mock_srun.side_effect = Exception("SLURM is down")
 
             result = mixin._run_postprocess_container()
@@ -653,12 +653,12 @@ class TestS3UploadFaultTolerance:
         # Mock S3 config
         mixin._get_s3_config = MagicMock(return_value=S3Config(bucket="test-bucket"))
 
-        # Mock start_srun_process to return a process that times out
+        # Mock launch to return a process that times out
         mock_proc = MagicMock()
         mock_proc.wait.side_effect = subprocess.TimeoutExpired(cmd="test", timeout=600)
         mock_proc.kill = MagicMock()
 
-        with patch("srtctl.cli.mixins.postprocess_stage.start_srun_process") as mock_srun:
+        with patch("srtctl.cli.mixins.postprocess_stage.launch") as mock_srun:
             mock_srun.return_value = mock_proc
 
             result = mixin._run_postprocess_container()
@@ -680,12 +680,12 @@ class TestS3UploadFaultTolerance:
         mock_proc = MagicMock()
         mock_proc.wait.return_value = 0
         mock_proc.returncode = 0
-        with patch("srtctl.cli.mixins.postprocess_stage.start_srun_process") as mock_srun:
+        with patch("srtctl.cli.mixins.postprocess_stage.launch") as mock_srun:
             mock_srun.return_value = mock_proc
             result = mixin._run_postprocess_container()
 
         assert result is not None and result.startswith("s3://test-bucket/srtslurm/") and result.endswith("/12345/")
-        script = mock_srun.call_args.kwargs["command"][2]
+        script = vars(mock_srun.call_args.args[0])["command"][2]
         for pattern in DEFAULT_S3_EXCLUDE:
             assert f"--exclude {shlex.quote(pattern)}" in script, pattern
         # The archived files are kept out of the plain sync, with ** collapsed to the AWS wildcard.
@@ -715,12 +715,12 @@ class TestS3UploadFaultTolerance:
         # Mock S3 config
         mixin._get_s3_config = MagicMock(return_value=S3Config(bucket="test-bucket"))
 
-        # Mock start_srun_process to return a process that fails
+        # Mock launch to return a process that fails
         mock_proc = MagicMock()
         mock_proc.wait.return_value = None
         mock_proc.returncode = 1  # Non-zero exit
 
-        with patch("srtctl.cli.mixins.postprocess_stage.start_srun_process") as mock_srun:
+        with patch("srtctl.cli.mixins.postprocess_stage.launch") as mock_srun:
             mock_srun.return_value = mock_proc
 
             s3_url = mixin._run_postprocess_container()

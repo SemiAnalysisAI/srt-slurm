@@ -33,9 +33,9 @@ from srtctl.services.gms import GMS_READY_MARKER, PREVIEW_COMMAND, GMSService, b
 from srtctl.services.implicit import effective_services
 from srtctl.services.registry import ServiceLaunchContext
 
-SRUN_WORKER = "srtctl.cli.mixins.worker_stage.start_srun_process"
+SRUN_WORKER = "srtctl.cli.mixins.worker_stage.launch"
 HOST_IP_WORKER = "srtctl.cli.mixins.worker_stage.get_hostname_ip"
-SRUN_SERVICE = "srtctl.cli.mixins.service_stage.start_srun_process"
+SRUN_SERVICE = "srtctl.cli.mixins.service_stage.launch"
 WAIT_SERVICE = "srtctl.cli.mixins.service_stage.wait_until_ready"
 HOST_IP_SERVICE = "srtctl.cli.mixins.service_stage.get_hostname_ip"
 HOST_IP = "srtctl.core.slurm.get_hostname_ip"
@@ -388,7 +388,7 @@ def test_gms_service_launches_one_pinned_instance_per_worker(tmp_path: Path) -> 
         procs = orchestrator.start_services("before_workers")
 
     assert [p.name for p in procs] == ["service_gms_agg_0_node1", "service_gms_agg_1_node1"]
-    calls = {call.kwargs["step_name"]: call.kwargs for call in srun.call_args_list}
+    calls = {vars(call.args[0])["step_name"]: vars(call.args[0]) for call in srun.call_args_list}
     first = calls["service_gms_agg_0_node1"]
     assert first["env_to_set"]["CUDA_VISIBLE_DEVICES"] == "0"
     assert first["env_to_set"]["GMS_SOCKET_DIR"] == "/dev/shm/srtctl-15600/agg_0"
@@ -415,7 +415,7 @@ def test_worker_stage_launches_only_engines(tmp_path: Path) -> None:
         procs = orchestrator.start_all_workers()
 
     assert list(procs) == ["agg_0_node1", "agg_0_node1_e1", "agg_1_node1", "agg_1_node1_e1"]
-    calls = {call.kwargs["step_name"]: call.kwargs for call in srun.call_args_list}
+    calls = {vars(call.args[0])["step_name"]: vars(call.args[0]) for call in srun.call_args_list}
     e0, e1 = calls["agg_0_node1"], calls["agg_0_node1_e1"]
     for step in (e0, e1):
         assert step["env_to_set"]["CUDA_VISIBLE_DEVICES"] == "0"
@@ -448,15 +448,15 @@ def test_full_node_worker_pins_nothing(tmp_path: Path) -> None:
     ):
         (gms,) = orchestrator.start_services("before_workers")
     assert gms.name == "service_gms_agg_0_node1"
-    assert "CUDA_VISIBLE_DEVICES" not in srun_service.call_args.kwargs["env_to_set"]
-    assert "seq 0 7" in srun_service.call_args.kwargs["command"][2]
+    assert "CUDA_VISIBLE_DEVICES" not in vars(srun_service.call_args.args[0])["env_to_set"]
+    assert "seq 0 7" in vars(srun_service.call_args.args[0])["command"][2]
     with (
         patch(SRUN_WORKER, return_value=_proc()) as srun_worker,
         patch(HOST_IP_WORKER, return_value="10.0.0.11"),
         patch(HOST_IP, return_value="10.0.0.11"),
     ):
         orchestrator.start_all_workers()
-    assert "CUDA_VISIBLE_DEVICES" not in srun_worker.call_args.kwargs["env_to_set"]
+    assert "CUDA_VISIBLE_DEVICES" not in vars(srun_worker.call_args.args[0])["env_to_set"]
 
 
 def test_mock_sweep_runs_the_failover_recipe_end_to_end(tmp_path: Path) -> None:

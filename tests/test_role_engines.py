@@ -283,11 +283,11 @@ def test_vllm_role_workers_launch_with_separate_images_args_and_ports(tmp_path):
     with (
         patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"),
         patch("srtctl.cli.mixins.worker_stage.get_hostname_ip", return_value="10.0.0.1"),
-        patch("srtctl.cli.mixins.worker_stage.start_srun_process") as srun,
+        patch("srtctl.cli.mixins.worker_stage.launch") as srun,
     ):
         SweepOrchestrator(config, runtime).start_all_workers()
 
-    prefill, decode = [call.kwargs for call in srun.call_args_list]
+    prefill, decode = [vars(call.args[0]) for call in srun.call_args_list]
     assert [worker["container_image"] for worker in (prefill, decode)] == ["prefill-image", "decode-image"]
     commands = [worker["command"] for worker in (prefill, decode)]
     assert all(command[:3] == ["vllm", "serve", "/model"] for command in commands)

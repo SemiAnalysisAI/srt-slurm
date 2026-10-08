@@ -1407,12 +1407,12 @@ class TestWorkerEnvironmentTemplating:
                 mock_config.frontend = config.frontend
                 mock_config.profiling = config.profiling
 
-                with patch("srtctl.cli.mixins.worker_stage.start_srun_process") as mock_srun:
+                with patch("srtctl.cli.mixins.worker_stage.launch") as mock_srun:
                     mock_srun.return_value = MagicMock()
 
                     # Test prefill worker on gpu-01 (index 0)
                     worker_stage.start_worker(processes[0], [])
-                    call_kwargs = mock_srun.call_args.kwargs
+                    call_kwargs = vars(mock_srun.call_args.args[0])
                     env_vars = call_kwargs.get("env_to_set", {})
 
                     assert "SGLANG_DG_CACHE_DIR" in env_vars
@@ -1421,14 +1421,14 @@ class TestWorkerEnvironmentTemplating:
 
                     # Test decode worker on gpu-02 (index 1)
                     worker_stage.start_worker(processes[1], [])
-                    call_kwargs = mock_srun.call_args.kwargs
+                    call_kwargs = vars(mock_srun.call_args.args[0])
                     env_vars = call_kwargs.get("env_to_set", {})
 
                     assert env_vars["SGLANG_DG_CACHE_DIR"] == "/configs/dg-1"
 
                     # Test decode worker on gpu-03 (index 2)
                     worker_stage.start_worker(processes[2], [])
-                    call_kwargs = mock_srun.call_args.kwargs
+                    call_kwargs = vars(mock_srun.call_args.args[0])
                     env_vars = call_kwargs.get("env_to_set", {})
 
                     assert env_vars["SGLANG_DG_CACHE_DIR"] == "/configs/dg-2"
@@ -1531,12 +1531,12 @@ class TestWorkerEnvironmentTemplating:
                 mock_config.frontend = config.frontend
                 mock_config.profiling = config.profiling
 
-                with patch("srtctl.cli.mixins.worker_stage.start_srun_process") as mock_srun:
+                with patch("srtctl.cli.mixins.worker_stage.launch") as mock_srun:
                     mock_srun.return_value = MagicMock()
 
                     # This should NOT throw an error
                     worker_stage.start_worker(process, [])
-                    call_kwargs = mock_srun.call_args.kwargs
+                    call_kwargs = vars(mock_srun.call_args.args[0])
                     env_vars = call_kwargs.get("env_to_set", {})
 
                     # Supported placeholder should be replaced

@@ -121,7 +121,7 @@ Frontend/router configuration.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `type` | str | `'dynamo'` | Frontend type - "dynamo" (default); "sglang-router" (SGLang Model Gateway), "vllm-router", "smg" (Shepherd Model Gateway, any backend), "atomesh", and "tilert-router" (static routers); "sglang", "vllm", and "trtllm_serve" (direct: the single aggregate worker binds the public port, no router process); "none" (services-only job: no router, no OpenAI endpoint, no worker-count health gate; requires no engine roles). Pre-2.0 recipes spelled the router "sglang"; ``srtctl migrate`` rewrites that to "sglang-router". |
+| `type` | str | `'dynamo'` | Frontend type - "dynamo" (default); "sglang-router" (SGLang Model Gateway), "vllm-router", "smg" (Shepherd Model Gateway, any backend), "llm-d" (llm-d Endpoint Picker behind Envoy, vLLM), "atomesh", and "tilert-router" (static routers); "sglang", "vllm", and "trtllm_serve" (direct: the single aggregate worker binds the public port, no router process); "none" (services-only job: no router, no OpenAI endpoint, no worker-count health gate; requires no engine roles). Pre-2.0 recipes spelled the router "sglang"; ``srtctl migrate`` rewrites that to "sglang-router". |
 | `enable_multiple_frontends` | bool | `True` | Scale with nginx + multiple routers. When ``True`` (default), srtctl stands up nginx and fans out to ``num_additional_frontends + 1`` router replicas. When ``False``, there is NO nginx proxy — the benchmark must target the single master router (or a worker) directly at ``http://localhost:<port>``. ``benchmark.command`` has no placeholder substitution, so write the URL out literally. |
 | `num_additional_frontends` | int | `9` | Additional routers beyond master (default: 9) |
 | `nginx_container` | str | `'nginx:1.27.4'` | Custom nginx container image (default: nginx:1.27.4) |
@@ -130,6 +130,7 @@ Frontend/router configuration.
 | `nginx_session_affinity_header` | str | `'X-Dynamo-Session-ID'` | Header hashed when affinity is on (default ``X-Dynamo-Session-ID``). Set ``X-Correlation-ID`` for clients (e.g. aiperf) that carry the session id in that header instead. |
 | `nginx_keepalive_timeout` | str | `'600s'` | Idle timeout for client and upstream keepalive connections in the generated nginx.conf (default "600s"). nginx's own default is 75s, which closes a session's connection during the long recorded think-time of an agentic replay; the client's next write on that pooled socket then fails with "broken pipe" / "server disconnected" and nothing is logged server-side. |
 | `worker_selection` | dict[str, Any] \| None | `None` | Inline Dynamo worker-selection policy configuration. srtctl writes this mapping under the top-level ``worker_selection`` key in a generated router policy YAML and passes it to the Dynamo frontend via ``--router-policy-config``. |
+| `epp_config` | dict[str, Any] \| None | `None` | llm-d Endpoint Picker configuration (``EndpointPickerConfig``: ``plugins``, ``schedulingProfiles``, ...) for ``frontend.type: llm-d``. srtctl writes it to a file with the ``file-discovery`` plugin and ``dataLayer.discovery`` added, so the EPP reads the job's workers from the endpoints file srtctl renders. Omitted, srtctl runs the scorers of llm-d's no-Kubernetes guide (in prefill and decode profiles for a prefill/decode job). |
 | `args` | dict[str, Any] \| None | `None` | CLI arguments passed to the frontend/router process |
 | `env` | dict[str, str] \| None | `None` | Environment variables for frontend processes |
 | `container_image` | str \| None | `None` | Optional router-specific image. Static routers use the model/backend image when omitted. |
@@ -248,12 +249,11 @@ Profiling configuration.
 
 ### OutputConfig
 
-Output paths and optional reproducibility artifacts.
+Output configuration with formattable paths.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `log_dir` | [FormattablePath](#formattablepath) | `<lambda>()` | Directory for job logs and results; a FormattablePath, so `{job_id}` and `$VARS` expand. |
-| `record_launch_plan` | bool | `False` | Save the realized `srun` scripts and a manifest under `logs/launch-plan/`. |
 
 ### HealthCheckConfig
 
@@ -800,7 +800,6 @@ Top-level keys of `srtslurm.yaml`. Recipes inherit these defaults and resolve al
 | `default_health_check` | dict[str, int] \| None | `None` | `health_check` block (`max_attempts`, `interval_seconds`) used when a recipe has none. |
 | `srtctl_root` | str \| None | `None` | srtctl checkout on the shared filesystem that compute nodes mount at /srtctl-src. Default: this checkout. |
 | `output_dir` | str \| None | `None` | Custom output directory for job logs |
-| `record_launch_plan` | bool | `False` | Cluster-wide default for recording exact realized srun commands. Recipes can opt in independently with output.record_launch_plan. |
 | `model_paths` | dict[str, str] \| None | `None` | Alias -> path map; a recipe's `model.path` may name an alias instead of a path. |
 | `containers` | dict[str, str] \| None | `None` | Alias -> image map, resolved for every container key in a recipe (`model.container`, `roles.<role>.container`, ...). |
 | `cloud` | dict[str, str] \| None | `None` | Free-form cloud settings. Accepted for compatibility; srtctl does not read it. |

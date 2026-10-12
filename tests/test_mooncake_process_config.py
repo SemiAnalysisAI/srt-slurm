@@ -155,14 +155,14 @@ def test_worker_launch_uses_rendered_config(
     with (
         patch("srtctl.core.slurm.get_hostname_ip", return_value="192.0.2.2"),
         patch("srtctl.cli.mixins.worker_stage.get_hostname_ip", return_value="192.0.2.2"),
-        patch("srtctl.cli.mixins.worker_stage.start_srun_process") as srun,
+        patch("srtctl.cli.mixins.worker_stage.launch") as srun,
     ):
         for worker in workers:
             orchestrator.start_worker(worker, [worker])
 
     assert srun.call_count == len(workers)
     for worker, call in zip(workers, srun.call_args_list, strict=True):
-        launch = call.kwargs
+        launch = vars(call.args[0])
         env = launch["env_to_set"]
         gpu_ids = "-".join(map(str, sorted(worker.gpu_indices)))
         filename = f"mooncake_store_config_gpu{gpu_ids}.json" if mapped else "mooncake_store_config.json"

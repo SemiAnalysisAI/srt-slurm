@@ -11,8 +11,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from srtctl.core.launch_plan import configure_launch_plan
+from srtctl.core.launcher import LaunchSpec, launch
 from srtctl.core.schema import ClusterConfig, OutputConfig
-from srtctl.core.slurm import start_srun_process
 
 
 @pytest.fixture(autouse=True)
@@ -27,10 +27,10 @@ def _launch(tmp_path: Path, **kwargs) -> Path:
     configure_launch_plan(plan_dir, job_id="42042")
     with (
         patch("srtctl.core.slurm.get_slurm_job_id", return_value="42042"),
-        patch("srtctl.core.slurm._get_cluster_bash_preamble", return_value=None),
+        patch("srtctl.core.launcher._get_cluster_bash_preamble", return_value=None),
         patch("subprocess.Popen", return_value=MagicMock()),
     ):
-        start_srun_process(["python3", "-m", "worker"], **kwargs)
+        launch(LaunchSpec(["python3", "-m", "worker"], **kwargs))
     return plan_dir
 
 
@@ -44,10 +44,10 @@ def test_launch_plan_is_opt_in_for_recipe_and_cluster() -> None:
 def test_disabled_recorder_writes_nothing(tmp_path: Path) -> None:
     with (
         patch("srtctl.core.slurm.get_slurm_job_id", return_value="42042"),
-        patch("srtctl.core.slurm._get_cluster_bash_preamble", return_value=None),
+        patch("srtctl.core.launcher._get_cluster_bash_preamble", return_value=None),
         patch("subprocess.Popen", return_value=MagicMock()),
     ):
-        start_srun_process(["python3", "-m", "worker"])
+        launch(LaunchSpec(["python3", "-m", "worker"]))
 
     assert not (tmp_path / "launch-plan").exists()
 
@@ -109,10 +109,10 @@ def test_multiple_commands_have_stable_order_and_distinct_files(tmp_path: Path) 
     plan_dir = _launch(tmp_path, output=str(tmp_path / "logs" / "infra.out"))
     with (
         patch("srtctl.core.slurm.get_slurm_job_id", return_value="42042"),
-        patch("srtctl.core.slurm._get_cluster_bash_preamble", return_value=None),
+        patch("srtctl.core.launcher._get_cluster_bash_preamble", return_value=None),
         patch("subprocess.Popen", return_value=MagicMock()),
     ):
-        start_srun_process(["python3", "bench.py"], output=str(tmp_path / "logs" / "benchmark.out"))
+        launch(LaunchSpec(["python3", "bench.py"], output=str(tmp_path / "logs" / "benchmark.out")))
 
     manifest = json.loads((plan_dir / "manifest.json").read_text())
     assert [entry["sequence"] for entry in manifest["steps"]] == [1, 2]

@@ -13,7 +13,6 @@ container_mounts:
     <output>/logs: /logs
 env_to_set:
     CUDA_VISIBLE_DEVICES: 0
-use_bash_wrapper: True
 command: |
     pd-sidecar --port=9600 --model-server-port=6100 --kv-connector=nixlv2 --secure-proxy=false
 
@@ -188,7 +187,7 @@ use_bash_wrapper: False
 command: |
     tachometer-scraper --config <output>/logs/tachometer_config.toml --local-dir <output>/logs/tachometer/local --sync-interval 120
 
-## <unnamed>
+## benchmark
 nodelist: node-01
 output: <output>/logs/benchmark.out
 container_image: llm-d-vllm

@@ -29,7 +29,7 @@ from srtctl.services import (
 )
 from srtctl.services.implicit import discovery_env, effective_services, uses_discovery_plane
 
-SRUN = "srtctl.cli.mixins.service_stage.start_srun_process"
+SRUN = "srtctl.cli.mixins.service_stage.launch"
 WAIT = "srtctl.cli.mixins.service_stage.wait_until_ready"
 HOST_IP = "srtctl.cli.mixins.service_stage.get_hostname_ip"
 
@@ -270,7 +270,7 @@ services:
         procs = orchestrator.start_services("after_frontend")
 
     srun.assert_called_once()
-    kw = srun.call_args.kwargs
+    kw = vars(srun.call_args.args[0])
     assert kw["nodelist"] == ["node0"]
     assert kw["command"] == ["python3", "-m", "router", "--node", "node0", "--infra", "10.0.0.10"]
     assert kw["container_image"] == "/job.sqsh"
@@ -292,8 +292,8 @@ def test_container_alias_and_no_discovery_env(tmp_path: Path) -> None:
     )
     with patch(SRUN, return_value=_proc()) as srun, patch(HOST_IP, return_value="10.0.0.10"):
         (proc,) = _orchestrator(config, tmp_path).start_services("after_frontend")
-    assert srun.call_args.kwargs["container_image"] == "/mine.sqsh"
-    assert "ETCD_ENDPOINTS" not in srun.call_args.kwargs["env_to_set"]
+    assert vars(srun.call_args.args[0])["container_image"] == "/mine.sqsh"
+    assert "ETCD_ENDPOINTS" not in vars(srun.call_args.args[0])["env_to_set"]
     assert proc.critical is True
 
 
@@ -304,7 +304,7 @@ def test_declared_order_is_launch_order(tmp_path: Path) -> None:
     )
     with patch(SRUN, return_value=_proc()) as srun, patch(HOST_IP, return_value="10.0.0.10"):
         _orchestrator(config, tmp_path).start_services("after_frontend")
-    assert [call.kwargs["command"][1] for call in srun.call_args_list] == ["b", "a", "c"]
+    assert [vars(call.args[0])["command"][1] for call in srun.call_args_list] == ["b", "a", "c"]
 
 
 def test_readiness_gate_blocks_and_failure_terminates_started(tmp_path: Path) -> None:
@@ -386,16 +386,16 @@ services:
         _orchestrator(config, tmp_path).start_services("after_frontend")
 
     clone, build, launch = srun.call_args_list
-    assert clone.kwargs["container_image"] is None
-    assert "git -c http.version=HTTP/1.1 clone" in clone.kwargs["command"][-1]
-    assert "refs/pull/1/head" in clone.kwargs["command"][-1]
-    assert build.kwargs["container_image"] == "/job.sqsh"
-    assert build.kwargs["command"] == ["bash", "-lc", "pip install -e ."]
+    assert vars(clone.args[0])["container_image"] is None
+    assert "git -c http.version=HTTP/1.1 clone" in vars(clone.args[0])["command"][-1]
+    assert "refs/pull/1/head" in vars(clone.args[0])["command"][-1]
+    assert vars(build.args[0])["container_image"] == "/job.sqsh"
+    assert vars(build.args[0])["command"] == ["bash", "-lc", "pip install -e ."]
     # Build and launch run inside the container, where log_dir is mounted at /logs.
-    assert "/logs/services/router/src/lib/router" in build.kwargs["bash_preamble"]
-    assert str(tmp_path) not in build.kwargs["bash_preamble"]
-    assert launch.kwargs["command"] == ["python3", "-m", "router"]
-    assert "/logs/services/router/src/lib/router" in launch.kwargs["bash_preamble"]
+    assert "/logs/services/router/src/lib/router" in vars(build.args[0])["bash_preamble"]
+    assert str(tmp_path) not in vars(build.args[0])["bash_preamble"]
+    assert vars(launch.args[0])["command"] == ["python3", "-m", "router"]
+    assert "/logs/services/router/src/lib/router" in vars(launch.args[0])["bash_preamble"]
 
 
 def test_clone_and_build_failures_raise(tmp_path: Path) -> None:
@@ -499,7 +499,7 @@ def test_mooncake_stores_launch_once_per_role_node_with_master_env(tmp_path: Pat
     orchestrator = _orchestrator(_load(STORES, head=MOONCAKE_HEAD, engine=MOONCAKE_ENGINE), tmp_path)
     ips = {"node0": "10.0.0.10", "node1": "10.0.0.11", "node2": "10.0.0.12", "node3": "10.0.0.13"}
     with (
-        patch(SRUN, side_effect=lambda **_: _proc()) as srun,
+        patch(SRUN, side_effect=lambda _: _proc()) as srun,
         patch(HOST_IP, side_effect=lambda node, _iface: ips[node]),
         patch(WAIT, return_value=True) as wait,
     ):
@@ -519,12 +519,12 @@ def test_mooncake_stores_launch_once_per_role_node_with_master_env(tmp_path: Pat
     # Master: three default ports gated in turn; stores: one declared probe each.
     assert wait.call_count == 3 + 3
 
-    master = srun.call_args_list[0].kwargs
+    master = vars(srun.call_args_list[0].args[0])
     assert master["container_image"] == "/mooncake-master.sqsh"
     assert master["command"][0] == "mooncake_master"
     assert master["step_name"] == "service_mooncake-master"
 
-    prefill = srun.call_args_list[1].kwargs
+    prefill = vars(srun.call_args_list[1].args[0])
     assert prefill["container_image"] == "/mooncake-master.sqsh"  # falls back to mooncake_kv_store.container
     assert prefill["command"] == [
         "python",
@@ -546,7 +546,7 @@ def test_mooncake_stores_launch_once_per_role_node_with_master_env(tmp_path: Pat
     assert prefill["cpu_bind"] == "none"
     assert prefill["srun_options"] == {"exclusive": ""}
 
-    decode = srun.call_args_list[2].kwargs
+    decode = vars(srun.call_args_list[2].args[0])
     assert decode["container_image"] == "/mooncake-store.sqsh"
     assert decode["env_to_set"]["MOONCAKE_GLOBAL_SEGMENT_SIZE"] == "400gb"
     assert decode["env_to_set"]["MOONCAKE_LOCAL_HOSTNAME"] == "10.0.0.12"
@@ -573,7 +573,7 @@ def test_workers_placement_deduplicates_shared_nodes(tmp_path: Path) -> None:
     )
     orchestrator = _orchestrator(config, tmp_path)
     with (
-        patch(SRUN, side_effect=lambda **_: _proc()) as srun,
+        patch(SRUN, side_effect=lambda _: _proc()) as srun,
         patch(HOST_IP, return_value="10.0.0.11"),
         patch(WAIT, return_value=True),
     ):
@@ -601,9 +601,9 @@ def test_dynamo_lifecycle_defaults_reach_frontend_and_workers(tmp_path, enabled)
     orchestrator = _orchestrator(config, tmp_path)
     runtime = orchestrator.runtime
     topology = SimpleNamespace(frontend_nodes=["node0"], frontend_port=8180)
-    with patch("srtctl.frontends.dynamo.start_srun_process", return_value=_proc()) as launch:
+    with patch("srtctl.frontends.dynamo.launch", return_value=_proc()) as launch:
         DynamoFrontend().start_frontends(topology, runtime, config, config.backend, [])
-    envs = [launch.call_args.kwargs["env_to_set"]]
+    envs = [launch.call_args.args[0].env_to_set]
     for mode in ("prefill", "decode"):
         envs.append(orchestrator._worker_environment_defaults(SimpleNamespace(endpoint_mode=mode, sys_port=8081)))
     for env, component in zip(envs, ("frontend", "prefill", "decode"), strict=True):
@@ -634,8 +634,8 @@ def test_otel_collector_launch_writes_dsight_input_and_survives_worker_shutdown(
     ):
         (proc,) = _orchestrator(config, tmp_path).start_services("before_workers")
     assert proc.critical and proc.shutdown_tier == 1
-    assert launch.call_args.kwargs["container_image"] is None
-    assert launch.call_args.kwargs["command"] == [
+    assert launch.call_args.args[0].container_image is None
+    assert launch.call_args.args[0].command == [
         "/srt/configs/otelcol-contrib",
         "--config",
         str(tmp_path / "otel-collector.yaml"),
@@ -703,7 +703,7 @@ def test_dynamo_frontend_implies_etcd_and_nats_on_the_infra_node(tmp_path: Path)
     assert [p.node for p in procs] == ["node0", "node0"]
     assert all(p.critical for p in procs)
     assert [p.step_name for p in procs] == ["service_etcd", "service_nats"]
-    etcd, nats = (call.kwargs for call in srun.call_args_list)
+    etcd, nats = (vars(call.args[0]) for call in srun.call_args_list)
     assert etcd["command"] == [
         "/configs/etcd",
         "--data-dir",
@@ -761,7 +761,7 @@ def test_nats_max_payload_renders_a_config_file(tmp_path: Path) -> None:
         patch(WAIT, return_value=True),
     ):
         orchestrator.start_services("infra")
-    nats = srun.call_args_list[1].kwargs
+    nats = vars(srun.call_args_list[1].args[0])
     assert nats["command"] == ["/configs/nats-server", "-c", "/tmp/nats.conf"]
     assert f"max_payload: {24 * 1024 * 1024}" in nats["bash_preamble"]
     assert "> /tmp/nats.conf" in nats["bash_preamble"]
@@ -867,7 +867,7 @@ def test_tachometer_exporters_are_implied_on_every_worker_node(tmp_path: Path, c
     ]
     # A dead exporter costs its metrics, never the run.
     assert not any(p.critical for p in procs)
-    dcgm = srun.call_args_list[0].kwargs
+    dcgm = vars(srun.call_args_list[0].args[0])
     assert dcgm["container_image"] == "nvcr.io#nvidia/k8s/dcgm-exporter:3.3.9-3.6.1-ubuntu22.04"
     assert dcgm["command"] == ["dcgm-exporter", "--collect-interval=1000", "--address", ":9401"]
     # Distroless image: no bash wrapper, env rides on srun --export instead.
@@ -875,7 +875,7 @@ def test_tachometer_exporters_are_implied_on_every_worker_node(tmp_path: Path, c
     assert dcgm["bash_preamble"] is None
     assert dcgm["env_to_set"] is None
     assert "ETCD_ENDPOINTS" in dcgm["srun_export_env"]
-    node = srun.call_args_list[3].kwargs
+    node = vars(srun.call_args_list[3].args[0])
     assert node["container_image"] == "quay.io#prometheus/node-exporter:v1.8.2"
     assert node["command"][:2] == ["/bin/node_exporter", "--web.listen-address=:9101"]
 
@@ -894,7 +894,7 @@ def test_declared_exporter_overrides_the_container(tmp_path: Path) -> None:
     ):
         _orchestrator(config, tmp_path).start_services("after_frontend")
     assert srun.call_count == 3
-    assert srun.call_args.kwargs["container_image"] == "/mirror/dcgm.sqsh"
+    assert vars(srun.call_args.args[0])["container_image"] == "/mirror/dcgm.sqsh"
 
 
 def test_power_telemetry_owns_the_dcgm_exporter() -> None:
@@ -927,7 +927,7 @@ def test_process_exporter_runs_host_native_on_every_allocated_node(tmp_path: Pat
     assert [p.node for p in procs] == ["node0", "node1", "node2", "node3"]
     assert [p.name for p in procs][:2] == ["service_process-exporter_node0", "service_process-exporter_node1"]
     assert not any(p.critical for p in procs)
-    launch = srun.call_args_list[0].kwargs
+    launch = vars(srun.call_args_list[0].args[0])
     assert launch["container_image"] is None
     assert launch["container_mounts"] is None
     assert launch["use_bash_wrapper"] is False
@@ -955,7 +955,11 @@ def test_process_exporter_with_a_declared_container_launches_in_it(tmp_path: Pat
         patch(HOST_BINARY, side_effect=AssertionError("not consulted")),
     ):
         procs = orchestrator.start_services("after_frontend")
-    launch = [call.kwargs for call in srun.call_args_list if "process-exporter" in call.kwargs["command"][0]][0]
+    launch = [
+        vars(call.args[0])
+        for call in srun.call_args_list
+        if "process-exporter" in vars(call.args[0])["command"][0]
+    ][0]
     assert launch["container_image"] == "pe-with-shell:latest"
     assert launch["container_mounts"] == {}
     assert launch["command"][:3] == ["/bin/process-exporter", "-config.path", "/logs/process-exporter.yml"]

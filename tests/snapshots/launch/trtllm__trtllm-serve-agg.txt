@@ -3,8 +3,6 @@
 # srun calls: 9
 
 ## agg_0_node-01
-nodes: 1
-ntasks: 1
 nodelist: node-01
 output: <output>/logs/node-01_agg_w0.out
 container_image: trtllm
@@ -134,7 +132,7 @@ use_bash_wrapper: False
 command: |
     tachometer-scraper --config <output>/logs/tachometer_config.toml --local-dir <output>/logs/tachometer/local --sync-interval 120
 
-## <unnamed>
+## benchmark
 nodelist: node-01
 output: <output>/logs/benchmark.out
 container_image: trtllm

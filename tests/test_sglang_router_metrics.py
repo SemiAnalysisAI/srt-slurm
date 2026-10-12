@@ -18,10 +18,9 @@ from unittest.mock import MagicMock, patch
 
 from srtctl.backends import SGLangBackend
 from srtctl.cli.mixins.frontend_stage import FrontendTopology
-from srtctl.core.schema import TachometerConfig
+from srtctl.core.launcher import LaunchSpec, launch
 from srtctl.core.processes import ManagedProcess, ProcessRegistry
-from srtctl.core.schema import DynamoConfig, TachometerConfig, RoleConfig
-from srtctl.core.slurm import start_srun_process
+from srtctl.core.schema import DynamoConfig, RoleConfig, TachometerConfig
 from srtctl.core.telemetry import generate_tachometer_config
 from srtctl.core.topology import Process
 from srtctl.frontends.sglang import SGLangRouterFrontend, router_metrics_port
@@ -129,11 +128,11 @@ def test_sglang_workers_enable_metrics_under_every_frontend() -> None:
 def test_srun_bash_wrapper_execs_the_command() -> None:
     with (
         patch("srtctl.core.slurm.get_slurm_job_id", return_value="1"),
-        patch("srtctl.core.slurm._get_cluster_bash_preamble", return_value=None),
+        patch("srtctl.core.launcher._get_cluster_bash_preamble", return_value=None),
         patch("subprocess.Popen") as popen,
     ):
         popen.return_value = MagicMock()
-        start_srun_process(["tachometer-scraper", "--config", "c.toml"], env_to_set={"POLARS_MAX_THREADS": "4"})
+        launch(LaunchSpec(["tachometer-scraper", "--config", "c.toml"], env_to_set={"POLARS_MAX_THREADS": "4"}))
     bash_cmd = popen.call_args.args[0][-1]
     assert bash_cmd.endswith("&& exec tachometer-scraper --config c.toml")
 
@@ -146,8 +145,8 @@ def test_tachometer_terminate_signals_the_step_then_waits() -> None:
     scancel = SimpleNamespace(returncode=0, stdout="", stderr="")
     with (
         patch.dict("os.environ", {"SLURM_JOB_ID": "12440"}),
-        patch("srtctl.core.processes.shutil.which", return_value="/usr/bin/slurm-tool"),
-        patch("srtctl.core.processes.subprocess.run", side_effect=[squeue, scancel]) as run,
+        patch("srtctl.core.slurm.shutil.which", return_value="/usr/bin/slurm-tool"),
+        patch("srtctl.core.launcher.subprocess.run", side_effect=[squeue, scancel]) as run,
         patch("srtctl.core.processes.terminate_and_reap") as reap,
     ):
         proc.terminate()
@@ -164,8 +163,8 @@ def test_terminate_falls_back_to_srun_sigterm_when_the_step_is_not_found() -> No
     squeue = SimpleNamespace(returncode=0, stdout="12440.extern extern\n", stderr="")
     with (
         patch.dict("os.environ", {"SLURM_JOB_ID": "12440"}),
-        patch("srtctl.core.processes.shutil.which", return_value="/usr/bin/slurm-tool"),
-        patch("srtctl.core.processes.subprocess.run", return_value=squeue),
+        patch("srtctl.core.slurm.shutil.which", return_value="/usr/bin/slurm-tool"),
+        patch("srtctl.core.launcher.subprocess.run", return_value=squeue),
         patch("srtctl.core.processes.terminate_and_reap") as reap,
     ):
         reap.return_value = SimpleNamespace(reaped=True, force_killed=False)
@@ -176,11 +175,11 @@ def test_terminate_falls_back_to_srun_sigterm_when_the_step_is_not_found() -> No
 def test_srun_step_name_becomes_job_name() -> None:
     with (
         patch("srtctl.core.slurm.get_slurm_job_id", return_value="1"),
-        patch("srtctl.core.slurm._get_cluster_bash_preamble", return_value=None),
+        patch("srtctl.core.launcher._get_cluster_bash_preamble", return_value=None),
         patch("subprocess.Popen") as popen,
     ):
         popen.return_value = MagicMock()
-        start_srun_process(["tachometer-scraper"], step_name="tachometer")
+        launch(LaunchSpec(["tachometer-scraper"], step_name="tachometer"))
     assert "--job-name=tachometer" in popen.call_args.args[0]
 
 

@@ -249,13 +249,13 @@ def test_sglang_disagg_dp_example_launches_two_disjoint_worker_groups(tmp_path: 
         patch("srtctl.core.slurm.get_hostname_ip", side_effect=node_ip),
         patch("srtctl.cli.mixins.worker_stage.get_hostname_ip", side_effect=node_ip),
         patch("srtctl.cli.mixins.worker_stage.generate_capture_script", return_value="true"),
-        patch("srtctl.cli.mixins.worker_stage.start_srun_process") as mock_srun,
+        patch("srtctl.cli.mixins.worker_stage.launch") as mock_srun,
     ):
         managed = orchestrator.start_all_workers()
 
     assert len(managed) == mock_srun.call_count == 4
     for process, launch in zip(orchestrator.backend_processes, mock_srun.call_args_list, strict=True):
-        args = launch.kwargs
+        args = vars(launch.args[0])
         engine, sidecar = _sglang_launch_commands(args["command"])
         prefill = process.endpoint_mode == "prefill"
         leader = process.node_rank == 0

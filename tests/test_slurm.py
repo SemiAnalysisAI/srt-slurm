@@ -1076,7 +1076,7 @@ def test_uniform_multinode_endpoint_pins_rank_order(tmp_path: Path) -> None:
         patch("srtctl.cli.mixins.worker_stage.generate_capture_script", return_value="true"),
         patch("srtctl.cli.mixins.worker_stage.get_hostname_ip", return_value="10.0.0.1") as mock_ip,
         patch("srtctl.core.slurm.get_slurm_job_id", return_value="12345"),
-        patch("srtctl.core.slurm._get_cluster_bash_preamble", return_value=None),
+        patch("srtctl.core.launcher._get_cluster_bash_preamble", return_value=None),
         patch("subprocess.Popen") as mock_popen,
     ):
         mixin.start_endpoint_worker(processes)
@@ -1112,11 +1112,11 @@ def test_multinode_endpoint_warns_when_it_replaces_a_configured_distribution(tmp
     with (
         patch("srtctl.cli.mixins.worker_stage.generate_capture_script", return_value="true"),
         patch("srtctl.cli.mixins.worker_stage.get_hostname_ip", return_value="10.0.0.1"),
-        patch("srtctl.cli.mixins.worker_stage.start_srun_process") as mock_srun,
+        patch("srtctl.cli.mixins.worker_stage.launch") as mock_srun,
         caplog.at_level("WARNING", logger="srtctl.cli.mixins.worker_stage"),
     ):
         mixin.start_endpoint_worker(endpoints_to_processes(endpoints))
-    assert mock_srun.call_args.kwargs["srun_options"]["distribution"] == "arbitrary"
+    assert mock_srun.call_args.args[0].srun_options["distribution"] == "arbitrary"
     assert "distribution='block:block' is replaced by 'arbitrary'" in caplog.text
 
 

@@ -378,12 +378,14 @@ class SweepOrchestrator(
         procs = []
         for node in nodes:
             log = self.runtime.log_dir / f"clock_sync_{node}.out"
-            proc = start_srun_process(
-                command=["bash", "-c", self.CLOCK_SYNC_SCRIPT],
-                nodelist=[node],
-                output=str(log),
-                container_image=None,  # bare host: the time daemon lives outside the container
-                het_group=self.runtime.nodes.het_group_for(node),
+            proc = launch(
+                LaunchSpec(
+                    command=["bash", "-c", self.CLOCK_SYNC_SCRIPT],
+                    nodelist=[node],
+                    output=str(log),
+                    container_image=None,  # bare host: the time daemon lives outside the container
+                    het_group=self.runtime.nodes.het_group_for(node),
+                )
             )
             procs.append((node, proc, log))
 

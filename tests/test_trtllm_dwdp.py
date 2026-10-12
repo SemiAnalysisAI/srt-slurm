@@ -22,7 +22,7 @@ from srtctl.core.runtime import Nodes, RuntimeContext
 from srtctl.core.schema import RoleConfig, SrtConfig
 from srtctl.core.topology import Process
 
-SRUN_WORKER = "srtctl.cli.mixins.worker_stage.start_srun_process"
+SRUN_WORKER = "srtctl.cli.mixins.worker_stage.launch"
 HOST_IP_WORKER = "srtctl.cli.mixins.worker_stage.get_hostname_ip"
 HOST_IP = "srtctl.core.slurm.get_hostname_ip"
 
@@ -153,7 +153,7 @@ def test_worker_stage_launches_a_dwdp_group_with_distinct_ranks_and_one_master(t
     ):
         orchestrator.start_all_workers()
 
-    steps = {call.kwargs["step_name"]: call.kwargs for call in srun.call_args_list}
+    steps = {call.args[0].step_name: vars(call.args[0]) for call in srun.call_args_list}
     prefill = sorted(name for name in steps if name.startswith("prefill_"))
     assert len(prefill) == 4
     ranks = []

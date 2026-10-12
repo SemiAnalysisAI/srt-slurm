@@ -3,8 +3,6 @@
 # srun calls: 11
 
 ## agg_0_node-01
-nodes: 1
-ntasks: 1
 nodelist: node-01
 output: <output>/logs/node-01_agg_w0.out
 container_image: trtllm
@@ -36,8 +34,6 @@ command: |
     trtllm-llmapi-launch trtllm-serve /model --host 0.0.0.0 --port 6100 --tensor_parallel_size 1 --config /logs/trtllm_config_agg.yaml --served_model_name Qwen/Qwen3-0.6B
 
 ## agg_1_node-01
-nodes: 1
-ntasks: 1
 nodelist: node-01
 output: <output>/logs/node-01_agg_w1.out
 container_image: trtllm
@@ -179,7 +175,7 @@ use_bash_wrapper: False
 command: |
     tachometer-scraper --config <output>/logs/tachometer_config.toml --local-dir <output>/logs/tachometer/local --sync-interval 120
 
-## <unnamed>
+## benchmark
 nodelist: node-01
 output: <output>/logs/benchmark.out
 container_image: trtllm

@@ -601,9 +601,9 @@ def test_dynamo_lifecycle_defaults_reach_frontend_and_workers(tmp_path, enabled)
     orchestrator = _orchestrator(config, tmp_path)
     runtime = orchestrator.runtime
     topology = SimpleNamespace(frontend_nodes=["node0"], frontend_port=8180)
-    with patch("srtctl.frontends.dynamo.start_srun_process", return_value=_proc()) as launch:
+    with patch("srtctl.frontends.dynamo.launch", return_value=_proc()) as launch:
         DynamoFrontend().start_frontends(topology, runtime, config, config.backend, [])
-    envs = [launch.call_args.kwargs["env_to_set"]]
+    envs = [launch.call_args.args[0].env_to_set]
     for mode in ("prefill", "decode"):
         envs.append(orchestrator._worker_environment_defaults(SimpleNamespace(endpoint_mode=mode, sys_port=8081)))
     for env, component in zip(envs, ("frontend", "prefill", "decode"), strict=True):
@@ -634,8 +634,8 @@ def test_otel_collector_launch_writes_dsight_input_and_survives_worker_shutdown(
     ):
         (proc,) = _orchestrator(config, tmp_path).start_services("before_workers")
     assert proc.critical and proc.shutdown_tier == 1
-    assert launch.call_args.kwargs["container_image"] is None
-    assert launch.call_args.kwargs["command"] == [
+    assert launch.call_args.args[0].container_image is None
+    assert launch.call_args.args[0].command == [
         "/srt/configs/otelcol-contrib",
         "--config",
         str(tmp_path / "otel-collector.yaml"),

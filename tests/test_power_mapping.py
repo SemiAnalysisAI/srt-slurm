@@ -467,7 +467,7 @@ class TestTelemetryStage:
         )
         assert resolve_exporter_command(AMD_EXPORTER, DCGM_EXPORTER_COMMAND_TEMPLATE) == "/home/amd/tools/entrypoint.sh"
 
-    @patch("srtctl.cli.mixins.telemetry_stage.start_srun_process")
+    @patch("srtctl.cli.mixins.telemetry_stage.launch")
     def test_amd_exporter_launches_with_its_command_and_the_session_parses_its_metric(self, mock_srun, tmp_path):
         popen = MagicMock()
         popen.poll.return_value = None
@@ -484,7 +484,7 @@ class TestTelemetryStage:
             ready = harness._power_telemetry_ready
             session.stop_and_finalize()
 
-        kwargs = mock_srun.call_args.kwargs
+        kwargs = vars(mock_srun.call_args.args[0])
         assert kwargs["command"] == ["/home/amd/tools/entrypoint.sh"]
         assert kwargs["container_image"] == AMD_IMAGE
         assert ready is True, "readiness needs every expected GPU parsed from the AMD metric"

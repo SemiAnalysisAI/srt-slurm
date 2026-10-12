@@ -81,14 +81,14 @@ class TestGate:
     def test_probes_every_node_on_the_bare_host(self, tmp_path):
         orch = SweepOrchestrator(config=_config(telemetry=_dcgm_power()), runtime=_runtime(tmp_path))
 
-        with patch("srtctl.cli.do_sweep.start_srun_process", return_value=_proc(0)) as srun:
+        with patch("srtctl.cli.do_sweep.launch", return_value=_proc(0)) as srun:
             orch._check_clock_sync()
 
-        assert [c.kwargs["nodelist"] for c in srun.call_args_list] == [["node0"], ["node1"], ["node2"]]
+        assert [c.args[0].nodelist for c in srun.call_args_list] == [["node0"], ["node1"], ["node2"]]
         for call in srun.call_args_list:
-            assert call.kwargs["container_image"] is None, "the time daemon lives on the host, not in the container"
-            assert call.kwargs["command"][:2] == ["bash", "-c"]
-            script = call.kwargs["command"][2]
+            assert call.args[0].container_image is None, "the time daemon lives on the host, not in the container"
+            assert call.args[0].command[:2] == ["bash", "-c"]
+            script = call.args[0].command[2]
             # Every probe branch must leave evidence in the .out, not just an exit code.
             for daemon in ("timedatectl", "chronyc", "ntpq"):
                 assert daemon in script
@@ -98,10 +98,10 @@ class TestGate:
         """A client node outside the worker set still feeds window timestamps and must be probed."""
         orch = SweepOrchestrator(config=_config(telemetry=_dcgm_power()), runtime=_runtime(tmp_path, bench="node9"))
 
-        with patch("srtctl.cli.do_sweep.start_srun_process", return_value=_proc(0)) as srun:
+        with patch("srtctl.cli.do_sweep.launch", return_value=_proc(0)) as srun:
             orch._check_clock_sync()
 
-        probed = [c.kwargs["nodelist"][0] for c in srun.call_args_list]
+        probed = [c.args[0].nodelist[0] for c in srun.call_args_list]
         assert probed == ["node0", "node9", "node1", "node2"]
         assert len(probed) == len(set(probed))
 
@@ -110,7 +110,7 @@ class TestGate:
         procs = iter([_proc(0), _proc(1), _proc(0)])
 
         with (
-            patch("srtctl.cli.do_sweep.start_srun_process", side_effect=lambda **_: next(procs)),
+            patch("srtctl.cli.do_sweep.launch", side_effect=lambda _spec: next(procs)),
             pytest.raises(RuntimeError, match="clock_sync_check: node1"),
         ):
             orch._check_clock_sync()
@@ -118,7 +118,7 @@ class TestGate:
     def test_best_effort_run_only_warns(self, tmp_path, caplog):
         orch = SweepOrchestrator(config=_config(telemetry=_dcgm_power(required=False)), runtime=_runtime(tmp_path))
 
-        with patch("srtctl.cli.do_sweep.start_srun_process", return_value=_proc(1)), caplog.at_level("WARNING"):
+        with patch("srtctl.cli.do_sweep.launch", return_value=_proc(1)), caplog.at_level("WARNING"):
             orch._check_clock_sync()  # must not raise
 
         assert "telemetry.required is false" in caplog.text
@@ -127,7 +127,7 @@ class TestGate:
     def test_passing_probe_leaves_no_failures(self, tmp_path):
         orch = SweepOrchestrator(config=_config(telemetry=_dcgm_power(required=False)), runtime=_runtime(tmp_path))
 
-        with patch("srtctl.cli.do_sweep.start_srun_process", return_value=_proc(0)):
+        with patch("srtctl.cli.do_sweep.launch", return_value=_proc(0)):
             orch._check_clock_sync()
 
         assert orch._clock_sync_failures == []
@@ -136,18 +136,18 @@ class TestGate:
         """The per-node .out carries the probe's evidence; the sweep log should name it, not just say OK."""
         orch = SweepOrchestrator(config=_config(telemetry=_dcgm_power()), runtime=_runtime(tmp_path))
 
-        def srun(*, nodelist, output, **_):
+        def srun(spec):
             # Emulate what the real probe prints for each branch.
-            node = nodelist[0]
+            node = spec.nodelist[0]
             evidence = {
                 "node0": f"{node}: timedatectl NTPSynchronized=yes\n",
                 "node1": f"{node}: chronyc Leap status Normal\nSystem time     : 0.000012 seconds fast of NTP time\n",
                 "node2": "",  # a probe that passed silently still gets a bare OK line
             }[node]
-            Path(output).write_text(evidence)
+            Path(spec.output).write_text(evidence)
             return _proc(0)
 
-        with patch("srtctl.cli.do_sweep.start_srun_process", side_effect=srun), caplog.at_level("INFO"):
+        with patch("srtctl.cli.do_sweep.launch", side_effect=srun), caplog.at_level("INFO"):
             orch._check_clock_sync()
 
         assert "clock_sync_check: node0 OK (timedatectl NTPSynchronized=yes)" in caplog.text
@@ -175,7 +175,7 @@ class TestGate:
     def test_best_effort_failures_reach_the_power_session(self, tmp_path):
         """The warning alone is not enough: the manifest must carry the unverified-clock reason."""
         orch = SweepOrchestrator(config=_config(telemetry=_dcgm_power(required=False)), runtime=_runtime(tmp_path))
-        with patch("srtctl.cli.do_sweep.start_srun_process", return_value=_proc(1)):
+        with patch("srtctl.cli.do_sweep.launch", return_value=_proc(1)):
             orch._check_clock_sync()
 
         session = MagicMock()
@@ -200,7 +200,7 @@ class TestGate:
         orch = SweepOrchestrator(config=_config(telemetry=_dcgm_power(required=True)), runtime=_runtime(tmp_path))
 
         with (
-            patch("srtctl.cli.do_sweep.start_srun_process", side_effect=lambda **_: next(procs)),
+            patch("srtctl.cli.do_sweep.launch", side_effect=lambda _spec: next(procs)),
             pytest.raises(RuntimeError, match="clock_sync_check: node0"),
         ):
             orch._check_clock_sync()
@@ -299,7 +299,7 @@ class TestSkipped:
     def test_no_srun_when_not_applicable(self, tmp_path, telemetry):
         orch = SweepOrchestrator(config=_config(telemetry=telemetry), runtime=_runtime(tmp_path))
 
-        with patch("srtctl.cli.do_sweep.start_srun_process") as srun:
+        with patch("srtctl.cli.do_sweep.launch") as srun:
             orch._check_clock_sync()
 
         srun.assert_not_called()
@@ -309,7 +309,7 @@ class TestSkipped:
         monkeypatch.setenv("EVAL_ONLY", "true")
         orch = SweepOrchestrator(config=_config(telemetry=_dcgm_power(required=True)), runtime=_runtime(tmp_path))
 
-        with patch("srtctl.cli.do_sweep.start_srun_process") as srun:
+        with patch("srtctl.cli.do_sweep.launch") as srun:
             orch._check_clock_sync()
 
         srun.assert_not_called()

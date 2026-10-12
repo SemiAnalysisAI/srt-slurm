@@ -4,6 +4,33 @@ The `observability:` preset (nsys, OTEL, Tachometer) and the `telemetry:` provid
 
 ## observability
 
+**Dynamo request-lifecycle OTel tracing is on by default**, including when
+`observability.enabled: false` or the entire block is omitted. It applies only to
+the Dynamo stack (`frontend.type: dynamo`). No `enable_otel`, `otel_endpoint`, or
+`DYN_LIFECYCLE_TRACE_ENABLED` recipe setting is needed.
+
+The implied `otel-collector` service starts on the head node before workers,
+receives OTLP/gRPC on port 4317, and saves `<log_dir>/otel/traces.jsonl` and
+`logs.jsonl`. Dynamo frontends and workers receive `DYN_LIFECYCLE_TRACE_ENABLED=1`,
+`OTEL_EXPORT_ENABLED=1`, the head-node OTLP endpoint, and a component service name.
+The collector stops after the serving processes so they can flush spans. This
+uses Dynamo's native `dynamo.request_lifecycle` instrumentation (Dynamo PR
+[#14101](https://github.com/ai-dynamo/dynamo/pull/14101)); the installed Dynamo build
+must include it. The default lifecycle mode is Dynamo's `core` mode.
+
+`make setup ARCH=<compute_arch>` installs the pinned, checksum-verified
+`otelcol-contrib` host binary. A missing binary fails startup with a setup hint.
+An air-gapped installation can set `services[name: otel-collector].options.binary`
+to a shared executable; `options.port` changes both its listener and the automatic
+endpoint. `srtctl dry-run` shows the implied collector regardless of the analytics
+level. [DSight](dsight.md) discovers the saved OTLP JSONL when building the report.
+
+Explicit recipe environment still wins. The existing `enable_otel: true` plus
+`otel_endpoint` redirects traces to that external endpoint, so those traces are
+not saved locally. To opt out of automatic collection, declare the
+`otel-collector` service with `enabled: false`; this also removes its default
+lifecycle/export environment. Neither option changes other stacks' defaults.
+
 Tachometer collection is **on by default for every run** (no configuration needed; `observability.tachometer.enabled: false` opts out). `observability.enabled` turns on the server metrics *content* (the TRT-LLM publish flag and engine statistics) and the trace surfaces:
 
 ```yaml
@@ -69,7 +96,7 @@ Every Tachometer field: [TachometerConfig](schema-reference.md#tachometerconfig)
 | `default_exporters` | bool | `true` | Imply the built-in DCGM + node + process exporters when no explicit blocks are set. The exporters are [services](services.md#implicit-services) (`dcgm-exporter`, `node-exporter`, `process-exporter`); declaring one under `services:` by that name overrides it, and `srtctl dry-run` lists them |
 | `dcgm_exporter` | object/null | built-in | Defaults to `nvcr.io#nvidia/k8s/dcgm-exporter:3.3.9-3.6.1-ubuntu22.04` on port 9401; an explicit block overrides |
 | `node_exporter` | object/null | built-in | Defaults to `quay.io#prometheus/node-exporter:v1.8.2` on port 9101 with the `cpu`, `infiniband`, `meminfo`, `processes`, `stat`, `vmstat`, `pressure` and `meminfo_numa` collectors on worker nodes. Includes major faults and page-reclaim counters; retains process-state and NUMA-node identity. An explicit block overrides |
-| `process_exporter` | object/null | built-in | Defaults to the **host-native** `configs/process-exporter` binary (ncabatoff/process-exporter 0.8.7, installed by `make setup` for the compute arch, like `configs/nats-server` and `configs/etcd`) on port 9256, launched with plain `srun` (no container) on every allocated node (the `process-exporter` service, `placement.node: all`). Reads the host `/proc` and publishes per-process-group CPU seconds by mode, thread count, per-thread-name CPU and count (`-threads=true`), context switches, RSS and open fds. The passthrough filter retains metric names and labels, including summary sum/count suffixes, and attaches hostname and run metadata to raw rows. Groups (frontend, `dynamo_trtllm` / `dynamo_sglang` / `dynamo_vllm` handlers, `trtllm_engine` children, the SGLang engine processes `sglang_scheduler` / `sglang_dp_controller` / `sglang_detokenizer` matched on their retitled command lines, launcher, client, infra daemons) come from `<log_dir>/process-exporter.yml`, written at launch. If the binary is missing the leg is skipped with a warning (submit warns too). An explicit block may set `binary` (absolute, or relative to the srtctl checkout) or instead a `container_image` with `binary` unset to run it containerized; the upstream `FROM scratch` image is not used by default because pyxis/enroot on some clusters cannot start shell-less images |
+| `process_exporter` | object/null | built-in | Defaults to the **host-native** `configs/process-exporter` binary (ncabatoff/process-exporter 0.8.7, installed by `make setup` for the compute arch, like `configs/nats-server` and `configs/etcd`) on port 9256, launched with plain `srun` (no container) on every allocated node (the `process-exporter` service, `placement.node: all`). Reads the host `/proc` and publishes per-process-group CPU seconds by mode, thread count, per-thread-name CPU and count (`-threads=true`), context switches, RSS and open fds. The passthrough filter retains metric names and labels, including summary sum/count suffixes, and attaches hostname and run metadata to raw rows. Groups come from `<log_dir>/process-exporter.yml`, written at launch: the Dynamo frontend, then the groups of every engine the recipe runs (each backend's `process_exporter_groups`: TRT-LLM's `trtllm_llmapi_launch` launcher, `trtllm_engine` children, `dynamo_trtllm` handler and `trtllm_serve`; SGLang's `sglang_scheduler` / `sglang_dp_controller` / `sglang_detokenizer` engine processes and `dynamo_sglang`; vLLM's `vllm_engine_core` / `vllm_worker` / `vllm_api_server` / `vllm_dp_coordinator` engine processes, `vllm_serve` and `dynamo_vllm`), then `vllm_router`, the benchmark clients and the infra daemons. SGLang and vLLM engine processes are matched on their retitled command lines (vLLM's default `VLLM::` title prefix). If the binary is missing the leg is skipped with a warning (submit warns too). An explicit block may set `binary` (absolute, or relative to the srtctl checkout) or instead a `container_image` with `binary` unset to run it containerized; the upstream `FROM scratch` image is not used by default because pyxis/enroot on some clusters cannot start shell-less images |
 
 Every exporter block ([TelemetryExporterConfig](schema-reference.md#telemetryexporterconfig)) accepts `container_image`, `port`, `command` and `binary`, and GPU exporters also `kind` (`dcgm` or `custom`), `gpu_labels` and `gpu_metrics`. `binary` selects host-native launch (the executable runs directly under `srun`, `container_image` is ignored and may be `""`); without it the exporter runs from `container_image`. One of the two must be set. `gpu_labels` and `gpu_metrics` matter only to GPU power telemetry (`telemetry.dcgm_exporter` and the cluster `default_gpu_exporter` it inherits from) and default to DCGM; see [GPU power telemetry](power-telemetry.md#gpu-exporter-labels-and-metrics).
 

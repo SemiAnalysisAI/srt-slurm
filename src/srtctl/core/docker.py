@@ -110,6 +110,8 @@ class DockerLauncher(Launcher):
         ]
         if spec.step_name:
             cmd.extend(["--label", f"{STEP_LABEL}={spec.step_name}"])
+        # Before the job's own -e flags: docker keeps the last value of a variable.
+        cmd.extend(get_srtslurm_setting("docker_args") or [])
         for host, container in (spec.container_mounts or {}).items():
             cmd.extend(["-v", f"{host}:{container}"])
         for name in (*_PASSTHROUGH_ENV, *(spec.env_to_pass_through or ())):
@@ -117,7 +119,6 @@ class DockerLauncher(Launcher):
                 cmd.extend(["-e", name])
         for key, value in (spec.srun_export_env or {}).items():
             cmd.extend(["-e", f"{key}={value}"])
-        cmd.extend(get_srtslurm_setting("docker_args") or [])
         cmd.append(self.docker_image(str(spec.container_image)))
         cmd.extend(self.build_task_command(spec))
         return cmd

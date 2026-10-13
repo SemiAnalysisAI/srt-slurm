@@ -111,7 +111,8 @@ class TestLocalDockerCommand:
         assert "--label srtctl.step=worker_prefill_0" in joined
         assert "-e ENROOT_REMAP_ROOT=yes" in joined
         image_at = cmd.index("nvcr.io/nvidia/vllm:25.01")
-        assert cmd[image_at - 2 : image_at] == ["--user", "1000:1000"]
+        # docker_args precede the job's -e flags, which docker resolves last-wins.
+        assert cmd.index("--user") < cmd.index("ENROOT_REMAP_ROOT=yes") < image_at
         assert cmd[image_at + 1 : image_at + 3] == ["bash", "-c"]
         assert cmd[-1] == (
             "ulimit -n 4096 && export CUDA_VISIBLE_DEVICES=2,3 && unset -- NCCL_DEBUG && exec vllm serve /model"

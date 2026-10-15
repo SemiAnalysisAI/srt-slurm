@@ -141,6 +141,9 @@ class DockerLauncher(Launcher):
             "stack=67108864",
             "--entrypoint",
             "",
+            # As under pyxis, the image's USER does not apply.
+            "--user",
+            "0:0",
         ]
         if spec.step_name:
             cmd.extend(["--label", f"{STEP_LABEL}={spec.step_name}"])
@@ -153,12 +156,36 @@ class DockerLauncher(Launcher):
             cmd.extend(["-e", f"{key}={value}"])
         cmd.extend(get_srtslurm_setting("docker_args") or [])
         cmd.append(self.docker_image(str(spec.container_image)))
-        cmd.extend(self.build_task_command(spec))
+        task = self.build_task_command(spec)
+        if task[:2] == ["bash", "-c"]:
+            # Root here is root on the shared mounts; pyxis maps it to the submitting
+            # user, who keeps writing next to (and later removes) what it creates.
+            task = ["bash", "-c", f"umask 0000 && {task[2]}", *task[3:]]
+        if spec.mpi and spec.ntasks > 1:
+            # An MPI step (TRT-LLM) on one node: the container runs every rank.
+            oversubscribe = ["--oversubscribe"] if spec.oversubscribe else []
+            task = [
+                "mpirun",
+                "--allow-run-as-root",
+                "--bind-to",
+                "none",
+                *oversubscribe,
+                "-np",
+                str(spec.ntasks),
+                *task,
+            ]
+        cmd.extend(task)
         return cmd
 
     def launch(self, spec: LaunchSpec) -> subprocess.Popen:
         hosts = list(spec.nodelist or self.hosts()[:1])
-        if spec.ntasks != len(hosts):
+        if spec.mpi and spec.container_image and len(set(hosts)) == 1:
+            hosts = hosts[:1]  # one container, every rank under mpirun (docker_command)
+        elif spec.mpi and spec.ntasks > 1:
+            raise ValueError(
+                f"launcher: docker runs an MPI step on one node; {spec.step_name} spans {', '.join(dict.fromkeys(hosts))}"
+            )
+        elif spec.ntasks != len(hosts):
             raise ValueError(
                 f"launcher: docker runs one task per node; got ntasks={spec.ntasks} on {len(hosts)} node(s) "
                 f"for {spec.step_name or shlex.join(spec.command[:3])}"
@@ -342,11 +369,16 @@ class DockerLauncher(Launcher):
             cluster_default=get_srtslurm_setting("use_het_jobs", False),
         ):
             errors.append("resources.het_jobs is a Slurm heterogeneous job; set it false")
-        if config.backend.get_srun_config().launch_per_endpoint:
-            errors.append(
-                f"engine {config.backend_type} launches each endpoint as one multi-task MPI step, "
-                "which launcher: docker does not support"
-            )
+        for role in config.topology.roles:
+            backend = config.backend_for_role(role)
+            if (
+                backend.get_srun_config().launch_per_endpoint
+                and config.topology.gpus_per_worker(role) > config.resources.gpus_per_node
+            ):
+                errors.append(
+                    f"roles.{role}: engine {backend.type} runs each worker as one MPI step, which "
+                    "launcher: docker runs on a single node; give each worker at most one node's GPUs"
+                )
         images = {"model.container": str(config.model.container)}
         images.update({f"roles.{role}.container": image for role, image in config.role_containers.items()})
         for key, image in images.items():

@@ -117,8 +117,33 @@ class TestDockerCommand:
         assert cmd.index("--user") < cmd.index("ENROOT_REMAP_ROOT=yes") < image_at
         assert cmd[image_at + 1 : image_at + 3] == ["bash", "-c"]
         assert cmd[-1] == (
-            "ulimit -n 4096 && export CUDA_VISIBLE_DEVICES=2,3 && unset -- NCCL_DEBUG && exec vllm serve /model"
+            "umask 0000 && ulimit -n 4096 && export CUDA_VISIBLE_DEVICES=2,3 && unset -- NCCL_DEBUG "
+            "&& exec vllm serve /model"
         )
+        # The image's USER does not apply, as under pyxis; docker_args may still set one.
+        assert cmd[cmd.index("--user") + 1] == "0:0" and cmd.index("--user") < cmd.index("1000:1000")
+
+    def test_one_node_mpi_step_runs_every_rank_in_one_container(self, docker, cluster):
+        cluster(launcher="docker", docker_hosts=["node-a"])
+        spec = LaunchSpec(
+            command=["trtllm-llmapi-launch", "serve"],
+            ntasks=8,
+            nodelist=["node-a"],
+            container_image="trtllm:1",
+            mpi="pmix",
+            oversubscribe=True,
+            step_name="worker_decode_0",
+        )
+        with patch("srtctl.core.docker.subprocess.Popen", return_value=MagicMock()) as popen:
+            docker.launch(spec)
+        script = popen.call_args.args[0][2]
+        assert script.count("docker run") == 1
+        assert "trtllm:1 mpirun --allow-run-as-root --bind-to none --oversubscribe -np 8 bash -c" in script
+
+    def test_multi_node_mpi_step_is_rejected(self, docker):
+        spec = LaunchSpec(command=["serve"], ntasks=16, nodelist=["a"] * 8 + ["b"] * 8, container_image="x", mpi="pmix")
+        with pytest.raises(ValueError, match="MPI step on one node"):
+            docker.launch(spec)
 
     def test_bash_wrapper_matches_slurm(self, cluster):
         cluster(default_bash_preamble="ulimit -n 4096")
@@ -332,16 +357,14 @@ class TestValidation:
         }
         assert DockerLauncher().validate(_config(tmp_path, data)) == []
 
-    def test_mpi_step_engines_are_rejected(self, tmp_path, cluster):
-        cluster(launcher="docker")
-        data = {
-            **SINGLE_NODE_DISAGG,
-            "frontend": {"type": "dynamo"},
-            "engine": "trtllm",
-            "roles": {"agg": {"nodes": 1, "workers": 1, "gpus": 4}},
-        }
-        problems = DockerLauncher().validate(_config(tmp_path, data))
-        assert any("multi-task MPI step" in p for p in problems)
+    def test_mpi_step_engines_need_one_node_per_worker(self, tmp_path, cluster):
+        cluster(launcher="docker", docker_hosts=["node-a", "node-b"])
+        data = {**SINGLE_NODE_DISAGG, "frontend": {"type": "dynamo"}, "engine": "trtllm"}
+        one_node = {**data, "roles": {"agg": {"nodes": 1, "workers": 1, "gpus": 4}}}
+        assert DockerLauncher().validate(_config(tmp_path, one_node)) == []
+        two_nodes = {**data, "roles": {"agg": {"nodes": 2, "workers": 1}}}
+        problems = DockerLauncher().validate(_config(tmp_path, two_nodes))
+        assert any("roles.agg: engine trtllm runs each worker as one MPI step" in p for p in problems)
 
     def test_slurm_accepts_everything(self, tmp_path):
         assert SlurmLauncher().validate(_config(tmp_path, SINGLE_NODE_DISAGG)) == []

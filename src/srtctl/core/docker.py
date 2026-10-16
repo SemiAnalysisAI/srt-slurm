@@ -135,6 +135,10 @@ class DockerLauncher(Launcher):
             "host",
             "--ipc",
             "host",
+            # CUDA IPC hands GPU memory between ranks with pidfd_getfd, which docker's
+            # seccomp profile only allows with this capability (TRT-LLM, NCCL).
+            "--cap-add",
+            "SYS_PTRACE",
             "--ulimit",
             "memlock=-1",
             "--ulimit",

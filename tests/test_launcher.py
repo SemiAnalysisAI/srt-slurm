@@ -107,7 +107,7 @@ class TestDockerCommand:
         cmd = docker.docker_command(spec, "srtctl_docker-test_worker_prefill_0")
         assert cmd[:5] == ["docker", "run", "--rm", "--name", "srtctl_docker-test_worker_prefill_0"]
         joined = " ".join(cmd)
-        for flag in ("--gpus all", "--network host", "--ipc host", "-v /data/model:/model", "--entrypoint "):
+        for flag in ("--gpus all", "--network host", "--ipc host", "--cap-add SYS_PTRACE", "-v /data/model:/model", "--entrypoint "):
             assert flag in joined
         assert "--label srtctl.job=docker-test" in joined
         assert "--label srtctl.step=worker_prefill_0" in joined

@@ -50,6 +50,11 @@ from srtctl.backends import (
     VLLMMooncakeKVStoreConfig,
 )
 from srtctl.backends.base import RoleSettings, WorkerMode
+from srtctl.backends.trtllm import (
+    trtllm_mooncake_block_only_key_problem,
+    trtllm_mooncake_role_key_problem,
+    trtllm_mooncake_store_config_problem,
+)
 from srtctl.core.formatting import (
     FormattablePath,
     FormattablePathField,
@@ -450,8 +455,10 @@ class ClusterConfig:
     # runtime if a path is genuinely missing on the compute node.
     preflight: bool = True
     # Where processes run: `slurm` (srun steps inside an sbatch allocation) or `docker`
-    # (one job on this machine, containers under `docker run`). See docs/cluster-config.md#launcher.
+    # (`docker run` containers on docker_hosts). See docs/cluster-config.md#launcher.
     launcher: Literal["slurm", "docker"] = "slurm"
+    # Nodes of a `launcher: docker` job, reached over ssh unless it is this machine (default: this machine).
+    docker_hosts: list[str] | None = None
     # Extra `docker run` arguments for every container under `launcher: docker`, e.g. `["--user", "1000:1000"]`.
     docker_args: list[str] | None = None
 
@@ -677,7 +684,7 @@ class SweepConfig:
 class ModelConfig:
     """Model configuration."""
 
-    # Model weights directory, or a `model_paths` alias from srtslurm.yaml. Mounted at /model.
+    # Model weights directory, model_paths alias, or hf:<repo-id>. Local paths are mounted at /model.
     path: str
     # Container image (`.sqsh` path or registry URI), or a `containers` alias from srtslurm.yaml.
     container: str
@@ -686,6 +693,8 @@ class ModelConfig:
     # Optional: stage the model from shared storage to this node-local dir
     # before workers start (e.g. "/raid/scratch/models"). None = use path directly.
     stage_dir: str | None = None
+    # TRT-LLM container path to an HF cache snapshot; pins weights and benchmark tokenizer.
+    hf_snapshot_path: str | None = None
 
     Schema: ClassVar[type[Schema]] = Schema
 
@@ -717,9 +726,9 @@ class IdentityContainerConfig:
 class IdentityConfig:
     """Virtual identity for runtime verification and reproduction.
 
-    These fields declare what *should* be running. They are not used for
-    launching — only for verifying the runtime fingerprint matches expectations
-    and for helping others reproduce the run.
+    These fields declare what *should* be running. The model revision validates
+    model.hf_snapshot_path when one is set; the remaining identity fields are
+    used for runtime verification and reproduction.
 
     - model: HF repo + revision (verified against download metadata at runtime)
     - container: Docker image URI (recorded for reproduction, not verified)
@@ -832,7 +841,7 @@ class RoleConfig(RoleSettings):
     worker, its environment and engine arguments, and optionally its own engine and
     image. ``SrtConfig.topology`` derives the per-role counts the launch path reads;
     ``SrtConfig.backend`` binds the roles onto the engine, which reads ``env`` / ``args`` /
-    ``extra_args`` / ``kv_events`` from them.
+    ``extra_args`` / ``kv_events`` / ``mooncake_store_config`` from them.
     """
 
     # Nodes reserved for this role. `colocate` (decode only) reserves none and packs the
@@ -859,6 +868,9 @@ class RoleConfig(RoleSettings):
     container: str | None = None
     # `true` for the default ZMQ publisher, or a mapping with `publisher` / `topic`.
     kv_events: bool | dict[str, Any] | None = None
+    # TRT-LLM only: Mooncake client config keys for this role's workers (`role`, `global_segment_size`,
+    # ...), layered over the `mooncake-master` service's `options.store_config`. Pool-wide keys stay there.
+    mooncake_store_config: dict[str, Any] = field(default_factory=dict)
     # Run the native engine with a Dynamo sidecar (turns on `dynamo.sidecar`); every role must agree.
     sidecar: bool | None = field(
         default=None,
@@ -1209,6 +1221,10 @@ class BenchmarkConfig:
     # Custom dataset fields (sa-bench)
     dataset_name: str | None = None  # "random" (default) or "custom"
     dataset_path: str | None = None  # Container path to dataset file (mount via extra_mount)
+    # Host dir where sa-bench caches generated "random" datasets so repeated sweeps
+    # skip the (minutes-long) tokenize/decode prompt build. Mounted into the
+    # benchmark container by SABenchRunner.
+    dataset_cache_dir: str | None = None
     # AgentPerf benchmark fields (agentperf-client trajectory replay)
     agentperf_client_dir: str | None = None  # Container path to an agentperf-client checkout (mount via extra_mount)
     # Container path to the client's workload YAML (endpoint/model/concurrency injected)
@@ -1217,6 +1233,8 @@ class BenchmarkConfig:
     trace_file: str | None = None  # Path to trace JSONL file (container path, e.g., /traces/dataset.jsonl)
     custom_tokenizer: str | None = None  # Custom tokenizer class (e.g., "module.path.ClassName")
     use_chat_template: bool = True  # Pass --use-chat-template to benchmark (default: true)
+    # SA-Bench API path (see benchmark_serving.py --endpoint).
+    endpoint: str | None = None  # default: /v1/completions
     # SA-Bench Dynamo adapter: reuse a benchmark-scoped HTTP connection pool.
     # Opt-in to preserve the historical per-request ClientSession behavior.
     reuse_http_connections: bool = False
@@ -1942,8 +1960,13 @@ class CpuPowerConfig:
 
     Attributes:
         enabled: Master switch for this leg. Default: False.
-        source: ``auto`` tries ACPI then DCGM and is best-effort; naming
-            ``acpi`` or ``dcgm`` explicitly makes that provider mandatory.
+        source: ``auto`` uses ACPI when some socket-total sensor reads a
+            positive value, else DCGM fields 1130+1132, else 1130 alone
+            (either DCGM rung accepted only if some socket reads a positive
+            1130; SysIO alone cannot vouch),
+            logging each step down; naming ``acpi`` or ``dcgm`` explicitly
+            makes that provider mandatory (it still proves itself, but exits
+            instead of stepping).
         sample_interval_seconds: Read period on each node, in seconds.
         startup_timeout_seconds: How long to wait for every node's collector
             to publish its ready marker before giving up on readiness.
@@ -1972,17 +1995,26 @@ class CpuPowerExporterConfig:
     containerized -- cpu-power-exporter is a bundled binary installed by
     make setup, launched directly on the bare worker host, with a fallback
     to the Python stdlib exporter when the binary is absent.
+
+    Attributes:
+        port: TCP port the per-node exporter listens on for ``/metrics``.
+        source: Power reading back-end passed through to the bundled Rust
+            binary's own ``--source`` flag (``auto`` | ``acpi`` | ``dcgm``).
+            ``auto`` tries ACPI first (the only source with the socket
+            envelope) and falls back to DCGM when no ACPI power_meter hwmon
+            sensors exist or no socket-total sensor reads positive on two
+            probes; DCGM watches fields 1130+1132 and falls back to 1130 alone
+            if this libdcgm refuses the pair, and is accepted only if some
+            socket reads a positive 1130. DCGM mode reports field 1130 = the
+            CPU rail (plus 1132 = SysIO), about half the ACPI envelope, and
+            the energy report flags such runs as "CPU rail only". Has no
+            effect when the Python stdlib fallback exporter is used instead of
+            the binary -- that fallback is ACPI-only.
     """
 
     # Port the exporter listens on and the head-node collector scrapes.
     port: int = 9405
     source: Literal["auto", "acpi", "dcgm"] = "auto"
-    """Power reading back-end passed through to the bundled Rust binary's own
-    ``--source`` flag (``auto`` | ``acpi`` | ``dcgm``). ``auto`` tries DCGM
-    first and falls back to ACPI when libdcgm.so is absent or reports no CPU
-    entities. Has no effect when the Python stdlib fallback exporter is used
-    instead of the binary -- that fallback is ACPI-only.
-    """
 
     Schema: ClassVar[type[Schema]] = Schema
 
@@ -2010,8 +2042,10 @@ class TelemetryConfig:
     # unsynchronised node silently misaligns the measurement. Fails the job
     # when ``required`` is true; otherwise the run continues and the manifest
     # records ``clock_sync_unverified`` with ``publication_valid: false``.
-    # Set false on clusters where timedatectl/chronyc/ntpq are unavailable to
-    # unprivileged users.
+    # Probes timedatectl, chronyc, ntpq, then kernel maxerror < 16 seconds via
+    # adjtimex(2) (python3) for hosts with no queryable time daemon. These are
+    # synchronisation-status checks, not bounds on inter-node clock skew.
+    # Set false only where none of those is available to unprivileged users.
     clock_sync_check: bool = True
     # Seconds to wait for the exporters to answer before giving up (DCGM and CPU legs).
     startup_timeout_seconds: float = 30.0
@@ -2487,15 +2521,20 @@ class DynamoConfig:
             return {}
         return {"DYNAMO_WHEEL_NAME": f"ai_dynamo-{version}-py3-none-any.whl", "DYNAMO_VERSION": version}
 
-    def get_install_commands(self) -> str:
+    def get_install_commands(self, *, serialize: bool = True) -> str:
         """Get the bash commands to install dynamo.
 
         The returned command is wrapped in a node-local flock + sentinel so
         that co-located srun tasks (``--ntasks-per-node > 1``, e.g. TRTLLM)
         install once per node instead of racing concurrent pip installs into
         the shared container site-packages. See ``_serialize_node_install``.
+
+        Pass ``serialize=False`` when baking the install into a container image:
+        there is a single task, and the sentinel would otherwise be captured in
+        the image and make every later job skip its own install.
         """
-        return _serialize_node_install(self._build_install_commands())
+        raw = self._build_install_commands()
+        return _serialize_node_install(raw) if serialize else raw
 
     def _build_install_commands(self) -> str:
         """Build the raw (unserialized) dynamo install command."""
@@ -2789,6 +2828,23 @@ class SrtConfig:
 
     def __post_init__(self):
         """Validate configuration after initialization."""
+        if isinstance(self.model, ModelConfig) and self.model.hf_snapshot_path is not None:
+            if not isinstance(self.engine, TRTLLMBackend):
+                raise ValueError("model.hf_snapshot_path currently requires engine.type: trtllm")
+            snapshot = Path(self.model.hf_snapshot_path)
+            model_id = self.model.path.removeprefix("hf:")
+            expected_repo_dir = "models--" + model_id.replace("/", "--")
+            if not self.model.path.startswith("hf:") or not snapshot.is_absolute():
+                raise ValueError("model.hf_snapshot_path requires an hf: model.path and an absolute container path")
+            if snapshot.parent.name != "snapshots" or snapshot.parent.parent.name != expected_repo_dir:
+                raise ValueError(
+                    "model.hf_snapshot_path must point to the model's HF cache snapshots/<revision> directory"
+                )
+            revision = self.identity.model.revision
+            if not revision or len(revision) != 40 or not is_commit_sha(revision) or snapshot.name != revision:
+                raise ValueError("model.hf_snapshot_path must end with identity.model.revision (a pinned commit SHA)")
+            if self.identity.model.repo and self.identity.model.repo != model_id:
+                raise ValueError("identity.model.repo must match model.path when model.hf_snapshot_path is set")
         self._validate_roles()
         _ = self.backend  # bind the roles onto the engine now, so a bad role setting fails at load
         self._validate_role_backends()
@@ -3306,6 +3362,10 @@ class SrtConfig:
         ``MooncakeConnector``), the master we launch is unused and workers fall
         back to the default transport — almost never what the user intends.
         """
+        self._validate_role_mooncake_store_config()
+        if isinstance(self.backend, TRTLLMBackend):
+            self._validate_trtllm_mooncake_store(self.backend)
+            return
         mooncake_cfg = self.backend.mooncake_kv_store
         if mooncake_cfg is None:
             return
@@ -3367,6 +3427,117 @@ class SrtConfig:
                     "one) so workers actually use the mooncake master srtslurm launches "
                     "for you."
                 )
+
+    def _validate_role_mooncake_store_config(self) -> None:
+        """``roles.<role>.mooncake_store_config`` is read by a TRT-LLM role's engine only."""
+        for role, spec in self.roles.items():
+            if spec.mooncake_store_config and not isinstance(self.role_backends.get(role, self.backend), TRTLLMBackend):
+                raise ValidationError(
+                    f"roles.{role}.mooncake_store_config is read by TRT-LLM only. For SGLang, set per-role Mooncake "
+                    "settings as MOONCAKE_* variables in roles.<role>.env; for vLLM, in the mooncake-master "
+                    "service's options.store_config."
+                )
+
+    def _validate_trtllm_mooncake_store(self, backend: TRTLLMBackend) -> None:
+        """TRT-LLM's Mooncake Store connector against the master srtslurm launches.
+
+        With a ``mooncake-master`` service, srtslurm renders each connector role's
+        client config and points ``MOONCAKE_CONFIG_PATH`` at it, which TRT-LLM reads
+        before its ``kv_connector_config.mooncake_store`` block. Everything checked
+        here would otherwise fail in every rank after the model has loaded.
+        """
+        store = backend.mooncake_kv_store
+        modes = backend.mooncake_store_modes()
+        role_keys = {
+            role: dict(spec.mooncake_store_config) for role, spec in self.roles.items() if spec.mooncake_store_config
+        }
+        if store is None:
+            if role_keys:
+                raise ValidationError(
+                    f"roles.{min(role_keys)}.mooncake_store_config needs a mooncake-master service: srtslurm writes "
+                    "it into the client config it renders for the master's pool"
+                )
+            self._validate_trtllm_own_mooncake_pool(backend, modes)
+            return
+        if any(s.enabled and s.type == "mooncake-master" and s.external for s in self.services):
+            raise ValidationError(
+                "an external mooncake-master is not supported for TRT-LLM: srtslurm renders each role's "
+                "master_server_address from the infra node, where nothing would be listening"
+            )
+        if not modes:
+            raise ValidationError(
+                "a mooncake-master service is configured but no roles.<role>.args.kv_connector_config resolves to "
+                "the Mooncake Store connector (connector: mooncake-store, with connector_module unset or "
+                "tensorrt_llm._torch.pyexecutor.connectors.mooncake_store), so no TRT-LLM worker would use the master."
+            )
+        for mode in modes:
+            if backend.get_config_for_mode(mode)["kv_connector_config"].get("mooncake_store") is not None:
+                raise ValidationError(
+                    f"roles.{mode}.args.kv_connector_config.mooncake_store is set, but with a mooncake-master "
+                    "service srtslurm gives this role its Mooncake client config through MOONCAKE_CONFIG_PATH, "
+                    "which TRT-LLM reads instead of that block. Remove the block and put its settings in the "
+                    "service's options.store_config or roles.<role>.mooncake_store_config (segment_size is "
+                    "global_segment_size there; pool, run_dir, and master_timeout have no equivalent)."
+                )
+        unused = sorted(set(role_keys) - set(modes))
+        if unused:
+            raise ValidationError(
+                f"roles.{unused[0]}.mooncake_store_config is set, but only {list(modes)} use the Mooncake Store "
+                "connector"
+            )
+        sources = {"mooncake-master options.store_config": store.store_config or {}}
+        sources.update({f"roles.{role}.mooncake_store_config": keys for role, keys in role_keys.items()})
+        for where, keys in sources.items():
+            problem = trtllm_mooncake_block_only_key_problem(keys)
+            if problem is None and where.startswith("roles."):
+                problem = trtllm_mooncake_role_key_problem(keys)
+            if problem is not None:
+                raise ValidationError(f"{where}: {problem}")
+        served_model_name = backend.get_served_model_name("<model directory name>")
+        for mode in modes:
+            problem = trtllm_mooncake_store_config_problem(
+                backend.build_mooncake_store_config(mode, "<infra_ip>", served_model_name)
+            )
+            if problem is not None:
+                raise ValidationError(f"Mooncake client config for roles.{mode}: {problem}")
+
+    def _validate_trtllm_own_mooncake_pool(self, backend: TRTLLMBackend, modes: tuple[WorkerMode, ...]) -> None:
+        """Connector roles without a mooncake-master service must find a client config themselves.
+
+        Every rank runs under trtllm-llmapi-launch, so a MOONCAKE_CONFIG_PATH that trtllm-serve
+        exports never reaches it: ranks read the config trtllm-serve rendered back from
+        ``mooncake_store.run_dir``, which one server claims for itself. ``dynamo.trtllm``
+        renders none; a Dynamo sidecar engine is ``tensorrt_llm.commands.serve`` and does.
+        """
+        from srtctl.frontends import get_frontend
+
+        workers = {
+            "prefill": self.topology.num_prefill,
+            "decode": self.topology.num_decode,
+            "agg": self.topology.num_agg,
+        }
+        run_dirs: dict[str, WorkerMode] = {}
+        for mode in modes:
+            if "MOONCAKE_CONFIG_PATH" in {**self.environment, **backend.get_environment_for_mode(mode)}:
+                continue
+            block = backend.get_config_for_mode(mode)["kv_connector_config"].get("mooncake_store")
+            run_dir = block.get("run_dir") if isinstance(block, Mapping) else None
+            serve_renders = self.dynamo.sidecar or get_frontend(self.frontend.type).worker_launch == "direct"
+            if not run_dir or not serve_renders:
+                raise ValidationError(
+                    f"roles.{mode}.args.kv_connector_config selects the mooncake-store connector, but its workers "
+                    "would not find a Mooncake client config. Declare a mooncake-master service: srtslurm then "
+                    "launches the master and gives this role its config through MOONCAKE_CONFIG_PATH. (Without "
+                    f"one, set MOONCAKE_CONFIG_PATH in roles.{mode}.env, or, when trtllm-serve runs the engine, "
+                    "a mooncake_store block with run_dir.)"
+                )
+            if workers[mode] > 1 or run_dir in run_dirs:
+                raise ValidationError(
+                    f"roles.{mode}.args.kv_connector_config.mooncake_store.run_dir {run_dir!r} would be shared by "
+                    "several servers, and TRT-LLM lets one live server own a run_dir. Give each role its own "
+                    "run_dir and one worker, or declare a mooncake-master service."
+                )
+            run_dirs[run_dir] = mode
 
     def _profiling_worker_ranks(self, mode: WorkerMode) -> set[int]:
         """Derive selectable physical ranks from the configured worker layout."""

@@ -325,8 +325,23 @@
         "slurm",
         "docker"
       ],
-      "description": "Where processes run: `slurm` (srun steps inside an sbatch allocation) or `docker` (one job on this machine, containers under `docker run`). See docs/cluster-config.md#launcher.",
+      "description": "Where processes run: `slurm` (srun steps inside an sbatch allocation) or `docker` (`docker run` containers on docker_hosts). See docs/cluster-config.md#launcher.",
       "default": "slurm"
+    },
+    "docker_hosts": {
+      "anyOf": [
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Nodes of a `launcher: docker` job, reached over ssh unless it is this machine (default: this machine).",
+      "default": null
     },
     "docker_args": {
       "anyOf": [

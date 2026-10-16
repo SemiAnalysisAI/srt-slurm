@@ -270,6 +270,7 @@ def mock_infrastructure(*, options: MockOptions, output_dir: Path):
         ("srtctl.cli.mixins.worker_stage.launch", _fake_launch),
         ("srtctl.cli.mixins.frontend_stage.launch", _fake_launch),
         ("srtctl.cli.mixins.telemetry_stage.launch", _fake_launch),
+        ("srtctl.cli.mixins.telemetry_stage.list_step_ids", lambda *args, **kwargs: None),
         ("srtctl.cli.mixins.benchmark_stage.launch", _fake_launch),
         ("srtctl.cli.mixins.postprocess_stage.launch", _fake_launch),
         ("srtctl.cli.mixins.service_stage.launch", _fake_launch),

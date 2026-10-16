@@ -115,6 +115,36 @@ def test_cluster_bash_preamble_warns_when_bash_wrapper_disabled(caplog) -> None:
     assert any("default_bash_preamble" in record.message for record in caplog.records)
 
 
+def test_srun_output_is_opened_in_append_mode() -> None:
+    """Benchmark stage banners are appended into live worker logs.
+
+    With srun's default truncating open it would keep writing at its own offset
+    and overwrite them.
+    """
+    with (
+        patch("srtctl.core.slurm.get_slurm_job_id", return_value="12345"),
+        patch("srtctl.core.launcher._get_cluster_bash_preamble", return_value=None),
+        patch("subprocess.Popen") as mock_popen,
+    ):
+        mock_popen.return_value = MagicMock()
+        launch(LaunchSpec(["python3", "-m", "server"], output="/logs/node01_prefill_w0.out"))
+
+    srun_cmd = mock_popen.call_args.args[0]
+    assert srun_cmd[srun_cmd.index("--open-mode") + 1] == "append"
+
+
+def test_srun_without_output_has_no_open_mode() -> None:
+    with (
+        patch("srtctl.core.slurm.get_slurm_job_id", return_value="12345"),
+        patch("srtctl.core.launcher._get_cluster_bash_preamble", return_value=None),
+        patch("subprocess.Popen") as mock_popen,
+    ):
+        mock_popen.return_value = MagicMock()
+        launch(LaunchSpec(["python3", "-m", "server"]))
+
+    assert "--open-mode" not in mock_popen.call_args.args[0]
+
+
 def test_srun_options_use_equals_separator() -> None:
     with (
         patch("srtctl.core.slurm.get_slurm_job_id", return_value="12345"),
@@ -392,9 +422,7 @@ def test_worker_container_paths_follow_a_remapped_log_mount(tmp_path: Path, laun
 
     dump_path = mixin.backend.build_worker_command.call_args.kwargs["dump_config_path"]
     assert dump_path == Path("/run/logs/node-a_config.json")
-    assert (
-        vars(srun.call_args.args[0])["env_to_set"]["SGLANG_TORCH_PROFILER_DIR"] == "/run/logs/profiles/prefill"
-    )
+    assert vars(srun.call_args.args[0])["env_to_set"]["SGLANG_TORCH_PROFILER_DIR"] == "/run/logs/profiles/prefill"
     assert capture.call_args.args[0] == "/run/logs/fingerprint_prefill_w0.json"
     # srtctl still creates the profile directory on the host side of the mount.
     assert (tmp_path / "profiles" / "prefill").is_dir()
@@ -656,9 +684,7 @@ def test_trtllm_native_kv_event_host_override_is_preserved(tmp_path: Path) -> No
         mock_srun.return_value = MagicMock()
         mixin.start_endpoint_worker([process, second_process])
 
-    assert (
-        vars(mock_srun.call_args.args[0])["env_to_set"]["DYN_TRTLLM_KV_EVENT_HOSTS"] == "override-a,override-b"
-    )
+    assert vars(mock_srun.call_args.args[0])["env_to_set"]["DYN_TRTLLM_KV_EVENT_HOSTS"] == "override-a,override-b"
 
 
 @pytest.mark.parametrize("launch_method", ["start_worker", "start_endpoint_worker"])

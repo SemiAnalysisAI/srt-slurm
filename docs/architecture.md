@@ -560,11 +560,11 @@ consumer derives one port from another.
 | `sys` | 7500 | 1 | global | every process (`DYN_SYSTEM_PORT`) |
 | `http` | 6100 | 32 | per node | endpoint leaders (a router connects) |
 | `bootstrap` | 7200 | 1 | per node | prefill endpoints |
-| `kv_events` | 5200 | 1 | global | every process (block per local DP size) |
+| `kv_events` | 5200 | 1 | global | every process (block per DP rank: vLLM local, SGLang the worker's) |
 | `nixl` | 5400 | 1 | global | every process (block per DP size) |
 | `dp_rpc` | 8400 | 1 | per node | vLLM DP endpoints |
 | `kvbm_zmq` | 5600 | 2 | global | KVBM leaders (pub, ack = pub + 1) |
-| `sidecar_grpc` | 50051 | 1 | global | Dynamo sidecars (base: `sidecar_port`) |
+| `sidecar_grpc` | 19000 | 1 | global | Dynamo sidecars (base: `sidecar_port`) |
 | `nccl` | 17500 | 1 | global | SGLang servers |
 | `dist_init` | 8300 | 1 | per node | SGLang multi-node endpoints (leader) |
 | `vllm_scan` | 20000 | 50 | global | vLLM `get_open_port()` scan range |

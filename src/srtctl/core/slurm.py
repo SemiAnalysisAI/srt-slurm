@@ -275,6 +275,12 @@ class SlurmLauncher(Launcher):
 
         if spec.output:
             srun_cmd.extend(["--output", spec.output])
+            # Stream task output with O_APPEND so another process on the shared
+            # filesystem can inject lines into a live log without srun overwriting
+            # them on its next write — this is what lets the benchmark mark its
+            # stages inside the worker logs. Log files are unique per job, so append
+            # behaves like truncate on the first open.
+            srun_cmd.extend(["--open-mode", "append"])
 
         if spec.container_image:
             srun_cmd.extend(["--container-image", str(spec.container_image)])
@@ -325,7 +331,9 @@ class SlurmLauncher(Launcher):
             env=None,  # Inherit environment
         )
 
-    def list_step_ids(self, job_id: str | None = None) -> dict[str, str] | None:
+    def list_step_ids(
+        self, job_id: str | None = None, *, unique_names: set[str] | None = None
+    ) -> dict[str, str] | None:
         job_id = job_id or get_slurm_job_id()
         if not job_id or shutil.which("squeue") is None:
             return None
@@ -347,6 +355,9 @@ class SlurmLauncher(Launcher):
         for line in result.stdout.splitlines():
             parts = line.split()
             if len(parts) >= 2:
+                if unique_names is not None and parts[1] in unique_names and parts[1] in steps:
+                    logger.warning("Ambiguous Slurm step name %s", parts[1])
+                    return None
                 steps.setdefault(parts[1], parts[0])
         return steps
 

@@ -19,12 +19,13 @@ import logging
 import os
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from srtctl.backends.vllm import MOONCAKE_STORE_CONFIG_FILENAME, VLLMBackend
+from srtctl.backends.vllm import VLLMBackend
 from srtctl.cli.mixins import (
     BenchmarkStageMixin,
     FrontendStageMixin,
@@ -131,18 +132,21 @@ class SweepOrchestrator(
         self.start_services("infra", registry)
 
     def _write_mooncake_store_config(self) -> None:
-        """vLLM's MooncakeStoreConnector reads its config from a JSON file, not env.
+        """vLLM's and TRT-LLM's Mooncake connectors read their config from a JSON file, not env.
 
         Written into log_dir (mounted at /logs in every worker) before workers
         start, pointing at the Mooncake master on the infra node.
         """
         backend = self.config.backend
+        served_model_name = backend.get_served_model_name(self.runtime.model_path.name)
+        for filename, store_cfg in backend.mooncake_store_configs(
+            self.runtime.infra_node_ip, served_model_name
+        ).items():
+            store_cfg_path = self.runtime.log_dir / filename
+            store_cfg_path.write_text(json.dumps(store_cfg, indent=2))
+            logger.info("Wrote mooncake_store_config to %s: %s", store_cfg_path, store_cfg)
         if not isinstance(backend, VLLMBackend) or backend.mooncake_kv_store is None:
             return
-        store_cfg = backend.build_mooncake_store_config(self.runtime.infra_node_ip)
-        store_cfg_path = self.runtime.log_dir / MOONCAKE_STORE_CONFIG_FILENAME
-        store_cfg_path.write_text(json.dumps(store_cfg, indent=2))
-        logger.info("Wrote mooncake_store_config to %s: %s", store_cfg_path, store_cfg)
         if not backend.mooncake_kv_store.device_names_by_gpu:
             return
         # Render only GPU subsets actually launched, rather than all 2**N subsets.
@@ -313,20 +317,75 @@ class SweepOrchestrator(
         raise RuntimeError(f"host_setup failed on: {', '.join(failures)}")
 
     # One probe per branch; the first that proves synchronisation prints its
-    # evidence and wins, so clock_sync_<node>.out records *which* daemon
+    # evidence and wins, so clock_sync_<node>.out records *which* source
     # vouched (and, for chrony/ntp, the offset it reported). Every probe is
     # read-only and unprivileged on stock images: timedatectl reads the kernel
-    # STA_UNSYNC flag over D-Bus, chronyc/ntpq ask their daemon. Locked-down
-    # cmdports print nothing and fall through to the failure line.
+    # maxerror over D-Bus, chronyc/ntpq ask their daemon. The last
+    # branch reads that same kernel value directly through adjtimex(2), for
+    # hosts whose clock is disciplined but expose no daemon to ask: no systemd
+    # PID 1 or D-Bus (container-rooted Slurm nodes), no chrony/ntp CLI. Each
+    # probe's stderr is kept and printed on the failure path, so the .out says
+    # why nothing vouched ("Failed to connect to bus", "command not found", ...).
+    #
+    # The kernel probe is plain Python shipped inside the bash one-liner, so it
+    # must stay free of single quotes.
+    CLOCK_SYNC_ADJTIMEX_PROBE = textwrap.dedent(
+        """\
+        import ctypes
+        import sys
+
+        # Match systemd ntp_synced(): STA_UNSYNC can stay set when chrony disables RTC sync.
+        MAXERROR_LIMIT_US = 16_000_000
+
+
+        class timex(ctypes.Structure):  # struct timex, LP64 layout (adjtimex(2))
+            _fields_ = [
+                ("modes", ctypes.c_uint),
+                ("offset", ctypes.c_long),
+                ("freq", ctypes.c_long),
+                ("maxerror", ctypes.c_long),
+                ("esterror", ctypes.c_long),
+                ("status", ctypes.c_int),
+                ("constant", ctypes.c_long),
+                ("precision", ctypes.c_long),
+                ("tolerance", ctypes.c_long),
+                ("time", ctypes.c_long * 2),
+                ("tick", ctypes.c_long),
+                ("ppsfreq", ctypes.c_long),
+                ("jitter", ctypes.c_long),
+                ("shift", ctypes.c_int),
+                ("stabil", ctypes.c_long),
+                ("jitcnt", ctypes.c_long),
+                ("calcnt", ctypes.c_long),
+                ("errcnt", ctypes.c_long),
+                ("stbcnt", ctypes.c_long),
+                ("tai", ctypes.c_int),
+                ("pad", ctypes.c_int * 11),
+            ]
+
+
+        tx = timex()  # modes == 0: read-only query
+        state = ctypes.CDLL(None, use_errno=True).adjtimex(ctypes.byref(tx))
+        if state < 0:
+            sys.exit("adjtimex failed: errno %d" % ctypes.get_errno())
+        if tx.maxerror >= MAXERROR_LIMIT_US:
+            sys.exit("kernel clock unsynchronised: state %d status 0x%x maxerror %dus" % (state, tx.status, tx.maxerror))
+        print("maxerror %dus status 0x%x" % (tx.maxerror, tx.status))
+        """
+    )
     CLOCK_SYNC_SCRIPT = (
-        "if timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -qx yes; then "
+        'timedatectl=$(timedatectl show -p NTPSynchronized --value 2>&1); if grep -qx yes <<<"$timedatectl"; then '
         'echo "$(hostname): timedatectl NTPSynchronized=yes"; exit 0; fi; '
-        "if t=$(chronyc -n tracking 2>/dev/null) && grep -Eq '^Leap status *: *Normal' <<<\"$t\"; then "
+        "if chronyc=$(chronyc -n tracking 2>&1) && grep -Eq '^Leap status *: *Normal' <<<\"$chronyc\"; then "
         'echo "$(hostname): chronyc Leap status Normal"; '
-        "grep -E '^(Reference ID|System time|Last offset)' <<<\"$t\"; exit 0; fi; "
-        "if n=$(ntpq -pn 2>/dev/null) && grep -q '^[*]' <<<\"$n\"; then "
-        'echo "$(hostname): ntpq has a selected peer"; grep \'^[*]\' <<<"$n"; exit 0; fi; '
-        'echo "$(hostname): system clock is not NTP-synchronised" >&2; exit 1'
+        "grep -E '^(Reference ID|System time|Last offset)' <<<\"$chronyc\"; exit 0; fi; "
+        "if ntpq=$(ntpq -pn 2>&1) && grep -q '^[*]' <<<\"$ntpq\"; then "
+        'echo "$(hostname): ntpq has a selected peer"; grep \'^[*]\' <<<"$ntpq"; exit 0; fi; '
+        f"if adjtimex=$(python3 -c '{CLOCK_SYNC_ADJTIMEX_PROBE}' 2>&1); then "
+        'echo "$(hostname): kernel adjtimex maxerror below 16s ($adjtimex)"; exit 0; fi; '
+        '{ echo "$(hostname): system clock is not NTP-synchronised"; '
+        'echo "timedatectl: $timedatectl"; echo "chronyc: $chronyc"; echo "ntpq: $ntpq"; echo "adjtimex: $adjtimex"; } >&2; '
+        "exit 1"
     )
     CLOCK_SYNC_TIMEOUT_SECONDS = 30
 
@@ -486,6 +545,12 @@ class SweepOrchestrator(
         in cache and skip downloading entirely - no locks created.
         """
         if not self.runtime.is_hf_model:
+            return
+
+        if self.runtime.hf_snapshot_path:
+            logger.info(
+                "Using pinned HF snapshot %s; skipping unversioned model pre-download", self.runtime.hf_snapshot_path
+            )
             return
 
         hf_home = self._get_hf_home()

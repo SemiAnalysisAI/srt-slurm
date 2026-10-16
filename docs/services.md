@@ -95,7 +95,7 @@ services:
 | `type` | `generic` | Selects a [service type](#service-types) that supplies defaults, and for the typed kinds the command. |
 | `enabled` | `true` | `false` drops the service. Declaring an implied name with `enabled: false` switches it off. |
 | `external` | none | `etcd`, `nats`, `mooncake-master` only: an address of an already-running instance. Nothing launches; the address is injected where the job's own would have been. |
-| `options` | `{}` | Kind-specific knobs; unknown keys are rejected. `nats`: `max_payload_mb`. `dcgm-exporter`, `node-exporter`: `port`, `collect_interval_ms`. `mooncake-master`: `store_config` (vLLM). |
+| `options` | `{}` | Kind-specific knobs; unknown keys are rejected. `nats`: `max_payload_mb`. `dcgm-exporter`, `node-exporter`: `port`, `collect_interval_ms`. `mooncake-master`: `store_config` (vLLM, TRT-LLM), `device_names_by_gpu` (vLLM). |
 | `command` | type default | Argv passed directly to the process. `generic` has no default, so it is required there. |
 | `args` | `[]` | Appended to `command`. Handy with typed services that supply the command. |
 | `container` | type fallback, then job container | Aliases resolve through `srtslurm.yaml` like every other container key. |
@@ -105,7 +105,7 @@ services:
 | `placement.per` | `node` | `worker`: one instance per engine worker on each placed node instead of one per node, attached to that worker (its `CUDA_VISIBLE_DEVICES`, the `{worker_*}` placeholders). See [Placement](#placement). |
 | `nodes` | none | Whole nodes this service owns: its pool, added to the allocation after the engine roles' nodes, in declaration order. Any number of services may own nodes, next to engine roles or without them. An owner is placed on its own pool (`placement.node: workers`). Not supported with `resources.het_jobs`. See [pools.md](pools.md). |
 | `start` | type default | `etcd`, `nats`: `infra`. `mooncake-master`, `mooncake-store`, `lmcache-server`: `before_workers`. `generic` and the exporters: `after_frontend`. |
-| `readiness` | type default | One probe per node: `port` / `tcp`, `http`, or `log`, plus `timeout_seconds` and `interval_seconds`. The typed kinds gate on their well-known ports when no probe is written. See [Start Order and Readiness](#start-order-and-readiness). Timing out terminates what this stage started and fails the job. |
+| `readiness` | type default | One probe per node: `port` / `tcp`, `http`, `log`, or `file`, plus `timeout_seconds` and `interval_seconds`. The typed kinds gate on their well-known ports when no probe is written. See [Start Order and Readiness](#start-order-and-readiness). Timing out terminates what this stage started and fails the job. |
 | `inherit_discovery_env` | `true` | Inject the same `ETCD_ENDPOINTS` / `NATS_SERVER` the Dynamo frontend gets. |
 | `critical` | type default | `generic`: `false`. `mooncake-store`, `lmcache-server`: `true`. |
 | `terminal` | `false` | This service is the job's run: the job ends when every instance of every terminal service has exited, with the worst exit code as the job's. The recipe has no benchmark step (`benchmark.type` stays `manual`); combining the two is refused. See [pools.md](pools.md#ending-the-job-with-a-pool). |
@@ -201,7 +201,7 @@ a sidecar in the Kubernetes sense. The instance runs in that worker's device vie
 `CUDA_VISIBLE_DEVICES`, the same pinning the worker's engine steps get) and sees `{worker_role}`,
 `{worker_index}`, `{worker_node_rank}`, `{worker_gpus}` and `{worker_gpu_count}`, plus `{worker_http_port}` when the worker serves an API and `{worker_proxy_port}` when the frontend reaches it through a proxy (`Process.proxy_port`). The kind decides which workers get an instance: every one by default; the `llm-d-sidecar` only the routable decode workers it fronts. Its step and log are
 `service_<name>_<role>_<index>_<node>`. Because the instances of one node share its network namespace,
-a per-worker service's `readiness` must be a log probe. The GPU Memory Service of
+a per-worker service's `readiness` must be a log or file probe. The GPU Memory Service of
 [shadow engine recovery](shadow-engine-recovery.md) is the built-in per-worker kind, and [SGLang fast engine recovery](sglang-weight-cache.md) runs SGLang's weight cache daemon as a plain `generic` per-worker service:
 
 ```yaml
@@ -228,7 +228,7 @@ declaration order:
 Within a phase, a service with `readiness` blocks until its probe passes on each of its nodes. The
 typed kinds gate on their well-known ports by default (etcd 2379, NATS 4222, the Mooncake master
 8700, 8701, and 8702, the exporters none); a `generic` service without a probe is considered started
-when its `srun` is launched. Three probes are available, and a `readiness` block names exactly one:
+when its `srun` is launched. Four probes are available, and a `readiness` block names exactly one:
 
 ```yaml
 readiness:
@@ -256,6 +256,27 @@ readiness:
   log:
     pattern: 'Uvicorn running on .*:\d+'   # a regex matched against service_<name>.out
 ```
+
+```yaml
+readiness:
+  file:
+    path: mooncake_donor_{index}.ready  # relative to the shared run logs directory
+```
+
+A file probe waits for a regular file under the run's shared logs directory. The service
+writes it through the `/logs` mount; the orchestrator checks the corresponding host path.
+Service placeholders are resolved for each instance. Include `{index}` to give every
+instance of a service a distinct marker, including under `placement.per: worker`;
+`{worker_index}` alone can repeat across roles. Use a dedicated marker name such as
+`mooncake_donor_{index}.ready`, since the path is deleted before launch; do not point it
+at a log or another component's file. Absolute paths and `..` components are rejected.
+The marker belongs to the service: srt-slurm removes an old marker **before launching** its process,
+so a previous execution cannot satisfy readiness. The service should create its marker
+only after initialization completes. See [the file readiness example](https://github.com/NVIDIA/srt-slurm/blob/main/examples/features/file-readiness.yaml).
+
+On NFS-backed logs directories, [attribute and lookup caching](https://man7.org/linux/man-pages/man5/nfs.5.html)
+can delay visibility of a marker created on another node. Allow for initialization and
+the mount's cache timeouts when setting `timeout_seconds`.
 
 The probe is re-run every `interval_seconds` until it passes. Between attempts the stage checks that
 the process is still alive, so a service that crashes fails the job at once with its exit code rather
@@ -307,7 +328,7 @@ environment its process needs; the launch path is shared by every kind. Register
 | `otel-collector` | `configs/otelcol-contrib --config <log_dir>/otel-collector.yaml` on the bare node | `before_workers` | `true` | Implied only by Dynamo, independent of observability. Head node, OTLP/gRPC port 4317. `options`: `binary`, `port`. Writes DSight-compatible OTLP JSONL and stops after workers. |
 | `etcd` | `/configs/etcd` from the job container, advertising the node's IP | `infra` | `true` | Implied by the Dynamo frontend. Placement `head`, `infra`, or `dedicated`; supports `external`. Fresh data dir on node-local `/tmp` each job. |
 | `nats` | `/configs/nats-server -js` from the job container | `infra` | `true` | Implied by the Dynamo frontend. `options.max_payload_mb` writes a server config. Same placements as etcd; supports `external`. |
-| `mooncake-master` | `mooncake_master` with the RPC, HTTP metadata, and metrics ports srtctl owns | `before_workers` | `true` | Declared by name; see [Mooncake KV Store](mooncake-kv-store.md). `args` are appended; `options.store_config` is the vLLM connector JSON. Container falls back to the job container. Supports `dedicated` and `external`. |
+| `mooncake-master` | `mooncake_master` with the RPC, HTTP metadata, and metrics ports srtctl owns | `before_workers` | `true` | Declared by name; see [Mooncake KV Store](mooncake-kv-store.md). `args` are appended; `options.store_config` is the vLLM or TRT-LLM connector JSON (a TRT-LLM role layers its own keys in `roles.<role>.mooncake_store_config`). Container falls back to the job container. Supports `dedicated` and `external`. |
 | `dcgm-exporter` | `dcgm-exporter --collect-interval=<ms> --address :9401` in `nvcr.io/nvidia/k8s/dcgm-exporter` | `after_frontend` | `false` | Implied on worker nodes while tachometer runs. Shell-less (distroless image). `options`: `port`, `collect_interval_ms`. |
 | `node-exporter` | `/bin/node_exporter` with the cpu, infiniband, and meminfo collectors on 9101 in `quay.io/prometheus/node-exporter` | `after_frontend` | `false` | Implied on worker nodes while tachometer runs. Shell-less. `options`: `port`. |
 | `process-exporter` | `configs/process-exporter -config.path <log_dir>/process-exporter.yml -web.listen-address=:9256 -threads=true ...` on the bare node | `after_frontend` | `false` | Implied on every allocated node (`placement.node: all`) while tachometer runs. Host-native from the static binary `make setup` installs; skipped with a warning when it is missing. A declared `container` switches to the image's `/bin/process-exporter` with the group file under `/logs`. `options`: `port`, `binary`. |

@@ -20,15 +20,26 @@ the watts is selected per cluster or recipe (see [GPU exporter labels and metric
   aligned, so the client may run on any node (`benchmark.placement.node`,
   including `dedicated`). Before any server starts, the
   orchestrator probes every allocation node's bare host for a synchronised
-  clock (`timedatectl`, then `chronyc`, then `ntpq`). Each node's verdict is
-  logged (`clock_sync_check: <node> OK (<which daemon vouched>)`) and the
-  probe's output — including the chrony/ntp offset when that path proved it —
-  is kept in `<log_dir>/clock_sync_<node>.out`. A node that cannot prove
+  clock (`timedatectl`, then `chronyc`, then `ntpq`, then kernel
+  `maxerror < 16_000_000` microseconds read through `adjtimex(2)` with
+  `python3`). The fallback follows
+  [systemd's synchronization check](https://github.com/systemd/systemd/commit/bca5a0e),
+  ignoring `STA_UNSYNC` because chrony can leave it set when RTC synchronization
+  is disabled. It supports hosts with no queryable time daemon, such as
+  container-rooted Slurm nodes without systemd or D-Bus. Each node's verdict
+  is logged (`clock_sync_check: <node> OK (<which source vouched>)`) and the
+  probe's output — including the chrony/ntp offset when that path proved it,
+  or every probe's stderr when none did — is kept in
+  `<log_dir>/clock_sync_<node>.out`. A node that cannot prove
   synchronisation aborts the job under `required: true`; under
   `required: false` the run continues but the manifest records the failing
   hosts in `clock_sync_failures`, carries the `clock_sync_unverified` reason,
   and sets `publication_valid: false` — the exit code stays that of the
-  benchmark. Set `clock_sync_check: false` where those tools are unavailable.
+  benchmark. Set `clock_sync_check: false` only where none of those sources
+  is available on the bare host. These probes check synchronization status;
+  the kernel fallback indicates recent clock discipline, not measured clock
+  offset. None of the branches guarantees inter-node skew below the
+  0.5-second measurement-window tolerance.
 - The exporter's power metric (`DCGM_FI_DEV_POWER_USAGE` for DCGM) determines
   which GPUs have power readings; optional utilization and temperature
   readings accompany them. Device identity comes from the exporter's index and identity labels
@@ -204,17 +215,21 @@ For any `kind: custom` exporter:
 `schema_version,timestamp_unix,scrape_seq,hostname,gpu_index,gpu_uuid,power_w,gpu_util_pct,sm_active,temperature_c` (version 3),
 one row per observation, `(scrape_seq, hostname, gpu_index)` unique. Rows are
 never interpolated, averaged, or role-attributed — role and heterogeneous
-group live once in the manifest topology.
+group live once in the manifest topology. The collector retains all GPU samples,
+including idle GPUs on an exclusive worker node. GPU energy totals include only
+worker GPUs; CPU energy remains whole socket. A GPU on a node that hosts no
+worker is still `unexpected_device`.
 
-GPU temperature is optional Celsius from `gpu_metrics.temperature` (`DCGM_FI_DEV_GPU_TEMP`
-for DCGM, `gpu_junction_temperature` on AMD MI3xx) in the same
-exporter response as power; collection adds no request, process, or wait.
-Temperature must match the power reading's GPU index and UUID. Missing,
-duplicate, non-finite, instance-labelled, or DCGM blank/error values leave the temperature
-cell empty without invalidating power. Older v1/v2 files remain readable;
-v3 readers must be deployed before upgrading producers. Consumers must show
-missing temperatures as unavailable, never zero. The exporter must expose the
-temperature field; collection does not enable additional profiling counters.
+Idle GPUs on a worker node are excused only by `worker_identity_proof`: once the
+server is healthy, one bare-host step per worker node (DCGM exporters only) joins
+`scontrol listpids` with `nvidia-smi --query-compute-apps` to record the GPU UUIDs
+each worker step holds, since the plan's `CUDA_VISIBLE_DEVICES` numbering and the exporter's
+device index are otherwise joined on index alone. Those UUIDs must equal the
+exporter's at the planned indices; a disagreement is `worker_gpu_uuid_mismatch`
+and blocks publication even on a fully used node. When the probe cannot run
+(other exporter kinds, MPS, no Slurm step listing) the manifest records why, a fully
+used node publishes as before, and a partly used node stays `unexpected_device`
+with `worker_identity_invalid`.
 
 `manifest.json` records producer identity (version, git commit, exporter image
 and its SHA-256), the power metric and scope, the sample interval, expected and observed device sets, the

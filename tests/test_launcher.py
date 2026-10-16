@@ -263,7 +263,7 @@ class TestMultiHost:
         script = shlex.split(popen.call_args.args[0][2])
         assert script[:6] == ["exec", "ssh", "-n", "-o", "BatchMode=yes", "node-b"]
         assert shlex.split(script[6])[:2] == ["docker", "run"]
-        assert script[-3:] == [">", str(out), "2>&1"]
+        assert script[-3:] == [">>", str(out), "2>&1"]
 
     def test_one_task_per_node_runs_in_parallel_with_per_node_output(self, docker, cluster, tmp_path):
         host = socket.gethostname()
@@ -280,7 +280,7 @@ class TestMultiHost:
             )
         script = popen.call_args.args[0][2]
         assert script.endswith(" & wait")
-        assert f"'exec exporter' > {tmp_path}/x.{host}.out 2>&1 & ssh -n -o BatchMode=yes -tt node-b " in script
+        assert f"'exec exporter' >> {tmp_path}/x.{host}.out 2>&1 & ssh -n -o BatchMode=yes -tt node-b " in script
         assert f"> {tmp_path}/x.node-b.out 2>&1" in script
 
     def test_remote_container_is_killed_over_ssh(self, docker, cluster):

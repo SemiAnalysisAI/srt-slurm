@@ -137,8 +137,13 @@ class Launcher(ABC):
         """Start ``spec`` and return the local process that tracks it."""
 
     @abstractmethod
-    def list_step_ids(self, job_id: str | None = None) -> dict[str, str] | None:
-        """``{step name: id}`` for this job's running named steps; None when it cannot be asked."""
+    def list_step_ids(
+        self, job_id: str | None = None, *, unique_names: set[str] | None = None
+    ) -> dict[str, str] | None:
+        """``{step name: id}`` for this job's running named steps; None when it cannot be asked.
+
+        None too when a name in ``unique_names`` belongs to more than one step.
+        """
 
     @abstractmethod
     def signal_step(

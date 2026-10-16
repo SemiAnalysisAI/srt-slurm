@@ -28,7 +28,7 @@ roles:
 dynamo:
   source:
     wheel: "<nightly-with-sidecars>"
-  sidecar_port: 50051
+  sidecar_port: 19000
   sidecar_args:
     - --grpc-connections
     - "4"
@@ -36,7 +36,11 @@ dynamo:
 
 The default sidecar commands are `python3 -m dynamo.sglang.sidecar`, `python3 -m dynamo.vllm.sidecar`, and `python3 -m dynamo.trtllm.sidecar`. All three use the shared `--grpc-endpoint` flag.
 
-TensorRT-LLM supports sidecars for aggregated workers only and runs the sidecar on MPI rank zero. `dynamo.sidecar_context_length` can override the TRT-LLM context length inferred from `roles.agg.args.max_seq_len`.
+TensorRT-LLM supports aggregate, prefill, and decode workers through OpenEngine gRPC. Each endpoint runs one sidecar on global MPI rank zero; prefill and decode sidecars register their disaggregation roles. The engine receives the configured parallelism and served model name, while the sidecar reads tokenizer artifacts from the model path. `dynamo.sidecar_context_length` can override the context length inferred from the corresponding role's `args.max_seq_len`. The image must include compatible TensorRT-LLM OpenEngine and Dynamo sidecar builds.
+
+The [disaggregated TRT-LLM example](https://github.com/NVIDIA/srt-slurm/blob/main/examples/trtllm/dynamo-sidecar-disagg.yaml) places a prefill and decode worker with sidecars on separate nodes.
+
+For a TRT-LLM `hf:` model, set `model.hf_snapshot_path` to the absolute path of its commit-specific snapshot inside the container, such as `/hf/hub/models--org--name/snapshots/<40-character-commit>`. Set `identity.model.revision` to the same commit and mount the full Hugging Face hub cache at `/hf/hub` so the snapshot's links to `blobs/` resolve. The TRT-LLM workers, sidecars, and sa-bench tokenizer then use that snapshot path; the served model name remains the configured model ID. An absent snapshot fails the launch instead of selecting a moving cache reference.
 
 ## SGLang topology and launch requirements
 
@@ -50,7 +54,7 @@ The [disaggregated multinode attention-DP example](https://github.com/NVIDIA/srt
 
 For multi-node vLLM data parallelism, srtctl launches one Rust gRPC frontend and one Dynamo sidecar on **every node** using hybrid load balancing. All nodes receive the global `--data-parallel-size`, while `--data-parallel-size-local` and `--data-parallel-start-rank` restrict each frontend to its colocated engines. For example, DP12 on three four-GPU nodes launches local DP4 with starting ranks 0, 4, and 8. Dynamo registers three endpoints, each covering its four local ranks. No node runs `--headless`, and readiness requires all three sidecars. vLLM sidecars require `engine.dp_launch_mode: per_node` (the default; `backend.dp_launch_mode` in schema 1); `per_gpu` is rejected during configuration validation, including for single-rank jobs.
 
-The multi-node DP command uses Python-supervised Rust frontends (`python3 -m vllm.entrypoints.cli.main serve` with `VLLM_USE_RUST_FRONTEND=1`). Python coordinates the shared DP rendezvous and starts `vllm-rs frontend` with each node's local engine count and starting rank; requests are handled by Rust. This is a current launcher limitation: `vllm-rs serve` expects to own the complete DP group and does not implement hybrid startup. Python supervision is not a fundamental requirement of the sidecar architecture. Single-node sidecars continue to use `vllm-rs serve`.
+The multi-node DP command uses Python-supervised Rust frontends (`python3 -m vllm.entrypoints.cli.main serve` with `VLLM_USE_RUST_FRONTEND=1`). Python coordinates the shared DP rendezvous and starts `vllm-rs frontend` with each node's local engine count and starting rank; requests are handled by Rust. This is a current launcher limitation: `vllm-rs serve` expects to own the complete DP group and does not implement hybrid startup. Python supervision is not a fundamental requirement of the sidecar architecture. Single-node sidecars continue to use `vllm-rs serve`. Because Python `vllm serve` parses the engine arguments itself and disables its reasoning parser by omission, srtctl drops `reasoning-parser: none` (the `vllm-rs serve` value Dynamo sidecars expect) on this launcher, where the bootstrapped Rust frontend already defaults to no parser; `reasoning-parser: auto` has no equivalent there and is rejected.
 
 Each Rust frontend has one API server; do not set `api-server-count` to another value or enable `grpc` (which selects the separate Python gRPC server) or `data-parallel-external-lb`.
 

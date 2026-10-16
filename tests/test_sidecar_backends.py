@@ -5,6 +5,7 @@
 
 import json
 import shlex
+import socket
 import subprocess
 import sys
 import time
@@ -43,7 +44,7 @@ def _process(
         node_rank=node_rank,
         bootstrap_port=7200 if mode == "prefill" else None,
         kv_events_port=kv_events_port,
-        sidecar_grpc_port=50051 + ordinal,
+        sidecar_grpc_port=19000 + ordinal,
         nccl_port=17500 + ordinal,
         dist_init_port=8300,
     )
@@ -54,6 +55,7 @@ def _runtime(tmp_path: Path | None = None) -> MagicMock:
     runtime.model_path = Path("/models/example-model")
     runtime.worker_model_arg = "/model"
     runtime.is_hf_model = False
+    runtime.hf_snapshot_path = None
     runtime.gpu_type = "h100"
     runtime.log_dir = tmp_path or Path("/tmp")
     runtime.network_interface = None
@@ -93,8 +95,8 @@ def test_sglang_sidecar_owns_leader_and_couples_lifecycle() -> None:
 
     leader_script = leader_command[2]
     assert "python3 -m sglang.launch_server" in leader_script
-    assert "--grpc-port 50051" in leader_script
-    assert "python3 -m dynamo.sglang.sidecar --grpc-endpoint 127.0.0.1:50051" in leader_script
+    assert "--grpc-port 19000" in leader_script
+    assert "python3 -m dynamo.sglang.sidecar --grpc-endpoint 127.0.0.1:19000" in leader_script
     assert 'wait -n "${ENGINE_PID}" "${SIDECAR_PID}"' in leader_script
     assert follower_command[:3] == ["python3", "-m", "sglang.launch_server"]
     assert "--grpc-port" not in follower_command
@@ -181,6 +183,8 @@ def test_sglang_sidecar_kv_events_config_true_covers_aggregated_mode() -> None:
         {"tensor_parallel_size": 8, "data_parallel_size": 2, "enable_dp_attention": True},
         {"tp-size": 8, "dp-size": 2, "enable-dp-attention": True},
         {"tp_size": 8, "dp_size": 2, "enable_dp_attention": True},
+        {"tp-size": 8, "attn-dp-size": 2},
+        {"tensor_parallel_size": 8, "attention_data_parallel_size": 2},
     ],
 )
 def test_sglang_multinode_dp_sidecar_relays_follower_kv_events(mode: str, args: dict) -> None:
@@ -303,6 +307,9 @@ def test_sglang_disagg_dp_example_launches_two_disjoint_worker_groups(tmp_path: 
         ({"tp-size": 8, "dp-size": 4, "enable-dp-attention": True}, 2, 4, {0, 1}),
         # Each attention-DP group spans two nodes; only its first node publishes.
         ({"tp-size": 8, "dp-size": 2, "enable-dp-attention": True}, 4, 2, {0, 2}),
+        ({"tp-size": 8, "attn-dp-size": 2}, 4, 2, {0, 2}),
+        # The deprecated spelling with one DP rank leaves attention DP off.
+        ({"tp-size": 8, "dp-size": 1, "enable-dp-attention": True}, 2, 4, {0}),
         # CP rank zero is the publisher even when all attention TP ranks are zero.
         ({"tp-size": 8, "dp-size": 2, "attn-cp-size": 4, "enable-dp-attention": True}, 4, 2, {0, 2}),
         # Later pipeline stages cannot publish the rank's KV events.
@@ -487,11 +494,90 @@ def test_vllm_sidecar_exposes_each_nodes_hybrid_dp_range(dp_size: int) -> None:
         assert "--headless" not in engine
         assert engine[engine.index("--data-parallel-address") + 1] == node_ips["node0"]
         assert engine[engine.index("--data-parallel-rpc-port") + 1] == str(processes[0].dp_rpc_port)
-        assert engine[engine.index("--grpc-port") + 1] == str(50051 + i)
-        assert f"python3 -m dynamo.vllm.sidecar --grpc-endpoint 127.0.0.1:{50051 + i}" in script
+        assert engine[engine.index("--grpc-port") + 1] == str(19000 + i)
+        assert f"python3 -m dynamo.vllm.sidecar --grpc-endpoint 127.0.0.1:{19000 + i}" in script
         assert 'wait -n "${ENGINE_PID}" "${SIDECAR_PID}"' in script
         kv_config = json.loads(engine[engine.index("--kv-events-config") + 1])
         assert kv_config["endpoint"] == f"tcp://{node_ips[process.node]}:{process.kv_events_port}"
+
+
+@pytest.mark.parametrize(
+    ("value", "forwarded"),
+    [("none", False), ("None", False), ("deepseek_v41", True)],
+)
+def test_vllm_sidecar_python_launcher_drops_reasoning_parser_none(value: str, forwarded: bool) -> None:
+    # Regression: hybrid DP launches through Python `vllm serve`, whose engine args treat every
+    # `--reasoning-parser` value as a registry name (its disabled value is omission), and the Rust
+    # frontend it bootstraps defaults to no parser. The vllm-rs sentinel `none`, which Dynamo
+    # sidecars require vLLM to run with, is therefore dropped on that launcher; parser names pass.
+    backend = VLLMBackend(
+        connector=None,
+        roles={
+            "decode": RoleConfig(
+                args={"data-parallel-size": 8, "enable-expert-parallel": True, "reasoning-parser": value},
+                kv_events=True,
+            )
+        },
+    )
+    endpoint = Endpoint(
+        mode="decode", index=0, nodes=("node0", "node1"), gpu_indices=frozenset(range(4)), gpus_per_node=4
+    )
+    processes = backend.endpoints_to_processes([endpoint], dynamo_sidecar=True)
+    node_ips = {"node0": "10.0.0.1", "node1": "10.0.0.2"}
+
+    with patch("srtctl.core.slurm.get_hostname_ip", side_effect=lambda node, _interface=None: node_ips[node]):
+        commands = [backend.build_worker_command(process, processes, _runtime()) for process in processes]
+
+    for command in commands:
+        engine_line = next(line for line in command[2].splitlines() if "vllm.entrypoints.cli.main serve" in line)
+        engine = shlex.split(engine_line)
+        assert "VLLM_USE_RUST_FRONTEND=1" in engine
+        if forwarded:
+            assert engine[engine.index("--reasoning-parser") + 1] == value
+        else:
+            assert "--reasoning-parser" not in engine
+
+
+def test_vllm_sidecar_python_launcher_rejects_reasoning_parser_auto() -> None:
+    # `auto` cannot be expressed on the Python launcher: Python has no auto selection and the
+    # bootstrapped Rust frontend ignores it, so fail loudly instead of changing the selection.
+    backend = VLLMBackend(
+        connector=None,
+        roles={
+            "decode": RoleConfig(
+                args={"data-parallel-size": 8, "enable-expert-parallel": True, "reasoning-parser": "auto"},
+                kv_events=True,
+            )
+        },
+    )
+    endpoint = Endpoint(
+        mode="decode", index=0, nodes=("node0", "node1"), gpu_indices=frozenset(range(4)), gpus_per_node=4
+    )
+    processes = backend.endpoints_to_processes([endpoint], dynamo_sidecar=True)
+
+    with (
+        patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"),
+        pytest.raises(ValueError, match="`auto` is a vllm-rs selection"),
+    ):
+        backend.build_worker_command(processes[0], processes, _runtime())
+
+
+def test_vllm_sidecar_rust_launcher_keeps_reasoning_parser_none() -> None:
+    # Single-node endpoints launch `vllm-rs serve`, which parses `none` itself.
+    backend = VLLMBackend(
+        connector=None,
+        roles={"prefill": RoleConfig(args={"data-parallel-size": 2, "reasoning-parser": "none"}, kv_events=True)},
+    )
+    endpoint = Endpoint(mode="prefill", index=0, nodes=("node0",), gpu_indices=frozenset(range(2)), gpus_per_node=4)
+    processes = backend.endpoints_to_processes([endpoint], dynamo_sidecar=True)
+
+    with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):
+        command = backend.build_worker_command(processes[0], processes, _runtime())
+
+    engine_line = next(line for line in command[2].splitlines() if "vllm-rs serve" in line)
+    engine = shlex.split(engine_line)
+    assert "vllm.entrypoints.cli.main" not in engine
+    assert engine[engine.index("--reasoning-parser") + 1] == "none"
 
 
 @pytest.mark.parametrize("override", [{"grpc": True}, {"data_parallel_external_lb": True}, {"api-server-count": 0}])
@@ -588,7 +674,7 @@ def test_vllm_sidecar_multi_node_replica_has_one_frontend(parallelism: dict) -> 
         assert "--headless" in engine
         assert not {"--grpc", "--grpc-port", "--port", "--api-server-count"}.intersection(engine)
         assert "dynamo.vllm.sidecar" not in command[2]
-        assert "/dev/tcp" not in command[2]
+        assert "/proc/net/tcp" not in command[2]
 
     from srtctl.cli.mixins.benchmark_stage import _get_health_expectations
 
@@ -611,7 +697,7 @@ def test_headless_follower_exit_is_reported_as_failure(exit_code: int) -> None:
     command = build_sidecar_launch_command(
         engine=["bash", "-c", f"exit {exit_code}"],
         sidecar=None,
-        grpc_port=50051,
+        grpc_port=19000,
         engine_name="vLLM follower",
         startup_timeout=60,
     )
@@ -635,7 +721,7 @@ def test_headless_follower_termination_reaps_engine(tmp_path: Path) -> None:
     command = build_sidecar_launch_command(
         engine=[sys.executable, "-c", engine],
         sidecar=None,
-        grpc_port=50051,
+        grpc_port=19000,
         engine_name="vLLM follower",
         startup_timeout=60,
     )
@@ -655,11 +741,53 @@ def test_headless_follower_termination_reaps_engine(tmp_path: Path) -> None:
             child.wait(timeout=15)
 
 
-@pytest.mark.parametrize("memory_bind", [False, True, "local"])
-def test_trtllm_sidecar_uses_native_grpc_on_rank_zero(tmp_path: Path, memory_bind) -> None:
-    process = _process()
+@pytest.mark.skipif(sys.platform != "linux", reason="the readiness probe reads /proc/net/tcp")
+def test_sidecar_waits_for_listener_without_connecting(tmp_path: Path) -> None:
+    # A connect probe can connect to itself before the engine listens and leave a
+    # TIME_WAIT socket that fails the engine's bind, so the only connection the
+    # engine accepts must be the sidecar's, made after the engine listens.
+    from srtctl.backends.sidecar import build_sidecar_launch_command
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    accepted = tmp_path / "accepted"
+    partial = tmp_path / "accepted.tmp"
+    engine = (
+        "import socket,time; from pathlib import Path; time.sleep(1.5); "
+        f"server = socket.create_server(('127.0.0.1', {port})); conn, _ = server.accept(); "
+        f"Path({str(partial)!r}).write_bytes(conn.recv(16)); Path({str(partial)!r}).rename({str(accepted)!r}); "
+        "time.sleep(60)"
+    )
+    sidecar = f"import socket,time; socket.create_connection(('127.0.0.1', {port})).sendall(b'sidecar'); time.sleep(60)"
+    command = build_sidecar_launch_command(
+        engine=[sys.executable, "-c", engine],
+        sidecar=[sys.executable, "-c", sidecar],
+        grpc_port=port,
+        engine_name="engine",
+        startup_timeout=30,
+    )
+    command[1] = "-c"
+    child = subprocess.Popen(command)
+    try:
+        deadline = time.monotonic() + 15
+        while not accepted.exists() and child.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert accepted.read_bytes() == b"sidecar"
+    finally:
+        child.terminate()
+        child.wait(timeout=15)
+
+
+@pytest.mark.parametrize(
+    ("mode", "memory_bind"),
+    [("agg", False), ("agg", True), ("agg", "local"), ("prefill", False), ("decode", False)],
+)
+def test_trtllm_sidecar_uses_native_grpc_on_rank_zero(tmp_path: Path, mode: str, memory_bind: bool | str) -> None:
+    process = _process(mode=mode)
     backend = TRTLLMBackend(
-        roles={"agg": RoleConfig(args={"tensor_parallel_size": 4, "max_seq_len": 4096})},
+        roles={mode: RoleConfig(args={"tensor_parallel_size": 4, "max_seq_len": 4096})},
+        served_model_name="Qwen/Qwen3-0.6B",
         numa_cpu_bind=memory_bind is not False,
         numa_memory_bind=memory_bind,
     )
@@ -670,14 +798,44 @@ def test_trtllm_sidecar_uses_native_grpc_on_rank_zero(tmp_path: Path, memory_bin
     assert "trtllm-llmapi-launch python3 -m tensorrt_llm.commands.serve /model" in script
     assert ("bash /configs/numa_cpu_bind.sh --bind-memory" in script) is (memory_bind == "local")
     assert ("numactl -m 0,1" in script) is (memory_bind is True)
-    assert "--grpc --host 127.0.0.1 --port 50051" in script
-    assert "python3 -m dynamo.trtllm.sidecar --grpc-endpoint 127.0.0.1:50051 --model-path /model" in script
+    assert "--grpc --grpc-protocol openengine --host 127.0.0.1 --port 19000" in script
+    assert "python3 -m dynamo.trtllm.sidecar --grpc-endpoint 127.0.0.1:19000 --model-path /model" in script
     assert "--context-length 4096" in script
     assert "${SLURM_PROCID:-0}" in script
+    assert "--served_model_name Qwen/Qwen3-0.6B" in script
+    assert "--tensor_parallel_size 4" in script
+    if mode == "agg":
+        assert "--disaggregation-mode" not in script
+    else:
+        assert f"--disaggregation-mode {mode}" in script
 
 
-def test_trtllm_sidecar_rejects_disaggregated_workers(tmp_path: Path) -> None:
+def test_trtllm_sidecar_rejects_direct_frontend(tmp_path: Path) -> None:
     backend = TRTLLMBackend()
 
-    with pytest.raises(ValueError, match="supports aggregated workers only"):
-        backend.build_worker_command(_process(mode="prefill"), [], _runtime(tmp_path))
+    with pytest.raises(ValueError, match="sidecar mode requires frontend.type: dynamo"):
+        backend.build_worker_command(
+            _process(mode="prefill"),
+            [],
+            _runtime(tmp_path),
+            frontend_type="trtllm_serve",
+        )
+
+
+def test_trtllm_sidecar_registers_hf_id_while_engine_uses_pinned_snapshot(tmp_path: Path) -> None:
+    snapshot = "/hf/hub/models--org--name/snapshots/" + "a" * 40
+    runtime = _runtime(tmp_path)
+    runtime.model_path = Path("org/name")
+    runtime.worker_model_arg = snapshot
+    runtime.is_hf_model = True
+    runtime.hf_snapshot_path = snapshot
+    backend = TRTLLMBackend(
+        roles={"prefill": RoleConfig(args={"tensor_parallel_size": 4, "max_seq_len": 4096})},
+        served_model_name="org/name",
+    )
+
+    script = backend.build_worker_command(_process(mode="prefill"), [], runtime)[2]
+
+    assert f"tensorrt_llm.commands.serve {snapshot} " in script
+    assert "dynamo.trtllm.sidecar --grpc-endpoint 127.0.0.1:19000 --model-path org/name " in script
+    assert "--served_model_name org/name" in script

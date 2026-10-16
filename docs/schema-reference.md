@@ -69,10 +69,11 @@ Model configuration.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `path` | str | required | Model weights directory, or a `model_paths` alias from srtslurm.yaml. Mounted at /model. |
+| `path` | str | required | Model weights directory, model_paths alias, or hf:<repo-id>. Local paths are mounted at /model. |
 | `container` | str | required | Container image (`.sqsh` path or registry URI), or a `containers` alias from srtslurm.yaml. |
 | `precision` | str | required | Weight precision (`fp4`, `fp8`, `fp16`, `bf16`). Recorded with results; engine flags set the actual dtype. |
 | `stage_dir` | str \| None | `None` | Optional: stage the model from shared storage to this node-local dir before workers start (e.g. "/raid/scratch/models"). None = use path directly. |
+| `hf_snapshot_path` | str \| None | `None` | TRT-LLM container path to an HF cache snapshot; pins weights and benchmark tokenizer. |
 
 ### ResourceConfig
 
@@ -111,6 +112,7 @@ One worker role of the recipe: `roles.prefill`, `roles.decode`, or `roles.agg`.
 | `engine` | str \| mapping | `None` | Engine type or mapping with engine options. Set on every role when no top-level `engine` is declared; the two forms cannot be mixed, and role engines do not inherit options from each other. |
 | `container` | str \| None | `None` | Optional role image; accepts cluster container aliases. Defaults to `model.container`. |
 | `kv_events` | bool \| dict[str, Any] \| None | `None` | `true` for the default ZMQ publisher, or a mapping with `publisher` / `topic`. |
+| `mooncake_store_config` | dict[str, Any] | `{}` | TRT-LLM only: Mooncake client config keys for this role's workers (`role`, `global_segment_size`, ...), layered over the `mooncake-master` service's `options.store_config`. Pool-wide keys stay there. |
 | `sidecar` | bool \| None | `None` | Run the native engine with a Dynamo sidecar (turns on `dynamo.sidecar`); every role must agree. |
 | `critical` | bool | `True` | A worker of this role exiting fails the run. `false` keeps the run alive for probes that kill workers. |
 | `restart` | [RestartPolicy](#restartpolicy) | `RestartPolicy()` | Relaunch exited workers in place: `never`, `on-failure`, `always`, or a mapping with `policy`, `max_restarts`, `backoff_seconds`, and `max_backoff_seconds`. |
@@ -152,7 +154,7 @@ Dynamo installation configuration.
 | `request_plane` | one of `'nats'`, `'tcp'`, `'http'` | `'tcp'` | Transport frontends use to send requests to workers. |
 | `event_plane` | one of `'nats'`, `'zmq'` \| None | `None` | Sets DYN_EVENT_PLANE for KV and worker events; unset follows the Dynamo image's default. |
 | `sidecar` | bool | `False` | Job-wide native sidecar mode; prefer `roles.<role>.sidecar: true`. |
-| `sidecar_port` | int | `50051` | Base loopback gRPC port between engine and sidecar; co-located workers get deterministic offsets. |
+| `sidecar_port` | int | `19000` | Base loopback gRPC port between engine and sidecar; co-located workers get deterministic offsets. |
 | `sidecar_binary` | str \| None | `None` | Standalone sidecar executable; unset runs `python3 -m dynamo.<framework>.sidecar`. |
 | `sidecar_startup_timeout` | int | `3600` | Seconds to wait for the native engine's gRPC endpoint. |
 | `sidecar_context_length` | int \| None | `None` | Context length the sidecar advertises (TRT-LLM); unset reads it from the engine. |
@@ -194,11 +196,13 @@ Benchmark configuration.
 | `num_warmup_mult` | int \| None | `None` | Multiplier for warmup prompts = concurrency * mult (default: 2) |
 | `dataset_name` | str \| None | `None` | Custom dataset fields (sa-bench) |
 | `dataset_path` | str \| None | `None` | Container path to dataset file (mount via extra_mount) |
+| `dataset_cache_dir` | str \| None | `None` | Host dir where sa-bench caches generated "random" datasets so repeated sweeps skip the (minutes-long) tokenize/decode prompt build. Mounted into the benchmark container by SABenchRunner. |
 | `agentperf_client_dir` | str \| None | `None` | AgentPerf benchmark fields (agentperf-client trajectory replay) |
 | `agentperf_config` | str \| None | `None` | Container path to the client's workload YAML (endpoint/model/concurrency injected) |
 | `trace_file` | str \| None | `None` | Trace replay benchmark fields (uses aiperf with mooncake_trace dataset type) |
 | `custom_tokenizer` | str \| None | `None` | Custom tokenizer class (e.g., "module.path.ClassName") |
 | `use_chat_template` | bool | `True` | Pass --use-chat-template to benchmark (default: true) |
+| `endpoint` | str \| None | `None` | SA-Bench API path (see benchmark_serving.py --endpoint). |
 | `reuse_http_connections` | bool | `False` | SA-Bench Dynamo adapter: reuse a benchmark-scoped HTTP connection pool. Opt-in to preserve the historical per-request ClientSession behavior. |
 | `command` | str \| None | `None` | Custom benchmark hook. ``command`` is passed to ``bash -lc`` verbatim; srtctl does NOT substitute placeholders like ``{nginx_url}`` or ``{slurm_job_id}``. Render any parameters when generating the recipe. See srtctl.benchmarks.custom.CustomBenchmarkRunner for details. |
 | `container_image` | str \| None | `None` | Image the benchmark client runs in (custom, agentperf); unset uses `model.container`. |
@@ -224,7 +228,7 @@ Benchmark configuration.
 | `mmlu` | MMLU accuracy evaluation benchmark. | `max_tokens`, `num_examples`, `num_threads`, `repeat` |
 | `mooncake-router` | Mooncake Router benchmark for testing KV-aware routing using aiperf. | `itl_threshold_ms`, `mooncake_workload`, `ttft_threshold_ms` |
 | `router` | Router performance benchmark. | `concurrency`, `isl`, `num_requests`, `osl`, `prefix_ratios` |
-| `sa-bench` | SA-Bench throughput and latency benchmark. | `custom_tokenizer`, `dataset_name`, `dataset_path`, `isl`, `num_prompts_mult`, `num_warmup_mult`, `osl`, `random_range_ratio`, `req_rate`, `reuse_http_connections`, `slow_down_sleep_time`, `slow_down_wait_time`, `use_chat_template` |
+| `sa-bench` | SA-Bench throughput and latency benchmark. | `custom_tokenizer`, `dataset_cache_dir`, `dataset_name`, `dataset_path`, `endpoint`, `env`, `isl`, `num_prompts_mult`, `num_warmup_mult`, `osl`, `random_range_ratio`, `req_rate`, `reuse_http_connections`, `slow_down_sleep_time`, `slow_down_wait_time`, `use_chat_template` |
 | `sglang-bench` | SGLang benchmark runner. | `isl`, `osl`, `req_rate` |
 | `trace-replay` | Trace replay benchmark using aiperf with a user-provided dataset. | `itl_threshold_ms`, `trace_file`, `ttft_threshold_ms` |
 
@@ -291,7 +295,7 @@ DCGM power telemetry for benchmark measurement windows.
 | `collect_interval_ms` | int | `1000` | Milliseconds between collector cycles. Replaces the retired ``default_frequency``, which despite its name was a period in seconds (1000ms == the old 1.0 default). |
 | `storage_subdir` | str | `'power'` | Output directory below the run's log directory. |
 | `required` | bool | `False` | Fail the benchmark when publishable DCGM power artifacts cannot be produced. CPU power stays best-effort. |
-| `clock_sync_check` | bool | `True` | Before any server starts, verify every allocation node reports an NTP-synchronised system clock. Sample timestamps (orchestrator host) and window boundaries (benchmark client host) are compared directly, so an unsynchronised node silently misaligns the measurement. Fails the job when ``required`` is true; otherwise the run continues and the manifest records ``clock_sync_unverified`` with ``publication_valid: false``. Set false on clusters where timedatectl/chronyc/ntpq are unavailable to unprivileged users. |
+| `clock_sync_check` | bool | `True` | Before any server starts, verify every allocation node reports an NTP-synchronised system clock. Sample timestamps (orchestrator host) and window boundaries (benchmark client host) are compared directly, so an unsynchronised node silently misaligns the measurement. Fails the job when ``required`` is true; otherwise the run continues and the manifest records ``clock_sync_unverified`` with ``publication_valid: false``. Probes timedatectl, chronyc, ntpq, then kernel maxerror < 16 seconds via adjtimex(2) (python3) for hosts with no queryable time daemon. These are synchronisation-status checks, not bounds on inter-node clock skew. Set false only where none of those is available to unprivileged users. |
 | `startup_timeout_seconds` | float | `30.0` | Seconds to wait for the exporters to answer before giving up (DCGM and CPU legs). |
 | `request_timeout_seconds` | float | `2.0` | Per-request exporter timeout in seconds (DCGM and CPU legs). |
 | `collector_join_timeout_seconds` | float \| None | `None` | None derives a safe shutdown budget from request_timeout_seconds. |
@@ -335,7 +339,7 @@ One entry of the top-level ``services:`` list.
 | `placement` | [ServicePlacementConfig](#serviceplacementconfig) \| None | `None` | Where the service runs. Defaults to the kind's placement (``head`` for generic services, ``infra`` for etcd/nats/mooncake-master, ``workers`` for the exporters). |
 | `nodes` | int \| None | `None` | Whole nodes this service owns: its pool. Pools add to the allocation next to the engine roles' nodes and are carved after them in declaration order, so a Ray cluster, a sandbox fleet and an engine role can each have their own nodes in one recipe. An owner is placed on its own pool (``placement.node: workers``); other services join it with ``placement.pool: <name>``. |
 | `start` | str \| None | `None` | ``after_frontend`` (default for ``generic``) or ``before_workers`` (default for ``mooncake-store``). |
-| `readiness` | [ServiceReadinessConfig](#servicereadinessconfig) \| None | `None` | Optional TCP port gate; the job waits for it on every service node before continuing. |
+| `readiness` | [ServiceReadinessConfig](#servicereadinessconfig) \| None | `None` | Optional TCP, HTTP, log or marker-file gate; the job waits for it on every service node before continuing. |
 | `inherit_discovery_env` | bool | `True` | Inject ``ETCD_ENDPOINTS`` / ``NATS_SERVER`` so the service can register with the job's Dynamo discovery plane. |
 | `critical` | bool \| None | `None` | When true a crash fails the run, like a worker dying. Default false for ``generic`` (a dead sidecar costs its own log, not the run) and true for ``mooncake-store``. Set true for anything in the live request path. |
 | `terminal` | bool | `False` | This service is the job's run: the job ends when every instance of every terminal service has exited, and the worst exit code becomes the job's. A recipe with a terminal service has no benchmark step (``benchmark.type`` stays ``manual``); a torchrun pool that trains to completion is the shape. |
@@ -346,7 +350,7 @@ One entry of the top-level ``services:`` list.
 | `build_timeout_seconds` | int | `1800` | Kill ``build_command`` after this many seconds. |
 | `enabled` | bool | `True` | ``false`` drops the service, including an implicit one (``etcd`` / ``nats`` under the Dynamo frontend, the default exporters) declared here by name. |
 | `external` | str \| None | `None` | For discovery-plane kinds (``etcd``, ``nats``, ``mooncake-master``): use this already-running endpoint and launch nothing; the URL is what the job's processes are pointed at. |
-| `options` | dict[str, Any] | `{}` | Kind-specific settings (``nats``: ``max_payload_mb``; ``mooncake-master``: ``store_config`` and ``device_names_by_gpu`` for vLLM). Unknown keys are rejected by the kind. |
+| `options` | dict[str, Any] | `{}` | Kind-specific settings (``nats``: ``max_payload_mb``; ``mooncake-master``: ``store_config`` for vLLM and TRT-LLM, ``device_names_by_gpu`` for vLLM). Unknown keys are rejected by the kind. |
 | `metrics` | list[[ServiceMetricsConfig](#servicemetricsconfig)] | `[]` | Prometheus endpoints this service serves: one mapping or a list of ``{port, path, nodes, name}`` (``path`` defaults to ``/metrics``, ``nodes`` to ``all``). Tachometer scrapes each on every node the service runs on, or on its first node with ``nodes: first``, as endpoint ``<name>_<node>`` where ``name`` defaults to the service name. The exporter kinds declare theirs; write it for a generic service that publishes metrics, or on a ``ray`` service whose head serves a trainer's collector and router. |
 
 ### PostEvalConfig
@@ -483,8 +487,8 @@ Best-effort CPU power collection via the cpu-power-exporter binary.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `port` | int | `9405` | Port the exporter listens on and the head-node collector scrapes. |
-| `source` | one of `'auto'`, `'acpi'`, `'dcgm'` | `'auto'` | Power reading back-end passed through to the bundled Rust binary's own ``--source`` flag (``auto`` \| ``acpi`` \| ``dcgm``). ``auto`` tries DCGM first and falls back to ACPI when libdcgm.so is absent or reports no CPU entities. Has no effect when the Python stdlib fallback exporter is used instead of the binary -- that fallback is ACPI-only. |
+| `port` | int | `9405` | TCP port the per-node exporter listens on for ``/metrics``. |
+| `source` | one of `'auto'`, `'acpi'`, `'dcgm'` | `'auto'` | Power reading back-end passed through to the bundled Rust binary's own ``--source`` flag (``auto`` \| ``acpi`` \| ``dcgm``). ``auto`` tries ACPI first (the only source with the socket envelope) and falls back to DCGM when no ACPI power_meter hwmon sensors exist or no socket-total sensor reads positive on two probes; DCGM watches fields 1130+1132 and falls back to 1130 alone if this libdcgm refuses the pair, and is accepted only if some socket reads a positive 1130. DCGM mode reports field 1130 = the CPU rail (plus 1132 = SysIO), about half the ACPI envelope, and the energy report flags such runs as "CPU rail only". Has no effect when the Python stdlib fallback exporter is used instead of the binary -- that fallback is ACPI-only. |
 
 ### CpuPowerConfig
 
@@ -493,7 +497,7 @@ Host-side CPU power collection on every worker node.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | bool | `False` | Master switch for this leg. Default: False. |
-| `source` | one of `'auto'`, `'acpi'`, `'dcgm'` | `'auto'` | ``auto`` tries ACPI then DCGM and is best-effort; naming ``acpi`` or ``dcgm`` explicitly makes that provider mandatory. |
+| `source` | one of `'auto'`, `'acpi'`, `'dcgm'` | `'auto'` | ``auto`` uses ACPI when some socket-total sensor reads a positive value, else DCGM fields 1130+1132, else 1130 alone (either DCGM rung accepted only if some socket reads a positive 1130; SysIO alone cannot vouch), logging each step down; naming ``acpi`` or ``dcgm`` explicitly makes that provider mandatory (it still proves itself, but exits instead of stepping). |
 | `sample_interval_seconds` | float | `0.1` | Read period on each node, in seconds. |
 | `startup_timeout_seconds` | float | `30.0` | How long to wait for every node's collector to publish its ready marker before giving up on readiness. |
 | `required` | bool | `False` | Fail the job when the leg does not become ready or does not produce a valid publication. |
@@ -530,6 +534,7 @@ Readiness gate: the launch blocks until the probe passes on every service node.
 | `tcp` | [TcpProbe](#tcpprobe) \| None | `None` | TCP connect probe. |
 | `http` | [HttpProbe](#httpprobe) \| None | `None` | HTTP GET probe. |
 | `log` | [LogProbe](#logprobe) \| None | `None` | Log-pattern probe against ``service_<name>.out``. |
+| `file` | [FileProbe](#fileprobe) \| None | `None` | Marker-file probe relative to the shared logs directory; removes the old marker before launch. |
 | `timeout_seconds` | int | `120` | How long to wait per node before failing the job. |
 | `interval_seconds` | int | `2` | Seconds between probe attempts. |
 
@@ -646,6 +651,14 @@ Ready when the service's log file contains a line matching the regular expressio
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `pattern` | str | required | Regular expression searched for in the service log. |
+
+### FileProbe
+
+Ready when a service-owned marker file exists in the run's shared logs directory.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `path` | str | required | Relative marker path under /logs; service placeholders such as {index} are expanded per instance. The previous marker is removed before launching that instance, so readiness requires a fresh file. |
 
 ### GpuPowerMetricConfig
 

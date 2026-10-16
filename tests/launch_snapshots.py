@@ -79,7 +79,13 @@ def snapshot_path(recipe: Path) -> Path:
 
 @contextmanager
 def _isolated_cluster(model_dir: Path, container_file: Path) -> Iterator[None]:
-    """No srtslurm.yaml; the recipe's model and container-file paths resolve to existing placeholders."""
+    """No srtslurm.yaml and no `make setup` binaries; the recipe's model and container-file paths resolve to
+    existing placeholders.
+
+    Snapshots describe a clean checkout, so a locally installed ``configs/process-exporter`` or
+    ``bin/tachometer-scraper`` must not add or rewrite srun calls.
+    """
+    from srtctl.cli.mixins.telemetry_stage import TelemetryStageMixin
     from srtctl.core import config as config_module
 
     original_load = config_module.load_config
@@ -89,11 +95,16 @@ def _isolated_cluster(model_dir: Path, container_file: Path) -> Iterator[None]:
         container = cfg.model.container
         if container.startswith(("/", "./")):
             container = str(container_file)
-        return dataclasses.replace(cfg, model=dataclasses.replace(cfg.model, path=str(model_dir), container=container))
+        # Pinned HF examples must retain the ID and snapshot so the launch plan
+        # captures the actual engine and tokenizer arguments.
+        model_path = cfg.model.path if cfg.model.hf_snapshot_path else str(model_dir)
+        return dataclasses.replace(cfg, model=dataclasses.replace(cfg.model, path=model_path, container=container))
 
     with (
         patch.object(config_module, "load_cluster_config", lambda: None),
         patch.object(config_module, "load_config", _load_with_fake_model),
+        patch("srtctl.services.exporters.resolve_host_binary", lambda binary: None),
+        patch.object(TelemetryStageMixin, "_resolve_bundled_binary", lambda self, name: name),
     ):
         yield
 

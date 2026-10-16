@@ -21,6 +21,7 @@ from srtctl.core.health import wait_for_health
 from srtctl.core.launcher import LaunchSpec, launch
 from srtctl.core.observability_nsys import wrap_observability_nsys
 from srtctl.core.processes import ManagedProcess, NamedProcesses, ProcessRegistry
+from srtctl.core.runtime import RuntimeContext
 from srtctl.core.schema import build_otel_env, installs_dynamo
 from srtctl.core.slurm import CONTAINER_REMAP_ROOT_EXPORT, get_hostname_ip
 from srtctl.core.supervisor import EndpointKey, WorkerSupervisor
@@ -31,7 +32,6 @@ from srtctl.services.otel import lifecycle_otel_env
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-    from srtctl.core.runtime import RuntimeContext
     from srtctl.core.schema import SrtConfig
     from srtctl.core.topology import Endpoint, Process
 
@@ -422,7 +422,7 @@ class WorkerStageMixin:
             local_hostname = env_to_set.get("MOONCAKE_LOCAL_HOSTNAME") or get_hostname_ip(
                 process.node, self.runtime.network_interface
             )
-            env_to_set.update(backend.get_mooncake_worker_env(self.runtime.infra_node_ip, local_hostname))
+            env_to_set.update(backend.get_mooncake_worker_env(self.runtime.infra_node_ip, local_hostname, mode))
 
         self._apply_mooncake_process_config(process, env_to_set)
 
@@ -448,7 +448,11 @@ class WorkerStageMixin:
                 bash_preamble,
                 _nsys_library_path_preamble(profiling.nsys_library_paths),
             )
-        fp_cmd = generate_capture_script(f"{self.runtime.container_log_dir}/fingerprint_{mode}_w{index}{suffix}.json")
+        fingerprint_path = f"{self.runtime.container_log_dir}/fingerprint_{mode}_w{index}{suffix}.json"
+        if isinstance(self.runtime, RuntimeContext) and self.runtime.hf_snapshot_path:
+            fp_cmd = generate_capture_script(fingerprint_path, self.runtime.worker_model_arg)
+        else:
+            fp_cmd = generate_capture_script(fingerprint_path)
         # Keep fingerprint failures non-fatal, but do not let its `|| true`
         # mask failures from setup/dynamo install commands before it.
         fp_cmd = f"( {fp_cmd} )"
@@ -509,6 +513,7 @@ class WorkerStageMixin:
             signal_full=not automatic_nsys,
             step_name=step_name,
             fatal_log_patterns=self._fatal_log_patterns(mode),
+            worker_assignments=(process,),
         )
 
     def start_endpoint_worker(self, endpoint_processes: list["Process"], *, attempt: int = 0) -> ManagedProcess:
@@ -652,7 +657,7 @@ class WorkerStageMixin:
             local_hostname = env_to_set.get("MOONCAKE_LOCAL_HOSTNAME") or get_hostname_ip(
                 leader.node, self.runtime.network_interface
             )
-            env_to_set.update(backend.get_mooncake_worker_env(self.runtime.infra_node_ip, local_hostname))
+            env_to_set.update(backend.get_mooncake_worker_env(self.runtime.infra_node_ip, local_hostname, mode))
 
         # Add profiling environment variables after the worker environment.
         if profiling.enabled and profiling_selects_process:
@@ -676,7 +681,11 @@ class WorkerStageMixin:
                 bash_preamble,
                 _nsys_library_path_preamble(profiling.nsys_library_paths),
             )
-        fp_cmd = generate_capture_script(f"{self.runtime.container_log_dir}/fingerprint_{mode}_w{index}.json")
+        fingerprint_path = f"{self.runtime.container_log_dir}/fingerprint_{mode}_w{index}.json"
+        if isinstance(self.runtime, RuntimeContext) and self.runtime.hf_snapshot_path:
+            fp_cmd = generate_capture_script(fingerprint_path, self.runtime.worker_model_arg)
+        else:
+            fp_cmd = generate_capture_script(fingerprint_path)
         # Keep fingerprint failures non-fatal, but do not let its `|| true`
         # mask failures from setup/dynamo install commands before it.
         fp_cmd = f"( {fp_cmd} )"
@@ -763,6 +772,7 @@ class WorkerStageMixin:
             signal_full=not automatic_nsys,
             step_name=step_name,
             fatal_log_patterns=self._fatal_log_patterns(mode),
+            worker_assignments=tuple(endpoint_processes),
         )
 
     def _wait_for_worker_ready(self, leader: "Process") -> None:

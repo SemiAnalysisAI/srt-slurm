@@ -208,7 +208,8 @@ class DockerLauncher(Launcher):
             if spec.output:
                 output = Path(spec.output.replace("%N", host))
                 output.parent.mkdir(parents=True, exist_ok=True)
-                line += f" > {shlex.quote(str(output))} 2>&1"
+                # Append, like srun --open-mode=append: the benchmark injects stage markers into live logs.
+                line += f" >> {shlex.quote(str(output))} 2>&1"
             lines.append(line)
         script = f"exec {lines[0]}" if len(lines) == 1 else " & ".join(lines) + " & wait"
         logger.info("docker launcher command: %s", script)
@@ -228,7 +229,10 @@ class DockerLauncher(Launcher):
 
     # -- signalling ----------------------------------------------------------
 
-    def list_step_ids(self, job_id: str | None = None) -> dict[str, str] | None:
+    def list_step_ids(
+        self, job_id: str | None = None, *, unique_names: set[str] | None = None
+    ) -> dict[str, str] | None:
+        # Step names key self._steps, so they are already unique.
         with self._lock:
             return {
                 name: step.container or str(step.popen.pid)

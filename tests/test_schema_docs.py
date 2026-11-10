@@ -274,6 +274,13 @@ def test_engine_types_and_cluster_config_are_rendered() -> None:
     assert "<!-- GENERATED FILE" in text
 
 
+@pytest.fixture
+def wide_console(monkeypatch) -> None:
+    # main() builds its own rich Console; at 80 columns a long tmp_path wraps mid-phrase or mid-filename.
+    monkeypatch.setenv("COLUMNS", "500")
+
+
+@pytest.mark.usefixtures("wide_console")
 def test_cli_check_passes_on_a_fresh_docs_dir(tmp_path: Path, monkeypatch, capsys) -> None:
     write_generated(tmp_path)
     monkeypatch.setattr(sys, "argv", ["srtctl", "schema-docs", "--check", "--docs-dir", str(tmp_path)])
@@ -281,6 +288,7 @@ def test_cli_check_passes_on_a_fresh_docs_dir(tmp_path: Path, monkeypatch, capsy
     assert "up to date" in capsys.readouterr().out
 
 
+@pytest.mark.usefixtures("wide_console")
 def test_cli_check_fails_on_a_stale_file(tmp_path: Path, monkeypatch, capsys) -> None:
     write_generated(tmp_path)
     (tmp_path / "cli-reference.md").write_text("# stale\n")
@@ -335,7 +343,7 @@ def test_allowed_values_come_from_literals_and_validators() -> None:
 
     assert values(SweepConfig, "mode") == ("zip", "grid")
     assert values(ProfilingPhaseConfig, "capture_scope") == ("selected", "all")
-    assert values(CpuPowerExporterConfig, "source") == ("auto", "acpi", "dcgm")
+    assert values(CpuPowerExporterConfig, "source") == ("auto", "acpi", "dcgm", "rapl")
     assert values(AtomBackend, "mooncake_protocol") == ("rdma", "tcp")
     assert values(DynamoConfig, "request_plane") == DynamoConfig._VALID_REQUEST_PLANES
     assert values(SrtConfig, "schema") == (2,)

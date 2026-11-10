@@ -8,7 +8,7 @@ selects, optionally clone and build a ``source`` once, then one ``srun`` per
 instance (one per node, or under ``placement.per: worker`` one per engine worker
 on each node, pinned to that worker's GPUs) with the kind's command and
 environment merged around the recipe's, an optional readiness probe (tcp, http,
-or log; or the kind's default ports), and a ``ManagedProcess`` for the shared
+log, or file; or the kind's default ports), and a ``ManagedProcess`` for the shared
 ``ProcessRegistry`` (which provides crash detection and teardown). The kind
 (``srtctl.services.registry.ServiceKind``) never launches anything itself.
 
@@ -37,6 +37,8 @@ from __future__ import annotations
 import logging
 import shlex
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -272,6 +274,8 @@ class ServiceStageMixin:
             nodelist=[node],
             output=str(build_log),
             container_image=self._service_container(service),
+            reuse_container=self.runtime.reuse_container,
+            container_prepare_timeout_seconds=self.runtime.container_prepare_timeout_seconds,
             container_mounts=self.runtime.container_mounts,
             srun_options=self.runtime.srun_options,
             het_group=self.runtime.nodes.het_group_for(node),
@@ -289,6 +293,17 @@ class ServiceStageMixin:
         )
 
     # -- launch ------------------------------------------------------------------
+
+    @staticmethod
+    def _instance_readiness(service: ServiceConfig, ctx: ServiceLaunchContext) -> ServiceReadinessConfig | None:
+        """Resolve the service's probe and expand this instance's marker path."""
+        readiness = service.readiness or get_service_kind(service.type).readiness(service, ctx)
+        if readiness is not None and readiness.file is not None:
+            readiness = replace(
+                readiness,
+                file=replace(readiness.file, path=render_placeholders(readiness.file.path, ctx.template_vars())),
+            )
+        return readiness
 
     def _service_environment(self, service: ServiceConfig, ctx: ServiceLaunchContext) -> dict[str, str]:
         kind = get_service_kind(service.type)
@@ -318,6 +333,20 @@ class ServiceStageMixin:
         step_name = service_step_name(service, ctx.node, instances, ctx.process)
         log_file = self.runtime.log_dir / f"{step_name}.out"
 
+        readiness = self._instance_readiness(service, ctx)
+        if readiness is not None and readiness.file is not None:
+            # Clear on the orchestrator before starting srun: clearing inside the
+            # service would race the first readiness poll against an old marker.
+            marker = log_file.parent / readiness.file.path
+            try:
+                marker.unlink(missing_ok=True)
+            except OSError as exc:
+                reason = "path is a directory" if marker.is_dir() else str(exc)
+                raise RuntimeError(
+                    f"services[{service.name}].readiness.file.path: cannot remove marker {marker}: {reason}; "
+                    "use a dedicated marker file"
+                ) from None
+
         env = self._service_environment(service, ctx)
         if ctx.process is not None and len(ctx.process.gpu_indices) < self.runtime.gpus_per_node:
             # placement.per: worker means the worker's device view: the same pinning the
@@ -334,6 +363,8 @@ class ServiceStageMixin:
             nodelist=[ctx.node],
             output=str(log_file),
             container_image=None if host_native else self._service_container(service),
+            reuse_container=self.runtime.reuse_container,
+            container_prepare_timeout_seconds=self.runtime.container_prepare_timeout_seconds,
             container_mounts=None if host_native else self.runtime.container_mounts,
             # Without the bash wrapper there is no `export`; srun --export carries the env instead.
             env_to_set=env if kind.use_bash_wrapper else None,
@@ -384,23 +415,41 @@ class ServiceStageMixin:
 
     def _wait_service_ready(self, proc: ManagedProcess, service: ServiceConfig, ctx: ServiceLaunchContext) -> None:
         """The recipe's ``readiness`` probe, else the kind's per-instance probe, else each default port in turn."""
-        if service.readiness is not None:
-            self._wait_ready(proc, service, service.readiness)
-            return
-        kind = get_service_kind(service.type)
-        instance_probe = kind.readiness(service, ctx)
+        instance_probe = self._instance_readiness(service, ctx)
         if instance_probe is not None:
             self._wait_ready(proc, service, instance_probe)
             return
+        kind = get_service_kind(service.type)
         for port in kind.default_readiness_ports:
             probe = ServiceReadinessConfig(tcp=TcpProbe(port=port), timeout_seconds=kind.default_readiness_timeout)
             self._wait_ready(proc, service, probe)
+
+    def _wait_instances_ready(
+        self, service: ServiceConfig, launched: list[tuple[ManagedProcess, ServiceLaunchContext]]
+    ) -> None:
+        """Wait for every launched instance's readiness at once; the first failure raises.
+
+        The pool is not joined on failure: the caller terminates every process, and
+        each remaining probe then stops at its next liveness check.
+        """
+        if not launched:
+            return
+        pool = ThreadPoolExecutor(max_workers=len(launched), thread_name_prefix=f"service-{service.name}")
+        try:
+            futures = [pool.submit(self._wait_service_ready, proc, service, ctx) for proc, ctx in launched]
+            for future in as_completed(futures):
+                future.result()
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
     def start_services(self, start: str, registry: ProcessRegistry | None = None) -> list[ManagedProcess]:
         """Launch every effective service whose ``start`` phase matches: implicit ones first, then declared.
 
         Each process is added to ``registry`` as soon as its srun exists, so a
         readiness wait interrupted by a signal still leaves nothing untracked.
+        Services start one after another; the instances of one service launch
+        together and their readiness probes run concurrently (a kind with
+        ``leader_first`` gets instance 0 ready before the rest launch).
         A readiness gate that fails terminates every process this call started
         and raises. The started processes are also returned. A service with
         ``external`` set launches nothing; its address is injected instead.
@@ -446,9 +495,8 @@ class ServiceStageMixin:
                         "workers" if service.effective_per == "worker" else "nodes",
                     )
                     continue
-                instances: list[ManagedProcess] = []
-                for index, (node, process) in enumerate(placed):
-                    ctx = ServiceLaunchContext(
+                contexts = [
+                    ServiceLaunchContext(
                         runtime=self.runtime,
                         node=node,
                         node_ip=ip_of[node],
@@ -460,15 +508,24 @@ class ServiceStageMixin:
                         process=process,
                         config=self.config,
                     )
-                    proc = self._launch_service_instance(service, ctx, work_dir, len(placed))
-                    started.append(proc)
-                    instances.append(proc)
-                    if registry is not None:
-                        registry.add_process(proc)
-                    self._wait_service_ready(proc, service, ctx)
-                    if service.terminal:
-                        # The manual loop in BenchmarkStageMixin ends the job when these exit.
-                        self.terminal_processes.setdefault(service.name, []).append(proc)
+                    for index, (node, process) in enumerate(placed)
+                ]
+                # Launch a batch, then wait for its readiness probes together.
+                batches = [contexts[:1], contexts[1:]] if kind.leader_first else [contexts]
+                instances: list[ManagedProcess] = []
+                for batch in batches:
+                    launched: list[tuple[ManagedProcess, ServiceLaunchContext]] = []
+                    for ctx in batch:
+                        proc = self._launch_service_instance(service, ctx, work_dir, len(placed))
+                        started.append(proc)
+                        launched.append((proc, ctx))
+                        if registry is not None:
+                            registry.add_process(proc)
+                    self._wait_instances_ready(service, launched)
+                    instances.extend(proc for proc, _ in launched)
+                if service.terminal:
+                    # The manual loop in BenchmarkStageMixin ends the job when these exit.
+                    self.terminal_processes.setdefault(service.name, []).extend(instances)
                 kind.wait_fleet_ready(service, self.runtime, instances)
                 logger.info("Service %s ready: %d instance(s) on %d node(s)", service.name, len(placed), len(nodes))
         except BaseException:

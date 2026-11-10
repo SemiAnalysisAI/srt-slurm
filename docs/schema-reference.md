@@ -28,6 +28,7 @@ Top-level keys of a recipe YAML.
 | `environment` | dict[str, str] | `{}` | Environment variables for every worker; applied after `roles.<role>.env`, so a key set in both takes this value. Values may use `{node}` and `{node_id}`. |
 | `container_mounts` | dict[[FormattablePath](#formattablepath), [FormattablePath](#formattablepath)] | `{}` | Host path -> container path mounts for every container; both sides are FormattablePaths. |
 | `extra_mount` | tuple[str, ...] \| None | `None` | Extra mounts as `host:container[:ro]` strings; `$VARS` expand, `{placeholders}` do not. |
+| `reuse_container` | bool | `False` | Reuse a named Pyxis container per image and root-remap mode on each node of this job, avoiding repeated root filesystem extraction into host RAM. Off by default. |
 | `srun_options` | dict[str, str] | `{}` | Extra srun options (`key: value` -> `--key=value`; empty value -> `--key`) for every job step. |
 | `sbatch_directives` | dict[str, str] | `{}` | Extra `#SBATCH --key=value` lines (empty value -> `--key`); wins over the cluster defaults. |
 | `enable_config_dump` | bool | `True` | Accepted for compatibility; srtctl does not read it. Workers dump their config where the engine supports it. |
@@ -69,10 +70,11 @@ Model configuration.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `path` | str | required | Model weights directory, or a `model_paths` alias from srtslurm.yaml. Mounted at /model. |
+| `path` | str | required | Model weights directory, model_paths alias, or hf:<repo-id>. Local paths are mounted at /model. |
 | `container` | str | required | Container image (`.sqsh` path or registry URI), or a `containers` alias from srtslurm.yaml. |
 | `precision` | str | required | Weight precision (`fp4`, `fp8`, `fp16`, `bf16`). Recorded with results; engine flags set the actual dtype. |
 | `stage_dir` | str \| None | `None` | Optional: stage the model from shared storage to this node-local dir before workers start (e.g. "/raid/scratch/models"). None = use path directly. |
+| `hf_snapshot_path` | str \| None | `None` | TRT-LLM container path to an HF cache snapshot; pins weights and benchmark tokenizer. |
 
 ### ResourceConfig
 
@@ -82,7 +84,7 @@ Cluster facts and allocation knobs; the worker topology is the `roles:` block.
 |---|---|---|---|
 | `gpu_type` | str \| None | `None` | GPU type (h100, gb200, ...). Cluster fact, not a topology choice. Optional: a recipe that omits it inherits `default_gpu_type` from srtslurm.yaml, and `gpus_per_node` inherits the cluster `gpus_per_node`. Both are still worth setting in a recipe so it is self-describing for result rollups. |
 | `gpus_per_node` | int | `4` | GPUs on each node. Inherits the cluster `gpus_per_node` when omitted, else 4. |
-| `spread_workers` | bool | `False` | If True, place each partial-node worker on its own node instead of packing multiple onto the same node. Caller must reserve enough nodes (e.g. give roles.decode as many nodes as workers when its gpus < gpus_per_node). |
+| `spread_workers` | bool | `False` | If True, place each partial-node worker on its own node instead of packing multiple onto the same node. Caller must reserve enough nodes (e.g. give roles.decode as many nodes as workers when its gpus < gpus_per_node). With roles.decode.nodes: colocate, the decode workers go one per prefill node in turn, each on that node's highest free GPUs. |
 | `het_jobs` | bool \| None | `None` | SLURM heterogeneous-job opt-in. Tri-state: None defers to the cluster default `use_het_jobs` on ClusterConfig; True/False overrides per recipe. When effectively True (and we are in disaggregated mode), the prefill and decode sides are submitted as two het components each with their own `--segment`. See HetComponent above and docs/slurm-faq.md. |
 
 ### SlurmConfig
@@ -104,6 +106,7 @@ One worker role of the recipe: `roles.prefill`, `roles.decode`, or `roles.agg`.
 | `nodes` | int \| one of `'colocate'` \| None | `None` | Nodes reserved for this role. `colocate` (decode only) reserves none and packs the decode workers onto the prefill nodes' free GPUs; `gpus` is then required on both roles and the loader rejects a split that does not fit. |
 | `workers` | int \| None | `None` | Number of workers of this role. |
 | `gpus` | int \| None | `None` | GPUs per worker. Defaults to `nodes * gpus_per_node // workers`; required when decode colocates. |
+| `gpu_indices` | list[int] \| list[list[int]] \| None | `None` | The node's GPU layout for this role's partial-node workers, when they must not take the first contiguous GPUs: one list is the physical GPUs of the single worker on each node (`[0, 2]` puts a TP2 worker on one GPU per socket of a 4-GPU node); a list of lists is the GPUs of each worker slot on a node (`[[0, 2], [1, 3]]` runs two such workers per node). Every list has `gpus` distinct entries below `resources.gpus_per_node`, the lists do not overlap, and workers fill the slots in order before moving to the next node. The device mask, vLLM `--device-ids`, the Mooncake device map and the NUMA binding follow it. |
 | `srun_options` | dict[str, str] | `{}` | Merged over the recipe srun_options on this role's worker steps only (e.g. a per-step mem cap). |
 | `env` | dict[str, str] | `{}` | Environment for every worker of this role. |
 | `args` | dict[str, Any] | `{}` | The engine's own CLI flags for this role, as a mapping (`tensor-parallel-size: 4`). |
@@ -111,6 +114,7 @@ One worker role of the recipe: `roles.prefill`, `roles.decode`, or `roles.agg`.
 | `engine` | str \| mapping | `None` | Engine type or mapping with engine options. Set on every role when no top-level `engine` is declared; the two forms cannot be mixed, and role engines do not inherit options from each other. |
 | `container` | str \| None | `None` | Optional role image; accepts cluster container aliases. Defaults to `model.container`. |
 | `kv_events` | bool \| dict[str, Any] \| None | `None` | `true` for the default ZMQ publisher, or a mapping with `publisher` / `topic`. |
+| `mooncake_store_config` | dict[str, Any] | `{}` | TRT-LLM and vLLM: Mooncake store config keys for this role's workers (`global_segment_size`, `local_buffer_size`, TRT-LLM's `role`, ...), layered over the `mooncake-master` service's `options.store_config`, so prefill and decode can differ. Pool-wide keys stay there. |
 | `sidecar` | bool \| None | `None` | Run the native engine with a Dynamo sidecar (turns on `dynamo.sidecar`); every role must agree. |
 | `critical` | bool | `True` | A worker of this role exiting fails the run. `false` keeps the run alive for probes that kill workers. |
 | `restart` | [RestartPolicy](#restartpolicy) | `RestartPolicy()` | Relaunch exited workers in place: `never`, `on-failure`, `always`, or a mapping with `policy`, `max_restarts`, `backoff_seconds`, and `max_backoff_seconds`. |
@@ -152,7 +156,7 @@ Dynamo installation configuration.
 | `request_plane` | one of `'nats'`, `'tcp'`, `'http'` | `'tcp'` | Transport frontends use to send requests to workers. |
 | `event_plane` | one of `'nats'`, `'zmq'` \| None | `None` | Sets DYN_EVENT_PLANE for KV and worker events; unset follows the Dynamo image's default. |
 | `sidecar` | bool | `False` | Job-wide native sidecar mode; prefer `roles.<role>.sidecar: true`. |
-| `sidecar_port` | int | `50051` | Base loopback gRPC port between engine and sidecar; co-located workers get deterministic offsets. |
+| `sidecar_port` | int | `19000` | Base gRPC port between engine and sidecar; co-located workers get deterministic offsets. The sidecar dials it on loopback; vLLM and SGLang bind it on the engine's host (0.0.0.0). |
 | `sidecar_binary` | str \| None | `None` | Standalone sidecar executable; unset runs `python3 -m dynamo.<framework>.sidecar`. |
 | `sidecar_startup_timeout` | int | `3600` | Seconds to wait for the native engine's gRPC endpoint. |
 | `sidecar_context_length` | int \| None | `None` | Context length the sidecar advertises (TRT-LLM); unset reads it from the engine. |
@@ -194,11 +198,13 @@ Benchmark configuration.
 | `num_warmup_mult` | int \| None | `None` | Multiplier for warmup prompts = concurrency * mult (default: 2) |
 | `dataset_name` | str \| None | `None` | Custom dataset fields (sa-bench) |
 | `dataset_path` | str \| None | `None` | Container path to dataset file (mount via extra_mount) |
+| `dataset_cache_dir` | str \| None | `None` | Host dir where sa-bench caches generated "random" datasets so repeated sweeps skip the (minutes-long) tokenize/decode prompt build. Mounted into the benchmark container by SABenchRunner. |
 | `agentperf_client_dir` | str \| None | `None` | AgentPerf benchmark fields (agentperf-client trajectory replay) |
 | `agentperf_config` | str \| None | `None` | Container path to the client's workload YAML (endpoint/model/concurrency injected) |
 | `trace_file` | str \| None | `None` | Trace replay benchmark fields (uses aiperf with mooncake_trace dataset type) |
 | `custom_tokenizer` | str \| None | `None` | Custom tokenizer class (e.g., "module.path.ClassName") |
 | `use_chat_template` | bool | `True` | Pass --use-chat-template to benchmark (default: true) |
+| `endpoint` | str \| None | `None` | SA-Bench API path (see benchmark_serving.py --endpoint). |
 | `reuse_http_connections` | bool | `False` | SA-Bench Dynamo adapter: reuse a benchmark-scoped HTTP connection pool. Opt-in to preserve the historical per-request ClientSession behavior. |
 | `command` | str \| None | `None` | Custom benchmark hook. ``command`` is passed to ``bash -lc`` verbatim; srtctl does NOT substitute placeholders like ``{nginx_url}`` or ``{slurm_job_id}``. Render any parameters when generating the recipe. See srtctl.benchmarks.custom.CustomBenchmarkRunner for details. |
 | `container_image` | str \| None | `None` | Image the benchmark client runs in (custom, agentperf); unset uses `model.container`. |
@@ -224,7 +230,7 @@ Benchmark configuration.
 | `mmlu` | MMLU accuracy evaluation benchmark. | `max_tokens`, `num_examples`, `num_threads`, `repeat` |
 | `mooncake-router` | Mooncake Router benchmark for testing KV-aware routing using aiperf. | `itl_threshold_ms`, `mooncake_workload`, `ttft_threshold_ms` |
 | `router` | Router performance benchmark. | `concurrency`, `isl`, `num_requests`, `osl`, `prefix_ratios` |
-| `sa-bench` | SA-Bench throughput and latency benchmark. | `custom_tokenizer`, `dataset_name`, `dataset_path`, `isl`, `num_prompts_mult`, `num_warmup_mult`, `osl`, `random_range_ratio`, `req_rate`, `reuse_http_connections`, `slow_down_sleep_time`, `slow_down_wait_time`, `use_chat_template` |
+| `sa-bench` | SA-Bench throughput and latency benchmark. | `custom_tokenizer`, `dataset_cache_dir`, `dataset_name`, `dataset_path`, `endpoint`, `env`, `isl`, `num_prompts_mult`, `num_warmup_mult`, `osl`, `random_range_ratio`, `req_rate`, `reuse_http_connections`, `slow_down_sleep_time`, `slow_down_wait_time`, `use_chat_template` |
 | `sglang-bench` | SGLang benchmark runner. | `isl`, `osl`, `req_rate` |
 | `trace-replay` | Trace replay benchmark using aiperf with a user-provided dataset. | `itl_threshold_ms`, `trace_file`, `ttft_threshold_ms` |
 
@@ -287,11 +293,11 @@ DCGM power telemetry for benchmark measurement windows.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | bool | `False` | Collect GPU power over each benchmark concurrency window. |
-| `dcgm_exporter` | [TelemetryExporterConfig](#telemetryexporterconfig) \| None | `None` | GPU power exporter image, port, command, labels and metrics. When `enabled` with no exporter and no CPU leg, the cluster `default_gpu_exporter` is used. |
+| `dcgm_exporter` | [TelemetryExporterConfig](#telemetryexporterconfig) \| None | `None` | GPU power exporter image, port, command, labels and metrics. When `enabled` and this key is unset, the cluster `default_gpu_exporter` is used, with or without a CPU leg. |
 | `collect_interval_ms` | int | `1000` | Milliseconds between collector cycles. Replaces the retired ``default_frequency``, which despite its name was a period in seconds (1000ms == the old 1.0 default). |
 | `storage_subdir` | str | `'power'` | Output directory below the run's log directory. |
 | `required` | bool | `False` | Fail the benchmark when publishable DCGM power artifacts cannot be produced. CPU power stays best-effort. |
-| `clock_sync_check` | bool | `True` | Before any server starts, verify every allocation node reports an NTP-synchronised system clock. Sample timestamps (orchestrator host) and window boundaries (benchmark client host) are compared directly, so an unsynchronised node silently misaligns the measurement. Fails the job when ``required`` is true; otherwise the run continues and the manifest records ``clock_sync_unverified`` with ``publication_valid: false``. Set false on clusters where timedatectl/chronyc/ntpq are unavailable to unprivileged users. |
+| `clock_sync_check` | bool | `True` | Before any server starts, verify every allocation node reports an NTP-synchronised system clock. Sample timestamps (orchestrator host) and window boundaries (benchmark client host) are compared directly, so an unsynchronised node silently misaligns the measurement. Fails the job when ``required`` is true; otherwise the run continues and the manifest records ``clock_sync_unverified`` with ``publication_valid: false``. Probes timedatectl, chronyc, ntpq, then kernel maxerror < 16 seconds via adjtimex(2) (python3) for hosts with no queryable time daemon. These are synchronisation-status checks, not bounds on inter-node clock skew. Set false only where none of those is available to unprivileged users. |
 | `startup_timeout_seconds` | float | `30.0` | Seconds to wait for the exporters to answer before giving up (DCGM and CPU legs). |
 | `request_timeout_seconds` | float | `2.0` | Per-request exporter timeout in seconds (DCGM and CPU legs). |
 | `collector_join_timeout_seconds` | float \| None | `None` | None derives a safe shutdown budget from request_timeout_seconds. |
@@ -335,7 +341,7 @@ One entry of the top-level ``services:`` list.
 | `placement` | [ServicePlacementConfig](#serviceplacementconfig) \| None | `None` | Where the service runs. Defaults to the kind's placement (``head`` for generic services, ``infra`` for etcd/nats/mooncake-master, ``workers`` for the exporters). |
 | `nodes` | int \| None | `None` | Whole nodes this service owns: its pool. Pools add to the allocation next to the engine roles' nodes and are carved after them in declaration order, so a Ray cluster, a sandbox fleet and an engine role can each have their own nodes in one recipe. An owner is placed on its own pool (``placement.node: workers``); other services join it with ``placement.pool: <name>``. |
 | `start` | str \| None | `None` | ``after_frontend`` (default for ``generic``) or ``before_workers`` (default for ``mooncake-store``). |
-| `readiness` | [ServiceReadinessConfig](#servicereadinessconfig) \| None | `None` | Optional TCP port gate; the job waits for it on every service node before continuing. |
+| `readiness` | [ServiceReadinessConfig](#servicereadinessconfig) \| None | `None` | Optional TCP, HTTP, log or marker-file gate; the job waits for it on every service node before continuing. |
 | `inherit_discovery_env` | bool | `True` | Inject ``ETCD_ENDPOINTS`` / ``NATS_SERVER`` so the service can register with the job's Dynamo discovery plane. |
 | `critical` | bool \| None | `None` | When true a crash fails the run, like a worker dying. Default false for ``generic`` (a dead sidecar costs its own log, not the run) and true for ``mooncake-store``. Set true for anything in the live request path. |
 | `terminal` | bool | `False` | This service is the job's run: the job ends when every instance of every terminal service has exited, and the worst exit code becomes the job's. A recipe with a terminal service has no benchmark step (``benchmark.type`` stays ``manual``); a torchrun pool that trains to completion is the shape. |
@@ -346,7 +352,7 @@ One entry of the top-level ``services:`` list.
 | `build_timeout_seconds` | int | `1800` | Kill ``build_command`` after this many seconds. |
 | `enabled` | bool | `True` | ``false`` drops the service, including an implicit one (``etcd`` / ``nats`` under the Dynamo frontend, the default exporters) declared here by name. |
 | `external` | str \| None | `None` | For discovery-plane kinds (``etcd``, ``nats``, ``mooncake-master``): use this already-running endpoint and launch nothing; the URL is what the job's processes are pointed at. |
-| `options` | dict[str, Any] | `{}` | Kind-specific settings (``nats``: ``max_payload_mb``; ``mooncake-master``: ``store_config`` and ``device_names_by_gpu`` for vLLM). Unknown keys are rejected by the kind. |
+| `options` | dict[str, Any] | `{}` | Kind-specific settings (``nats``: ``max_payload_mb``; ``mooncake-master``: ``store_config`` for vLLM and TRT-LLM, ``device_names_by_gpu`` for vLLM). Unknown keys are rejected by the kind. |
 | `metrics` | list[[ServiceMetricsConfig](#servicemetricsconfig)] | `[]` | Prometheus endpoints this service serves: one mapping or a list of ``{port, path, nodes, name}`` (``path`` defaults to ``/metrics``, ``nodes`` to ``all``). Tachometer scrapes each on every node the service runs on, or on its first node with ``nodes: first``, as endpoint ``<name>_<node>`` where ``name`` defaults to the service name. The exporter kinds declare theirs; write it for a generic service that publishes metrics, or on a ``ray`` service whose head serves a trainer's collector and router. |
 
 ### PostEvalConfig
@@ -483,8 +489,8 @@ Best-effort CPU power collection via the cpu-power-exporter binary.
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `port` | int | `9405` | Port the exporter listens on and the head-node collector scrapes. |
-| `source` | one of `'auto'`, `'acpi'`, `'dcgm'` | `'auto'` | Power reading back-end passed through to the bundled Rust binary's own ``--source`` flag (``auto`` \| ``acpi`` \| ``dcgm``). ``auto`` tries DCGM first and falls back to ACPI when libdcgm.so is absent or reports no CPU entities. Has no effect when the Python stdlib fallback exporter is used instead of the binary -- that fallback is ACPI-only. |
+| `port` | int | `9405` | TCP port the per-node exporter listens on for ``/metrics``. |
+| `source` | one of `'auto'`, `'acpi'`, `'dcgm'`, `'rapl'` | `'auto'` | Power reading back-end passed through to the bundled Rust binary's own ``--source`` flag (``auto`` \| ``acpi`` \| ``dcgm`` \| ``rapl``). ``auto`` tries ACPI first (the only source with the socket envelope) and falls back to DCGM when no ACPI power_meter hwmon sensors exist or no socket-total sensor reads positive on two probes; DCGM watches fields 1130+1132 and falls back to 1130 alone if this libdcgm refuses the pair, and is accepted only if some socket reads a positive 1130. DCGM mode reports field 1130 = the CPU rail (plus 1132 = SysIO), about half the ACPI envelope, and the energy report flags such runs as "CPU rail only". ``rapl`` reads the x86 RAPL package energy counters (AMD EPYC, Intel Xeon), whose ``energy_uj`` files are root-only unless a cluster admin grants read access; ``auto`` never selects it. Has no effect when the Python stdlib fallback exporter is used instead of the binary -- that fallback is ACPI-only. |
 
 ### CpuPowerConfig
 
@@ -493,7 +499,7 @@ Host-side CPU power collection on every worker node.
 | Key | Type | Default | Description |
 |---|---|---|---|
 | `enabled` | bool | `False` | Master switch for this leg. Default: False. |
-| `source` | one of `'auto'`, `'acpi'`, `'dcgm'` | `'auto'` | ``auto`` tries ACPI then DCGM and is best-effort; naming ``acpi`` or ``dcgm`` explicitly makes that provider mandatory. |
+| `source` | one of `'auto'`, `'acpi'`, `'dcgm'` | `'auto'` | ``auto`` uses ACPI when some socket-total sensor reads a positive value, else DCGM fields 1130+1132, else 1130 alone (either DCGM rung accepted only if some socket reads a positive 1130; SysIO alone cannot vouch), logging each step down; naming ``acpi`` or ``dcgm`` explicitly makes that provider mandatory (it still proves itself, but exits instead of stepping). |
 | `sample_interval_seconds` | float | `0.1` | Read period on each node, in seconds. |
 | `startup_timeout_seconds` | float | `30.0` | How long to wait for every node's collector to publish its ready marker before giving up on readiness. |
 | `required` | bool | `False` | Fail the job when the leg does not become ready or does not produce a valid publication. |
@@ -530,6 +536,7 @@ Readiness gate: the launch blocks until the probe passes on every service node.
 | `tcp` | [TcpProbe](#tcpprobe) \| None | `None` | TCP connect probe. |
 | `http` | [HttpProbe](#httpprobe) \| None | `None` | HTTP GET probe. |
 | `log` | [LogProbe](#logprobe) \| None | `None` | Log-pattern probe against ``service_<name>.out``. |
+| `file` | [FileProbe](#fileprobe) \| None | `None` | Marker-file probe relative to the shared logs directory; removes the old marker before launch. |
 | `timeout_seconds` | int | `120` | How long to wait per node before failing the job. |
 | `interval_seconds` | int | `2` | Seconds between probe attempts. |
 
@@ -647,6 +654,14 @@ Ready when the service's log file contains a line matching the regular expressio
 |---|---|---|---|
 | `pattern` | str | required | Regular expression searched for in the service log. |
 
+### FileProbe
+
+Ready when a service-owned marker file exists in the run's shared logs directory.
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `path` | str | required | Relative marker path under /logs; service placeholders such as {index} are expanded per instance. The previous marker is removed before launching that instance, so readiness requires a fresh file. |
+
 ### GpuPowerMetricConfig
 
 The per-GPU power metric in a GPU exporter's scrape, in watts.
@@ -725,8 +740,8 @@ TRTLLM backend configuration and launch implementation.
 | `publish_metrics` | bool | `True` | Publish TRT-LLM engine metrics without enabling KV-cache events. Requires a Dynamo build supporting --publish-metrics; set False to omit the flag for older builds. Native trtllm-serve and sidecars are unaffected. Iteration statistics stay off regardless: srtctl bakes enable_iter_perf_stats: false into every engine section unless the recipe or observability sets it (TRTLLM_ENGINE_DEFAULTS), so this flag costs the per-request perf metrics only. |
 | `publish_events_and_metrics` | bool \| None | `None` | Legacy compatibility flag for Dynamo builds without --publish-metrics. True emits only --publish-events-and-metrics, regardless of publish_metrics. False or None uses publish_metrics instead. Observability does not enable it. |
 | `sequential_node_start` | int | `0` | Controls batched startup of workers that share the same node. 0 = start all workers in parallel (no constraint). 1 = fully sequential: one worker at a time, each must be ready before the next. N > 1 = start N workers simultaneously per batch, wait for all to be ready, then next batch. For trtllm_serve: readiness is an HTTP 200 on the worker's http_port. For dynamo.trtllm: readiness is a TCP connection on the worker's sys_port. |
-| `numa_memory_bind` | bool \| one of `'local'` \| None | `None` | Worker memory policy. None (default) uses `numactl -m 0,1` only for gb200/gb300/vrnvl72 prefill and decode workers (case-sensitive GPU type). True uses nodes 0,1 for any GPU type or mode; False leaves the policy unchanged. CPU binding does not change these policies. "local" requires numa_cpu_bind=True and strictly binds memory to the task GPU's NUMA node. Local mode fails startup if GPU NUMA affinity is unknown. Local memory exhaustion can fail allocations; existing/shared pages are not migrated. |
-| `numa_cpu_bind` | bool | `False` | Optional stricter NUMA CPU affinity for the worker process, in addition to numa_memory_bind. A previous post-hoc `taskset -pc <cpuset> $PPID` approach (see bind-b300-prefill-cpus.sh) only pins the leader PID *after* launch, so secondary threads spawned by Python/UCX/MPI/TRT-LLM can still land cross-socket. When true, srtctl instead: 1. sets TLLM_NUMA_AWARE_WORKER_AFFINITY=0 (disables TRT-LLM's own internal NUMA thread-pinning, which fights with the OS-level mask) 2. wraps the worker command (prefill/decode/agg) in `taskset -c <cpu_list>`, applied *before* exec so every spawned thread inherits the mask. The CPU list is discovered at runtime (configs/numa_cpu_bind.sh) from the physical GPU this task owns, not a static SLURM_LOCALID table — a static table assumes SLURM_LOCALID is a node-wide GPU ordinal, which breaks when two endpoints share a node (each gets its own srun step, so LOCALID restarts at 0 for both). Set numa_memory_bind="local" to also bind memory to that same NUMA node. |
+| `numa_memory_bind` | bool \| one of `'local'`, `'preferred'` \| None | `None` | Worker memory policy. None (default) uses `numactl -m 0,1` only for gb200/gb300/vrnvl72 prefill and decode workers (case-sensitive GPU type). True uses nodes 0,1 for any GPU type or mode; False leaves the policy unchanged. CPU binding does not change these policies. "local" requires numa_cpu_bind=True and strictly binds memory to the task GPU's NUMA node. Local mode fails startup if GPU NUMA affinity is unknown. Local memory exhaustion can fail allocations; existing/shared pages are not migrated. "preferred" also requires numa_cpu_bind=True and launches the worker under `numactl --cpunodebind=<node> --preferred=<node>`: allocations prefer the GPU's NUMA node and fall back to other nodes when it is full. |
+| `numa_cpu_bind` | bool | `False` | Set worker CPU affinity with `numactl --cpunodebind=<node>` before exec so child processes and threads inherit it. Requires numactl. configs/numa_cpu_bind.sh resolves the NUMA node from the task's physical GPU via CUDA_VISIBLE_DEVICES and SLURM_LOCALID, including colocated workers. Defaults TLLM_NUMA_AWARE_WORKER_AFFINITY to 0 for every memory policy so TRT-LLM preserves the launch CPU mask. Explicit roles.<role>.env values override this default; top-level environment overrides both. Enabling native worker affinity explicitly may change the CPU mask after launch. Set numa_memory_bind to "local" for strict memory binding, or "preferred" for GPU-local memory with fallback. |
 
 ### VLLMBackend
 
@@ -791,7 +806,7 @@ Top-level keys of `srtslurm.yaml`. Recipes inherit these defaults and resolve al
 | `default_time_limit` | str \| None | `None` | Job time limit (HH:MM:SS) for recipes that omit `slurm.time_limit`. |
 | `gpus_per_node` | int \| None | `None` | GPUs per node for recipes that omit `resources.gpus_per_node`. |
 | `default_gpu_type` | str \| None | `None` | Default for ``ResourceConfig.gpu_type`` when the recipe omits it. Lets one recipe move between clusters of different GPU types without an edit. |
-| `network_interface` | str \| None | `None` | Interface whose IP address frontends use to reach workers (e.g. `ib0`). Unset resolves the hostname. |
+| `network_interface` | str \| None | `None` | Interface whose IP address frontends use to reach workers (e.g. `ib0`). Unset resolves the hostname; set it if hostnames resolve to a different network than the nodes route through. |
 | `visible_devices_env` | str | `'CUDA_VISIBLE_DEVICES'` | GPU-subset mask passed to workers; ROCm clusters use ROCR_VISIBLE_DEVICES. |
 | `default_gpu_exporter` | [TelemetryExporterConfig](#telemetryexporterconfig) \| None | `<lambda>()` | Recipe exporter settings win. Explicit null disables the GPU default only. |
 | `use_gpus_per_node_directive` | bool | `True` | Emit `#SBATCH --gpus-per-node`. Set false on clusters that reject or ignore it. |
@@ -800,6 +815,7 @@ Top-level keys of `srtslurm.yaml`. Recipes inherit these defaults and resolve al
 | `use_het_jobs` | bool | `False` | Default for ``ResourceConfig.het_jobs`` when the recipe doesn't set it. When True (and recipe doesn't override), the prefill side and decode side are submitted as two SLURM heterogeneous-job components, each with its own ``--segment``. Lets asymmetric layouts (e.g. prefill 12 + decode 10 nodes on GB200/GB300) preserve NVL72 affinity per side. |
 | `default_sbatch_directives` | dict[str, str] \| None | `None` | Extra `#SBATCH --key=value` lines added to every job; a recipe's `sbatch_directives` wins per key. |
 | `default_health_check` | dict[str, int] \| None | `None` | `health_check` block (`max_attempts`, `interval_seconds`) used when a recipe has none. |
+| `default_reuse_container` | bool | `False` | Default for recipe `reuse_container`; explicit true or false in the recipe wins. |
 | `srtctl_root` | str \| None | `None` | srtctl checkout on the shared filesystem that compute nodes mount at /srtctl-src. Default: this checkout. |
 | `output_dir` | str \| None | `None` | Custom output directory for job logs |
 | `record_launch_plan` | bool | `False` | Cluster-wide default for recording exact realized srun commands. Recipes can opt in independently with output.record_launch_plan. |
@@ -814,3 +830,4 @@ Top-level keys of `srtslurm.yaml`. Recipes inherit these defaults and resolve al
 | `nginx_raise_ulimit` | bool \| None | `None` | When set, applied to job configs that omit ``frontend.nginx_raise_ulimit``. Clusters that disallow raising nofile for nginx containers should use false. |
 | `git_http_version` | str \| None | `None` | Works around intermittent git smart-HTTP/HTTP2 failures cloning github.com (stalls, or truncated responses git misreports as "could not read Username" auth-prompt failures). See git_clone_command_prefix() in core/config.py -- applied to every git clone/fetch srtctl performs. |
 | `preflight` | bool | `True` | Run the pre-submit model.path / model.container / telemetry filesystem checks on ``srtctl apply``. Set false on clusters whose model or image paths exist only on compute nodes (node-local NVMe such as /raid), where the login node cannot stat them; every apply then behaves as if --no-preflight had been passed. The framework still fails loudly at runtime if a path is genuinely missing on the compute node. |
+| `release_nodes_before_postprocess` | bool | `False` | After workers stop, shrink the job to its batch host (`scontrol update NodeList=`) so the other nodes return to the scheduler before the S3 upload and AI analysis, which then run on the batch host. Needs job shrinking enabled (no `disable_job_shrink`); skipped for het jobs. |

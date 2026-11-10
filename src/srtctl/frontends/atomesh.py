@@ -20,7 +20,7 @@ class AtomeshFrontend(StaticRouterFrontend):
     """Route aggregate or disaggregated traffic to native ATOM servers."""
 
     type: ClassVar[str] = "atomesh"
-    required_backend: ClassVar[str] = "atom"
+    required_backend: ClassVar[str | None] = "atom"
     executable: ClassVar[tuple[str, ...]] = ("atomesh", "launch")
     pd_flag: ClassVar[str] = "--pd-disaggregation"
     process_name: ClassVar[str] = "atomesh"
@@ -38,6 +38,7 @@ class AtomeshFrontend(StaticRouterFrontend):
         config: Any,
         backend: Any,
         backend_processes: list[Process],
+        runtime: RuntimeContext | None = None,
     ) -> list[str]:
         normalized = {str(key).replace("_", "-") for key in (config.frontend.args or {})}
         if "backend" in normalized:

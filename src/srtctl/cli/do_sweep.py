@@ -17,14 +17,17 @@ import functools
 import json
 import logging
 import os
+import shlex
 import subprocess
 import sys
+import textwrap
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
-from srtctl.backends.vllm import MOONCAKE_STORE_CONFIG_FILENAME, VLLMBackend
+from srtctl.backends.base import WorkerMode
+from srtctl.backends.vllm import VLLMBackend
 from srtctl.cli.mixins import (
     BenchmarkStageMixin,
     FrontendStageMixin,
@@ -44,8 +47,8 @@ from srtctl.core.processes import (
 )
 from srtctl.core.resource_snapshot import record_resource_snapshot
 from srtctl.core.runtime import RuntimeContext
-from srtctl.core.schema import SrtConfig
-from srtctl.core.slurm import get_slurm_job_id, start_srun_process
+from srtctl.core.schema import SrtConfig, container_creation_env
+from srtctl.core.slurm import get_slurm_job_id, resolve_container_name, start_srun_process
 from srtctl.core.status import JobStage, JobStatus, LogStreamer, StatusReporter, tachometer_outbox
 from srtctl.core.supervisor import WORKER_RESTARTS_FILENAME
 from srtctl.core.topology import Endpoint, NodePortAllocator, Process, allocate_endpoints_het
@@ -57,6 +60,33 @@ from srtctl.ports import (
 from srtctl.services.implicit import uses_discovery_plane
 
 logger = logging.getLogger(__name__)
+
+# Workflow metadata forwarded into the post-benchmark or eval-only process.
+POST_EVAL_PASSTHROUGH_ENV = (
+    "RUN_EVAL",
+    "EVAL_ONLY",
+    "IS_MULTINODE",
+    "FRAMEWORK",
+    "PRECISION",
+    "MODEL_PREFIX",
+    "RUNNER_TYPE",
+    "RESULT_FILENAME",
+    "SPEC_DECODING",
+    "ISL",
+    "OSL",
+    "MODEL",
+    "MODEL_PATH",
+    "MAX_MODEL_LEN",
+    "EVAL_MAX_MODEL_LEN",
+    "PREFILL_TP",
+    "PREFILL_EP",
+    "PREFILL_DP_ATTN",
+    "PREFILL_NUM_WORKERS",
+    "DECODE_TP",
+    "DECODE_EP",
+    "DECODE_DP_ATTN",
+    "DECODE_NUM_WORKERS",
+)
 
 
 @dataclass
@@ -108,6 +138,7 @@ class SweepOrchestrator(
                 decode_nodes=self.runtime.nodes.decode_group,
                 gpus_per_node=r.gpus_per_node,
                 pack_multinode_workers=self.backend.type == "trtllm",
+                gpu_indices_by_mode=r.gpu_indices_by_mode,
             )
         return self.config.allocate_worker_endpoints(self.runtime.nodes.worker)
 
@@ -121,6 +152,12 @@ class SweepOrchestrator(
         allocator = NodePortAllocator(bases={SIDECAR_GRPC_PORTS.name: self.config.dynamo.sidecar_port})
         return self.config.worker_processes(self.endpoints, port_allocator=allocator)
 
+    @functools.cached_property
+    def worker_runtime(self) -> RuntimeContext:
+        """Give engines the listener node selected by the frontend's topology resolver."""
+        topology = self._compute_frontend_topology()
+        return replace(self.runtime, frontend_node=topology.frontend_nodes[0])
+
     def start_head_infrastructure(self, registry: ProcessRegistry) -> None:
         """Start the discovery plane (etcd, NATS) as services.
 
@@ -131,18 +168,21 @@ class SweepOrchestrator(
         self.start_services("infra", registry)
 
     def _write_mooncake_store_config(self) -> None:
-        """vLLM's MooncakeStoreConnector reads its config from a JSON file, not env.
+        """vLLM's and TRT-LLM's Mooncake connectors read their config from a JSON file, not env.
 
         Written into log_dir (mounted at /logs in every worker) before workers
         start, pointing at the Mooncake master on the infra node.
         """
         backend = self.config.backend
+        served_model_name = backend.get_served_model_name(self.runtime.model_path.name)
+        for filename, store_cfg in backend.mooncake_store_configs(
+            self.runtime.infra_node_ip, served_model_name
+        ).items():
+            store_cfg_path = self.runtime.log_dir / filename
+            store_cfg_path.write_text(json.dumps(store_cfg, indent=2))
+            logger.info("Wrote mooncake_store_config to %s: %s", store_cfg_path, store_cfg)
         if not isinstance(backend, VLLMBackend) or backend.mooncake_kv_store is None:
             return
-        store_cfg = backend.build_mooncake_store_config(self.runtime.infra_node_ip)
-        store_cfg_path = self.runtime.log_dir / MOONCAKE_STORE_CONFIG_FILENAME
-        store_cfg_path.write_text(json.dumps(store_cfg, indent=2))
-        logger.info("Wrote mooncake_store_config to %s: %s", store_cfg_path, store_cfg)
         if not backend.mooncake_kv_store.device_names_by_gpu:
             return
         # Render only GPU subsets actually launched, rather than all 2**N subsets.
@@ -159,39 +199,45 @@ class SweepOrchestrator(
                     written.add(filename)
 
     def _print_connection_info(self) -> None:
-        """Print srun commands for connecting to nodes."""
-        container_args = f"--container-image={self.runtime.container_image}"
-        mounts_str = ",".join(f"{src}:{dst}" for src, dst in self.runtime.container_mounts.items())
-        if mounts_str:
-            container_args += f" --container-mounts={mounts_str}"
-
+        """Print connections using the same image, role options and root mode as launches."""
         logger.info("")
         logger.info("=" * 60)
         logger.info("Connection Commands")
         logger.info("=" * 60)
         if self.config.frontend.type != "none":
             logger.info("Frontend URL: http://%s:%d", self._public_api_node(), FRONTEND_PUBLIC_PORT)
-        logger.info("")
-        logger.info("To connect to head node (%s):", self.runtime.nodes.head)
-        logger.info(
-            "  srun %s --jobid %s -w %s --overlap --pty bash",
-            container_args,
-            self.runtime.job_id,
-            self.runtime.nodes.head,
-        )
 
-        # Print worker node connection commands
-        for node in self.runtime.nodes.compute:
-            if node != self.runtime.nodes.head:
-                logger.info("")
-                logger.info("To connect to worker node (%s):", node)
-                logger.info(
-                    "  srun %s --jobid %s -w %s --overlap --pty bash",
-                    container_args,
-                    self.runtime.job_id,
-                    node,
-                )
-
+        targets: list[tuple[str, WorkerMode | None]] = [(self.runtime.nodes.head, None)]
+        targets.extend((process.node, process.endpoint_mode) for process in self.backend_processes)
+        seen: set[tuple[str, str, str | None]] = set()
+        for node, mode in targets:
+            image = self._worker_container_image(mode) if mode else str(self.runtime.container_image)
+            options = self._worker_srun_options(mode) if mode else self.runtime.srun_options
+            resolved = resolve_container_name(
+                image,
+                reuse_container=self.runtime.reuse_container,
+                srun_options=options,
+                srun_export_env=container_creation_env(self.config),
+                job_id=str(self.runtime.job_id),
+            )
+            key = (node, image, resolved.name)
+            if key in seen:
+                continue
+            seen.add(key)
+            args = [f"--container-image={image}"]
+            if resolved.name:
+                args.append(f"--container-name={resolved.name}")
+            if self.runtime.container_mounts:
+                mounts = ",".join(f"{src}:{dst}" for src, dst in self.runtime.container_mounts.items())
+                args.append(f"--container-mounts={mounts}")
+            logger.info("")
+            logger.info("To connect to %s (%s):", f"{mode} worker" if mode else "head node", node)
+            logger.info(
+                "  srun %s --jobid %s -w %s --overlap --pty bash",
+                shlex.join(args),
+                self.runtime.job_id,
+                node,
+            )
         logger.info("=" * 60)
         logger.info("")
 
@@ -324,20 +370,75 @@ class SweepOrchestrator(
         raise RuntimeError(f"host_setup failed on: {', '.join(failures)}")
 
     # One probe per branch; the first that proves synchronisation prints its
-    # evidence and wins, so clock_sync_<node>.out records *which* daemon
+    # evidence and wins, so clock_sync_<node>.out records *which* source
     # vouched (and, for chrony/ntp, the offset it reported). Every probe is
     # read-only and unprivileged on stock images: timedatectl reads the kernel
-    # STA_UNSYNC flag over D-Bus, chronyc/ntpq ask their daemon. Locked-down
-    # cmdports print nothing and fall through to the failure line.
+    # maxerror over D-Bus, chronyc/ntpq ask their daemon. The last
+    # branch reads that same kernel value directly through adjtimex(2), for
+    # hosts whose clock is disciplined but expose no daemon to ask: no systemd
+    # PID 1 or D-Bus (container-rooted Slurm nodes), no chrony/ntp CLI. Each
+    # probe's stderr is kept and printed on the failure path, so the .out says
+    # why nothing vouched ("Failed to connect to bus", "command not found", ...).
+    #
+    # The kernel probe is plain Python shipped inside the bash one-liner, so it
+    # must stay free of single quotes.
+    CLOCK_SYNC_ADJTIMEX_PROBE = textwrap.dedent(
+        """\
+        import ctypes
+        import sys
+
+        # Match systemd ntp_synced(): STA_UNSYNC can stay set when chrony disables RTC sync.
+        MAXERROR_LIMIT_US = 16_000_000
+
+
+        class timex(ctypes.Structure):  # struct timex, LP64 layout (adjtimex(2))
+            _fields_ = [
+                ("modes", ctypes.c_uint),
+                ("offset", ctypes.c_long),
+                ("freq", ctypes.c_long),
+                ("maxerror", ctypes.c_long),
+                ("esterror", ctypes.c_long),
+                ("status", ctypes.c_int),
+                ("constant", ctypes.c_long),
+                ("precision", ctypes.c_long),
+                ("tolerance", ctypes.c_long),
+                ("time", ctypes.c_long * 2),
+                ("tick", ctypes.c_long),
+                ("ppsfreq", ctypes.c_long),
+                ("jitter", ctypes.c_long),
+                ("shift", ctypes.c_int),
+                ("stabil", ctypes.c_long),
+                ("jitcnt", ctypes.c_long),
+                ("calcnt", ctypes.c_long),
+                ("errcnt", ctypes.c_long),
+                ("stbcnt", ctypes.c_long),
+                ("tai", ctypes.c_int),
+                ("pad", ctypes.c_int * 11),
+            ]
+
+
+        tx = timex()  # modes == 0: read-only query
+        state = ctypes.CDLL(None, use_errno=True).adjtimex(ctypes.byref(tx))
+        if state < 0:
+            sys.exit("adjtimex failed: errno %d" % ctypes.get_errno())
+        if tx.maxerror >= MAXERROR_LIMIT_US:
+            sys.exit("kernel clock unsynchronised: state %d status 0x%x maxerror %dus" % (state, tx.status, tx.maxerror))
+        print("maxerror %dus status 0x%x" % (tx.maxerror, tx.status))
+        """
+    )
     CLOCK_SYNC_SCRIPT = (
-        "if timedatectl show -p NTPSynchronized --value 2>/dev/null | grep -qx yes; then "
+        'timedatectl=$(timedatectl show -p NTPSynchronized --value 2>&1); if grep -qx yes <<<"$timedatectl"; then '
         'echo "$(hostname): timedatectl NTPSynchronized=yes"; exit 0; fi; '
-        "if t=$(chronyc -n tracking 2>/dev/null) && grep -Eq '^Leap status *: *Normal' <<<\"$t\"; then "
+        "if chronyc=$(chronyc -n tracking 2>&1) && grep -Eq '^Leap status *: *Normal' <<<\"$chronyc\"; then "
         'echo "$(hostname): chronyc Leap status Normal"; '
-        "grep -E '^(Reference ID|System time|Last offset)' <<<\"$t\"; exit 0; fi; "
-        "if n=$(ntpq -pn 2>/dev/null) && grep -q '^[*]' <<<\"$n\"; then "
-        'echo "$(hostname): ntpq has a selected peer"; grep \'^[*]\' <<<"$n"; exit 0; fi; '
-        'echo "$(hostname): system clock is not NTP-synchronised" >&2; exit 1'
+        "grep -E '^(Reference ID|System time|Last offset)' <<<\"$chronyc\"; exit 0; fi; "
+        "if ntpq=$(ntpq -pn 2>&1) && grep -q '^[*]' <<<\"$ntpq\"; then "
+        'echo "$(hostname): ntpq has a selected peer"; grep \'^[*]\' <<<"$ntpq"; exit 0; fi; '
+        f"if adjtimex=$(python3 -c '{CLOCK_SYNC_ADJTIMEX_PROBE}' 2>&1); then "
+        'echo "$(hostname): kernel adjtimex maxerror below 16s ($adjtimex)"; exit 0; fi; '
+        '{ echo "$(hostname): system clock is not NTP-synchronised"; '
+        'echo "timedatectl: $timedatectl"; echo "chronyc: $chronyc"; echo "ntpq: $ntpq"; echo "adjtimex: $adjtimex"; } >&2; '
+        "exit 1"
     )
     CLOCK_SYNC_TIMEOUT_SECONDS = 30
 
@@ -468,6 +569,8 @@ class SweepOrchestrator(
                 output=str(log),
                 container_image=str(self.runtime.container_image),
                 container_mounts=self.runtime.container_mounts,
+                reuse_container=self.runtime.reuse_container,
+                container_prepare_timeout_seconds=self.runtime.container_prepare_timeout_seconds,
                 het_group=self.runtime.nodes.het_group_for(node),
             )
             procs.append((node, proc, log))
@@ -493,6 +596,12 @@ class SweepOrchestrator(
         in cache and skip downloading entirely - no locks created.
         """
         if not self.runtime.is_hf_model:
+            return
+
+        if self.runtime.hf_snapshot_path:
+            logger.info(
+                "Using pinned HF snapshot %s; skipping unversioned model pre-download", self.runtime.hf_snapshot_path
+            )
             return
 
         hf_home = self._get_hf_home()
@@ -567,6 +676,8 @@ class SweepOrchestrator(
                 output=str(download_log),
                 container_image=str(self.runtime.container_image),
                 container_mounts=self.runtime.container_mounts,
+                reuse_container=self.runtime.reuse_container,
+                container_prepare_timeout_seconds=self.runtime.container_prepare_timeout_seconds,
                 env_to_set=hf_env,
                 use_bash_wrapper=False,  # command is already bash -c
                 het_group=self.runtime.nodes.het_group_for(download_node),
@@ -600,6 +711,10 @@ class SweepOrchestrator(
         """Run lm-eval after the main benchmark completes (or directly in eval-only mode)."""
         from srtctl.benchmarks import get_runner
 
+        # The eval harness uses a local HTTP endpoint, so run it beside the
+        # resolved public endpoint (router, nginx or direct worker).
+        eval_node = self._public_api_node()
+
         # In eval-only mode the benchmark health check was skipped, so do the
         # full model-ready wait here.  In post-benchmark mode a quick port
         # check is sufficient since the server already served traffic.
@@ -609,7 +724,7 @@ class SweepOrchestrator(
                 logger.error("Server did not become healthy for eval")
                 return 1
         else:
-            if not wait_for_port(self._public_api_node(), FRONTEND_PUBLIC_PORT, timeout=30):
+            if not wait_for_port(eval_node, FRONTEND_PUBLIC_PORT, timeout=30):
                 logger.error("Server health check failed before eval - skipping")
                 return 1
 
@@ -632,6 +747,7 @@ class SweepOrchestrator(
                 return 1
             cmd = runner.build_command(self.config, self.runtime)
 
+        logger.info("Eval node: %s", eval_node)
         logger.info("Eval command: %s", " ".join(cmd))
         logger.info("Eval log: %s", eval_log)
 
@@ -641,29 +757,7 @@ class SweepOrchestrator(
         env_to_set = {}
         for var in [
             *self.config.post_eval.passthrough_env,
-            "RUN_EVAL",
-            "EVAL_ONLY",
-            "IS_MULTINODE",
-            "FRAMEWORK",
-            "PRECISION",
-            "MODEL_PREFIX",
-            "RUNNER_TYPE",
-            "RESULT_FILENAME",
-            "SPEC_DECODING",
-            "ISL",
-            "OSL",
-            "MODEL",
-            "MODEL_PATH",
-            "MAX_MODEL_LEN",
-            "EVAL_MAX_MODEL_LEN",
-            "PREFILL_TP",
-            "PREFILL_EP",
-            "PREFILL_DP_ATTN",
-            "PREFILL_NUM_WORKERS",
-            "DECODE_TP",
-            "DECODE_EP",
-            "DECODE_DP_ATTN",
-            "DECODE_NUM_WORKERS",
+            *POST_EVAL_PASSTHROUGH_ENV,
         ]:
             val = os.environ.get(var)
             if val:
@@ -689,13 +783,16 @@ class SweepOrchestrator(
 
         proc = start_srun_process(
             command=cmd,
-            nodelist=[self.runtime.nodes.head],
+            step_name="eval",
+            nodelist=[eval_node],
             output=str(eval_log),
             container_image=str(self.runtime.container_image),
             container_mounts=self.runtime.container_mounts,
+            reuse_container=self.runtime.reuse_container,
+            container_prepare_timeout_seconds=self.runtime.container_prepare_timeout_seconds,
             env_to_set=env_to_set,
             srun_options=self.runtime.srun_options,
-            het_group=self.runtime.nodes.het_group_for(self.runtime.nodes.head),
+            het_group=self.runtime.nodes.het_group_for(eval_node),
         )
 
         while proc.poll() is None:
@@ -894,7 +991,7 @@ class SweepOrchestrator(
             # Post-process first: generate rollup, upload logs to S3, eagerly
             # push logs_url to the status API. Runs before report_completed so
             # the final PUT can reassert the artifact pointer.
-            self.run_postprocess(exit_code, reporter=reporter)
+            self.run_postprocess(exit_code, reporter=reporter, received_signal=registry.received_signal)
             if log_streamer is not None:
                 log_streamer.stop()
             reporter.report_completed(

@@ -28,7 +28,7 @@ roles:
 dynamo:
   source:
     wheel: "<nightly-with-sidecars>"
-  sidecar_port: 50051
+  sidecar_port: 19000
   sidecar_args:
     - --grpc-connections
     - "4"
@@ -36,7 +36,35 @@ dynamo:
 
 The default sidecar commands are `python3 -m dynamo.sglang.sidecar`, `python3 -m dynamo.vllm.sidecar`, and `python3 -m dynamo.trtllm.sidecar`. All three use the shared `--grpc-endpoint` flag.
 
-TensorRT-LLM supports sidecars for aggregated workers only and runs the sidecar on MPI rank zero. `dynamo.sidecar_context_length` can override the TRT-LLM context length inferred from `roles.agg.args.max_seq_len`.
+TensorRT-LLM supports aggregate, prefill, and decode workers through OpenEngine gRPC. Each endpoint runs one sidecar on global MPI rank zero; prefill and decode sidecars register their disaggregation roles. The engine receives the configured parallelism and served model name, while the sidecar reads tokenizer artifacts from the model path. `dynamo.sidecar_context_length` can override the context length inferred from the corresponding role's `args.max_seq_len`. The image must include compatible TensorRT-LLM OpenEngine and Dynamo sidecar builds.
+
+The [disaggregated TRT-LLM example](https://github.com/NVIDIA/srt-slurm/blob/main/examples/trtllm/dynamo-sidecar-disagg.yaml) places a prefill and decode worker with sidecars on separate nodes.
+
+For a TRT-LLM `hf:` model, set `model.hf_snapshot_path` to the absolute path of its commit-specific snapshot inside the container, such as `/hf/hub/models--org--name/snapshots/<40-character-commit>`. Set `identity.model.revision` to the same commit and mount the full Hugging Face hub cache at `/hf/hub` so the snapshot's links to `blobs/` resolve. The TRT-LLM workers, sidecars, and sa-bench tokenizer then use that snapshot path; the served model name remains the configured model ID. An absent snapshot fails the launch instead of selecting a moving cache reference.
+
+## Metrics
+
+A sidecar job has two kinds of worker metrics, served by different processes on different ports:
+
+- **Dynamo runtime metrics.** Every Rust sidecar starts the Dynamo runtime's system status server on `DYN_SYSTEM_PORT` (the worker's allocated system port) and serves the `dynamo_component_*` runtime, request-handler, and lifecycle families at `/metrics`; the vLLM and SGLang KV relays add `kv_publisher_*`. Only a process that runs a sidecar binds this port.
+- **Native engine metrics.** No sidecar bridges or polls the engine's own metrics ([ai-dynamo/dynamo `3e72af98f8a5`](https://github.com/ai-dynamo/dynamo/tree/3e72af98f8a5/lib/sidecar)), so the engine's Prometheus families come from the engine's own HTTP server, on the worker's allocated HTTP port.
+
+Tachometer scrapes both, and built-in AIPerf runners receive the same URLs in `AIPERF_SERVER_METRICS_URLS`. Custom benchmarks keep one URL per logical worker, aligned with `SRT_*_ENDPOINTS`: the leader's native engine endpoint, or the sidecar's runtime endpoint where the engine serves none (see [Benchmarks](benchmarks.md#custom)). Every target has the worker's `hostname`, `worker_index`, `worker_process`, and `worker_role` metadata and the `backend` filter:
+
+| Target name | URL |
+| --- | --- |
+| `backend_{mode}{index}_rank{rank}` | `http://<node>:<system port>/metrics`, the sidecar's runtime metrics |
+| `backend_{mode}{index}_rank{rank}_engine` | `http://<node>:<HTTP port>/metrics`, the native engine's metrics |
+
+`{rank}` is the process's rank within the worker: the node rank, or for vLLM hybrid DP the node's first global DP rank.
+
+| Engine | Sidecar runtime endpoint | Native engine endpoint |
+| --- | --- | --- |
+| vLLM | Every node that runs the Rust frontend: the single-node worker, each hybrid-DP node, and the leader of a cross-node TP/PP replica | Same nodes: `vllm-rs` serves `vllm:*` families labelled per DP engine (`model_name`, `engine`) on its HTTP server, which always runs beside gRPC and binds `0.0.0.0` in sidecar mode ([vLLM `b272cff368`](https://github.com/vllm-project/vllm/tree/b272cff368/rust/src/server/src)). `--disable-log-stats` turns the engine series off. Headless followers serve neither |
+| SGLang | The endpoint leader, plus each follower that runs a KV-relay sidecar ([topology](#sglang-topology-and-launch-requirements)) | Every node's `--port`, with `--enable-metrics`, which srtctl passes unless the role's `args` set `enable-metrics`. The leader runs the full HTTP server beside native gRPC: tokenizer histograms (TTFT, ITL, end-to-end latency) and its node's scheduler series. Each follower runs SGLang's health server, whose `/metrics` carries the scheduler series of the DP ranks on that node, labelled `dp_rank` ([SGLang `759111879457`](https://github.com/sgl-project/sglang/tree/759111879457/python/sglang/srt/entrypoints)). srtctl allocates each follower its own HTTP port for it |
+| TRT-LLM | The endpoint leader, where global MPI rank zero runs the sidecar | None |
+
+TRT-LLM's OpenEngine gRPC server (`tensorrt_llm.commands.serve --grpc --grpc-protocol openengine`) replaces the OpenAI HTTP server and has no Prometheus or iteration-statistics endpoint; its only load signal is the `GetLoad` RPC ([TensorRT-LLM `7695494b8f`](https://github.com/NVIDIA/TensorRT-LLM/blob/7695494b8f/tensorrt_llm/commands/serve.py)), which the sidecar does not export. A TRT-LLM sidecar job therefore records only the sidecar's `dynamo_component_*` metrics and no engine series such as KV-cache usage or iteration statistics. For built-in AIPerf runners, TRT-LLM sidecar URLs also follow the `engine.publish_events_and_metrics` gate described in [Benchmarks](benchmarks.md#custom); custom benchmarks always receive each leader's sidecar runtime URL, and Tachometer scrapes them regardless.
 
 ## SGLang topology and launch requirements
 
@@ -50,7 +78,7 @@ The [disaggregated multinode attention-DP example](https://github.com/NVIDIA/srt
 
 For multi-node vLLM data parallelism, srtctl launches one Rust gRPC frontend and one Dynamo sidecar on **every node** using hybrid load balancing. All nodes receive the global `--data-parallel-size`, while `--data-parallel-size-local` and `--data-parallel-start-rank` restrict each frontend to its colocated engines. For example, DP12 on three four-GPU nodes launches local DP4 with starting ranks 0, 4, and 8. Dynamo registers three endpoints, each covering its four local ranks. No node runs `--headless`, and readiness requires all three sidecars. vLLM sidecars require `engine.dp_launch_mode: per_node` (the default; `backend.dp_launch_mode` in schema 1); `per_gpu` is rejected during configuration validation, including for single-rank jobs.
 
-The multi-node DP command uses Python-supervised Rust frontends (`python3 -m vllm.entrypoints.cli.main serve` with `VLLM_USE_RUST_FRONTEND=1`). Python coordinates the shared DP rendezvous and starts `vllm-rs frontend` with each node's local engine count and starting rank; requests are handled by Rust. This is a current launcher limitation: `vllm-rs serve` expects to own the complete DP group and does not implement hybrid startup. Python supervision is not a fundamental requirement of the sidecar architecture. Single-node sidecars continue to use `vllm-rs serve`.
+The multi-node DP command uses Python-supervised Rust frontends (`python3 -m vllm.entrypoints.cli.main serve` with `VLLM_USE_RUST_FRONTEND=1`). Python coordinates the shared DP rendezvous and starts `vllm-rs frontend` with each node's local engine count and starting rank; requests are handled by Rust. This is a current launcher limitation: `vllm-rs serve` expects to own the complete DP group and does not implement hybrid startup. Python supervision is not a fundamental requirement of the sidecar architecture. Single-node sidecars continue to use `vllm-rs serve`. Because Python `vllm serve` parses the engine arguments itself and disables its reasoning parser by omission, srtctl drops `reasoning-parser: none` (the `vllm-rs serve` value Dynamo sidecars expect) on this launcher, where the bootstrapped Rust frontend already defaults to no parser; `reasoning-parser: auto` has no equivalent there and is rejected.
 
 Each Rust frontend has one API server; do not set `api-server-count` to another value or enable `grpc` (which selects the separate Python gRPC server) or `data-parallel-external-lb`.
 

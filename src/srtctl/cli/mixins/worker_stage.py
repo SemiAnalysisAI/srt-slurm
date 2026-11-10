@@ -20,8 +20,9 @@ from srtctl.core.fingerprint import generate_capture_script
 from srtctl.core.health import wait_for_health
 from srtctl.core.observability_nsys import wrap_observability_nsys
 from srtctl.core.processes import ManagedProcess, NamedProcesses, ProcessRegistry
-from srtctl.core.schema import build_otel_env, installs_dynamo
-from srtctl.core.slurm import CONTAINER_REMAP_ROOT_EXPORT, get_hostname_ip, start_srun_process
+from srtctl.core.runtime import RuntimeContext
+from srtctl.core.schema import build_otel_env, container_creation_env, installs_dynamo
+from srtctl.core.slurm import get_hostname_ip, start_srun_process
 from srtctl.core.supervisor import EndpointKey, WorkerSupervisor
 from srtctl.frontends import get_frontend
 from srtctl.services.implicit import discovery_env
@@ -30,7 +31,6 @@ from srtctl.services.otel import lifecycle_otel_env
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
-    from srtctl.core.runtime import RuntimeContext
     from srtctl.core.schema import SrtConfig
     from srtctl.core.topology import Endpoint, Process
 
@@ -94,6 +94,30 @@ class WorkerStageMixin:
     # Type hints for mixin dependencies
     config: "SrtConfig"
     runtime: "RuntimeContext"
+
+    @property
+    def worker_runtime(self) -> RuntimeContext:
+        """Runtime context passed to backend command builders."""
+        return self.runtime
+
+    def _worker_container_image(self, mode: WorkerMode) -> str:
+        return (
+            self.config.worker_container_for_role(mode)
+            if mode in self.config.role_containers
+            else str(self.runtime.container_image)
+        )
+
+    def _worker_srun_options(self, mode: WorkerMode) -> dict[str, str]:
+        return {**self.runtime.srun_options, **self.config.roles[mode].srun_options}
+
+    def _worker_container_nodes(self, mode: WorkerMode, het_group: int | None) -> tuple[str, ...] | None:
+        if self.runtime.reuse_container is not True:
+            return None
+        return tuple(
+            dict.fromkeys(
+                p.node for p in self.backend_processes if p.endpoint_mode == mode and p.het_group == het_group
+            )
+        )
 
     def _apply_mooncake_process_config(self, process: "Process", environment: dict[str, str]) -> None:
         backend = self.config.backend_for_role(process.endpoint_mode)
@@ -360,7 +384,7 @@ class WorkerStageMixin:
         cmd = backend.build_worker_command(
             process=process,
             endpoint_processes=endpoint_processes,
-            runtime=self.runtime,
+            runtime=self.worker_runtime,
             frontend_type=self.config.frontend.type,
             nsys_prefix=nsys_prefix,
             dump_config_path=config_dump,
@@ -421,7 +445,7 @@ class WorkerStageMixin:
             local_hostname = env_to_set.get("MOONCAKE_LOCAL_HOSTNAME") or get_hostname_ip(
                 process.node, self.runtime.network_interface
             )
-            env_to_set.update(backend.get_mooncake_worker_env(self.runtime.infra_node_ip, local_hostname))
+            env_to_set.update(backend.get_mooncake_worker_env(self.runtime.infra_node_ip, local_hostname, mode))
 
         self._apply_mooncake_process_config(process, env_to_set)
 
@@ -447,7 +471,11 @@ class WorkerStageMixin:
                 bash_preamble,
                 _nsys_library_path_preamble(profiling.nsys_library_paths),
             )
-        fp_cmd = generate_capture_script(f"{self.runtime.container_log_dir}/fingerprint_{mode}_w{index}{suffix}.json")
+        fingerprint_path = f"{self.runtime.container_log_dir}/fingerprint_{mode}_w{index}{suffix}.json"
+        if isinstance(self.runtime, RuntimeContext) and self.runtime.hf_snapshot_path:
+            fp_cmd = generate_capture_script(fingerprint_path, self.runtime.worker_model_arg)
+        else:
+            fp_cmd = generate_capture_script(fingerprint_path)
         # Keep fingerprint failures non-fatal, but do not let its `|| true`
         # mask failures from setup/dynamo install commands before it.
         fp_cmd = f"( {fp_cmd} )"
@@ -475,17 +503,16 @@ class WorkerStageMixin:
             command=cmd,
             nodelist=[process.node],
             output=str(worker_log),
-            container_image=(
-                self.config.worker_container_for_role(mode)
-                if mode in self.config.role_containers
-                else str(self.runtime.container_image)
-            ),
+            container_image=self._worker_container_image(mode),
+            reuse_container=self.runtime.reuse_container,
+            container_prepare_timeout_seconds=self.runtime.container_prepare_timeout_seconds,
+            container_prepare_nodes=self._worker_container_nodes(mode, process.het_group),
             container_mounts=self.runtime.container_mounts,
             env_to_set=env_to_set,
             env_to_unset=env_to_unset,
             bash_preamble=bash_preamble,
-            srun_options={**self.runtime.srun_options, **self.config.roles[mode].srun_options},
-            srun_export_env=CONTAINER_REMAP_ROOT_EXPORT if installs_dynamo(self.config) else None,
+            srun_options=self._worker_srun_options(mode),
+            srun_export_env=container_creation_env(self.config),
             het_group=process.het_group,
             step_name=step_name,
         )
@@ -506,6 +533,7 @@ class WorkerStageMixin:
             signal_full=not automatic_nsys,
             step_name=step_name,
             fatal_log_patterns=self._fatal_log_patterns(mode),
+            worker_assignments=(process,),
         )
 
     def start_endpoint_worker(self, endpoint_processes: list["Process"], *, attempt: int = 0) -> ManagedProcess:
@@ -572,7 +600,7 @@ class WorkerStageMixin:
         cmd = backend.build_worker_command(
             process=leader,
             endpoint_processes=endpoint_processes,
-            runtime=self.runtime,
+            runtime=self.worker_runtime,
             frontend_type=self.config.frontend.type,
             nsys_prefix=nsys_prefix,
             dump_config_path=config_dump,
@@ -649,7 +677,7 @@ class WorkerStageMixin:
             local_hostname = env_to_set.get("MOONCAKE_LOCAL_HOSTNAME") or get_hostname_ip(
                 leader.node, self.runtime.network_interface
             )
-            env_to_set.update(backend.get_mooncake_worker_env(self.runtime.infra_node_ip, local_hostname))
+            env_to_set.update(backend.get_mooncake_worker_env(self.runtime.infra_node_ip, local_hostname, mode))
 
         # Add profiling environment variables after the worker environment.
         if profiling.enabled and profiling_selects_process:
@@ -673,7 +701,11 @@ class WorkerStageMixin:
                 bash_preamble,
                 _nsys_library_path_preamble(profiling.nsys_library_paths),
             )
-        fp_cmd = generate_capture_script(f"{self.runtime.container_log_dir}/fingerprint_{mode}_w{index}.json")
+        fingerprint_path = f"{self.runtime.container_log_dir}/fingerprint_{mode}_w{index}.json"
+        if isinstance(self.runtime, RuntimeContext) and self.runtime.hf_snapshot_path:
+            fp_cmd = generate_capture_script(fingerprint_path, self.runtime.worker_model_arg)
+        else:
+            fp_cmd = generate_capture_script(fingerprint_path)
         # Keep fingerprint failures non-fatal, but do not let its `|| true`
         # mask failures from setup/dynamo install commands before it.
         fp_cmd = f"( {fp_cmd} )"
@@ -689,7 +721,7 @@ class WorkerStageMixin:
         # Repeated hosts preserve each node's exact rank count and ordering.
         task_nodes = [p.node for p in endpoint_processes for _ in p.gpu_indices]
         task_counts = [len(p.gpu_indices) for p in endpoint_processes]
-        srun_options = {**self.runtime.srun_options, **self.config.roles[mode].srun_options}
+        srun_options = self._worker_srun_options(mode)
         srun_options["ntasks-per-node"] = str(max(task_counts))
         if num_nodes > 1:
             # Every multi-node endpoint, uniform or not, lays its ranks out explicitly:
@@ -724,15 +756,14 @@ class WorkerStageMixin:
             ntasks=total_gpus,
             nodelist=endpoint_nodes,
             output=str(worker_log),
-            container_image=(
-                self.config.worker_container_for_role(mode)
-                if mode in self.config.role_containers
-                else str(self.runtime.container_image)
-            ),
+            container_image=self._worker_container_image(mode),
+            reuse_container=self.runtime.reuse_container,
+            container_prepare_timeout_seconds=self.runtime.container_prepare_timeout_seconds,
+            container_prepare_nodes=self._worker_container_nodes(mode, leader.het_group),
             container_mounts=self.runtime.container_mounts,
             env_to_set=env_to_set,
             bash_preamble=bash_preamble,
-            srun_export_env=CONTAINER_REMAP_ROOT_EXPORT if installs_dynamo(self.config) else None,
+            srun_export_env=container_creation_env(self.config),
             mpi=srun_config.mpi,
             oversubscribe=srun_config.oversubscribe,
             cpu_bind=srun_config.cpu_bind,
@@ -758,6 +789,7 @@ class WorkerStageMixin:
             signal_full=not automatic_nsys,
             step_name=step_name,
             fatal_log_patterns=self._fatal_log_patterns(mode),
+            worker_assignments=tuple(endpoint_processes),
         )
 
     def _wait_for_worker_ready(self, leader: "Process") -> None:

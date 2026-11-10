@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import subprocess
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -20,6 +21,7 @@ from srtctl.core.schema import SrtConfig
 from srtctl.core.topology import Endpoint
 from srtctl.ports import MOONCAKE_HTTP_METADATA_PORT, MOONCAKE_MASTER_PORT
 from srtctl.services import (
+    FileProbe,
     HttpProbe,
     ServiceConfig,
     ServiceLaunchContext,
@@ -101,6 +103,75 @@ def _proc(returncode: int = 0) -> MagicMock:
     proc.returncode = returncode
     proc.poll.return_value = None
     return proc
+
+
+def test_file_readiness_clears_stale_markers_and_resolves_each_node(tmp_path: Path) -> None:
+    config = _load("""
+frontend:
+  type: sglang-router
+services:
+  - name: donor
+    command: [python3, -c, "write /logs/donor_{index}.ready"]
+    placement: {node: decode}
+    start: before_workers
+    critical: true
+    readiness:
+      file: {path: "donor_{index}.ready"}
+""")
+    runtime = _runtime(tmp_path)
+    markers = [tmp_path / f"donor_{index}.ready" for index in range(2)]
+    for marker in markers:
+        marker.write_text("stale\n")
+    launches: list[dict] = []
+    probes: list[FileProbe] = []
+
+    def launch(**kwargs):
+        index = len(launches)
+        assert not markers[index].exists()
+        if index == 0:
+            assert markers[1].read_text() == "stale\n"
+        else:
+            assert markers[0].read_text() == "registered\n"
+        assert f"/logs/donor_{index}.ready" in kwargs["command"][-1]
+        launches.append(kwargs)
+        markers[index].write_text("registered\n")
+        return _proc()
+
+    def ready(probe, **kwargs):
+        assert isinstance(probe, FileProbe)
+        marker = kwargs["log_file"].parent / probe.path
+        assert marker.read_text() == "registered\n"
+        probes.append(probe)
+        return True
+
+    orchestrator = SweepOrchestrator(config, runtime)
+    with patch(SRUN, side_effect=launch), patch(WAIT, side_effect=ready), patch(HOST_IP, return_value="10.0.0.1"):
+        procs = orchestrator.start_services("before_workers")
+    assert len(procs) == 2
+    assert sorted(probe.path for probe in probes) == ["donor_0.ready", "donor_1.ready"]
+    assert config.services[0].readiness.file.path == "donor_{index}.ready"
+
+
+def test_file_readiness_rejects_a_directory_before_launch(tmp_path: Path) -> None:
+    config = _load("""
+frontend:
+  type: sglang-router
+services:
+  - name: donor
+    command: [/bin/true]
+    placement: {node: decode}
+    start: before_workers
+    readiness:
+      file: {path: "donor_{index}.ready"}
+""")
+    marker = tmp_path / "donor_0.ready"
+    marker.mkdir()
+    orchestrator = SweepOrchestrator(config, _runtime(tmp_path))
+    with patch(SRUN) as launch, patch(HOST_IP, return_value="10.0.0.1"):
+        with pytest.raises(RuntimeError, match=r"services\[donor\]\.readiness\.file\.path: .*path is a directory"):
+            orchestrator.start_services("before_workers")
+    launch.assert_not_called()
+    assert marker.is_dir()
 
 
 # --- schema -------------------------------------------------------------------
@@ -337,6 +408,56 @@ def test_readiness_gate_blocks_and_failure_terminates_started(tmp_path: Path) ->
     # Registered before the readiness wait, so a signal during the wait still finds it.
     (registered,) = [call.args[0] for call in registry.add_process.call_args_list]
     assert registered.popen is popen
+
+
+WORKERS_PROBED = (
+    "services:\n  - name: a\n    command: [/bin/true]\n    placement: {node: workers}\n"
+    "    readiness:\n      port: 9000\n      timeout_seconds: 5\n"
+)
+
+
+def test_instances_launch_together_and_are_probed_concurrently(tmp_path: Path) -> None:
+    config = _load(WORKERS_PROBED)
+    events: list[str] = []
+    # Passes only if all three probes are waiting at once; serial waits break it.
+    barrier = threading.Barrier(3, timeout=5)
+
+    def launch(**kwargs):
+        events.append(f"launch {kwargs['nodelist'][0]}")
+        return _proc()
+
+    def ready(probe, **kwargs):
+        events.append(f"wait {kwargs['host']}")
+        barrier.wait()
+        return True
+
+    with patch(SRUN, side_effect=launch), patch(WAIT, side_effect=ready), patch(HOST_IP, return_value="10.0.0.1"):
+        procs = _orchestrator(config, tmp_path).start_services("after_frontend")
+    assert [proc.node for proc in procs] == ["node1", "node2", "node3"]
+    assert events[:3] == ["launch node1", "launch node2", "launch node3"]
+    assert sorted(events[3:]) == ["wait node1", "wait node2", "wait node3"]
+
+
+def test_one_instance_failing_readiness_terminates_every_instance(tmp_path: Path) -> None:
+    config = _load(WORKERS_PROBED)
+    popens: list[MagicMock] = []
+
+    def launch(**kwargs):
+        popens.append(_proc())
+        return popens[-1]
+
+    registry = MagicMock()
+    with (
+        patch(SRUN, side_effect=launch),
+        patch(WAIT, side_effect=lambda probe, **kwargs: kwargs["host"] != "node2"),
+        patch(HOST_IP, return_value="10.0.0.1"),
+        pytest.raises(RuntimeError, match=r"services\[a\] on node2 was not ready within 5s"),
+    ):
+        _orchestrator(config, tmp_path).start_services("after_frontend", registry)
+    assert len(popens) == 3
+    for popen in popens:
+        popen.terminate.assert_called_once()
+    assert [call.args[0].popen for call in registry.add_process.call_args_list] == popens
 
 
 def test_readiness_fails_fast_when_the_process_dies(tmp_path: Path) -> None:

@@ -4,6 +4,7 @@
 """Tests for dry-run config details display (mounts, env vars)."""
 
 import os
+import re
 import tempfile
 from pathlib import Path
 from unittest.mock import patch
@@ -35,6 +36,13 @@ BASE_CONFIG = {
     },
     "benchmark": {"type": "manual"},
 }
+
+
+@pytest.fixture(autouse=True)
+def _no_local_cluster_config(tmp_path, monkeypatch):
+    # A developer's srtslurm.yaml in the repo root would add default_mounts rows whose
+    # long paths make rich truncate the cells these tests assert on.
+    monkeypatch.setenv("SRTSLURM_CONFIG", str(tmp_path / "absent-srtslurm.yaml"))
 
 
 def _make_config(overrides: dict | None = None) -> SrtConfig:
@@ -73,6 +81,39 @@ def test_cluster_gpu_visibility_is_visible(tmp_path, monkeypatch, capsys):
     assert "GPU subset visibility variable: ROCR_VISIBLE_DEVICES" in capsys.readouterr().out
 
 
+# "release ... post-process" on one logical line, or the srtslurm.yaml key itself.
+_NODE_RELEASE_LINE = re.compile(r"releas\w*[^\n]{0,160}post-?process|release_nodes_before_postprocess")
+
+
+@pytest.mark.parametrize(("release", "shown"), [(True, True), (False, False), (None, False)])
+def test_node_release_before_postprocess_is_visible_only_when_on(tmp_path, monkeypatch, capsys, release, shown):
+    cluster = {} if release is None else {"release_nodes_before_postprocess": release}
+    cluster_config = tmp_path / "srtslurm.yaml"
+    cluster_config.write_text(yaml.safe_dump(cluster))
+    monkeypatch.setenv("SRTSLURM_CONFIG", str(cluster_config))
+    show_config_details(_make_config())
+    output = capsys.readouterr().out.lower()
+    assert bool(_NODE_RELEASE_LINE.search(output)) is shown, output
+
+
+def test_pinned_hf_snapshot_is_visible_and_validated(capsys):
+    revision = "a" * 40
+    snapshot = f"/hf/hub/models--org--name/snapshots/{revision}"
+    overrides = {
+        "model": {"path": "hf:org/name", "hf_snapshot_path": snapshot},
+        "engine": {"type": "trtllm"},
+        "identity": {"model": {"revision": revision}},
+    }
+    config = _make_config(overrides)
+    show_config_details(config)
+    assert snapshot in " ".join(capsys.readouterr().out.split())
+    assert config.model.hf_snapshot_path == snapshot
+
+    overrides["identity"] = {"model": {"revision": "b" * 40}}
+    with pytest.raises(ValueError, match="model.hf_snapshot_path must end with identity.model.revision"):
+        _make_config(overrides)
+
+
 def test_role_restart_policy_and_limits_are_visible(capsys):
     config = _make_config(
         {"roles": {"decode": {"restart": {"policy": "on-failure", "max_restarts": 2, "backoff_seconds": 4}}}}
@@ -86,6 +127,59 @@ def test_role_restart_policy_and_limits_are_visible(capsys):
 def test_default_restart_policy_keeps_dry_run_unchanged(capsys):
     show_config_details(_make_config())
     assert "restart=" not in capsys.readouterr().out
+
+
+def test_container_reuse_is_visible_when_enabled(capsys):
+    config = _make_config({"reuse_container": True})
+    assert config.reuse_container is True
+    show_config_details(config)
+    output = " ".join(capsys.readouterr().out.split())
+    assert "reuse_container: true" in output
+    assert "--container-name" in output
+    assert ":no_exec" in output
+    assert "preparation timeout follows health_check" in output
+
+
+@pytest.mark.parametrize("overrides", [{}, {"reuse_container": False}])
+def test_container_reuse_defaults_to_disabled(capsys, overrides):
+    config = _make_config(overrides)
+    assert config.reuse_container is False
+    show_config_details(config)
+    output = capsys.readouterr().out
+    assert "reuse_container" not in output
+    assert "--container-name" not in output
+
+
+def test_container_reuse_rejects_invalid_values():
+    from marshmallow import ValidationError
+
+    with pytest.raises(ValidationError, match="reuse_container"):
+        _make_config({"reuse_container": "sometimes"})
+
+
+@pytest.mark.parametrize(
+    ("default", "override", "expected"),
+    [(True, None, True), (True, False, False), (False, True, True), (False, None, False)],
+)
+def test_container_reuse_cluster_default_and_recipe_override(
+    tmp_path, monkeypatch, capsys, default, override, expected
+):
+    from srtctl.core.config import load_config
+    from srtctl.core.schema import ClusterConfig
+
+    cluster = tmp_path / "srtslurm.yaml"
+    cluster.write_text(yaml.safe_dump({"default_reuse_container": default}))
+    monkeypatch.setenv("SRTSLURM_CONFIG", str(cluster))
+    assert ClusterConfig.Schema().load({"default_reuse_container": default}).default_reuse_container is default
+    recipe = {**BASE_CONFIG}
+    if override is not None:
+        recipe["reuse_container"] = override
+    path = tmp_path / "recipe.yaml"
+    path.write_text(yaml.safe_dump(recipe))
+    config = load_config(path)
+    assert config.reuse_container is expected
+    show_config_details(config)
+    assert ("reuse_container: true" in capsys.readouterr().out) is expected
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -122,9 +216,98 @@ def test_trtllm_local_numa_example_is_visible(capsys):
     assert config.backend.numa_cpu_bind is True
     assert config.backend.numa_memory_bind == "local"
     show_config_details(config)
-    output = capsys.readouterr().out
+    output = " ".join(capsys.readouterr().out.split())
     assert "strict GPU-local memory binding" in output
     assert "--bind-memory" in output
+    assert "numactl --cpunodebind=<node>" in output
+    assert "agg: TLLM_NUMA_AWARE_WORKER_AFFINITY=0 (effective)" in output
+
+
+def test_trtllm_preferred_numa_example_is_visible(capsys):
+    recipe = Path(__file__).resolve().parents[1] / "examples/trtllm/trtllm-serve-agg-numa-preferred.yaml"
+    config = SrtConfig.from_yaml(recipe)
+    assert config.backend.numa_cpu_bind is True
+    assert config.backend.numa_memory_bind == "preferred"
+    assert config.backend.get_environment_for_mode("agg")["TLLM_NUMA_AWARE_WORKER_AFFINITY"] == "0"
+    show_config_details(config)
+    output = " ".join(capsys.readouterr().out.split())
+    assert "--prefer-memory" in output
+    assert "numactl --cpunodebind=<node>" in output
+    assert "agg: TLLM_NUMA_AWARE_WORKER_AFFINITY=0 (effective)" in output
+
+
+def test_trtllm_cpu_only_numa_binding_is_visible(capsys):
+    config = _make_config({"engine": {"type": "trtllm", "numa_cpu_bind": True, "numa_memory_bind": False}})
+    show_config_details(config)
+    output = " ".join(capsys.readouterr().out.split())
+    assert "GPU-local CPU affinity" in output
+    assert "numactl --cpunodebind=<node>" in output
+    assert "prefill: TLLM_NUMA_AWARE_WORKER_AFFINITY=0 (effective)" in output
+    assert "decode: TLLM_NUMA_AWARE_WORKER_AFFINITY=0 (effective)" in output
+    assert "--bind-memory" not in output
+    assert "--prefer-memory" not in output
+
+
+@pytest.mark.parametrize(
+    ("role_env", "global_env", "prefill_affinity", "decode_affinity"),
+    [
+        ({}, {}, "0", "0"),
+        ({"TLLM_NUMA_AWARE_WORKER_AFFINITY": "1"}, {}, "1", "0"),
+        (
+            {"TLLM_NUMA_AWARE_WORKER_AFFINITY": "1"},
+            {"TLLM_NUMA_AWARE_WORKER_AFFINITY": "0"},
+            "0",
+            "0",
+        ),
+        (
+            {"TLLM_NUMA_AWARE_WORKER_AFFINITY": "0"},
+            {"TLLM_NUMA_AWARE_WORKER_AFFINITY": "1"},
+            "1",
+            "1",
+        ),
+    ],
+)
+def test_trtllm_numa_effective_worker_affinity_is_visible(
+    capsys, role_env, global_env, prefill_affinity, decode_affinity
+):
+    config = _make_config(
+        {
+            "engine": {"type": "trtllm", "numa_cpu_bind": True, "numa_memory_bind": "preferred"},
+            "roles": {"prefill": {"env": role_env}},
+            "environment": global_env,
+        }
+    )
+    show_config_details(config)
+    output = " ".join(capsys.readouterr().out.split())
+    assert f"prefill: TLLM_NUMA_AWARE_WORKER_AFFINITY={prefill_affinity} (effective)" in output
+    assert f"decode: TLLM_NUMA_AWARE_WORKER_AFFINITY={decode_affinity} (effective)" in output
+
+
+@pytest.mark.parametrize("prefill_cpu_bind", [False, True])
+def test_trtllm_numa_role_engines_are_visible(capsys, prefill_cpu_bind):
+    config = _make_config(
+        {
+            "frontend": {"type": "trtllm_serve", "enable_multiple_frontends": False},
+            "roles": {
+                "prefill": {
+                    "engine": {
+                        "type": "trtllm",
+                        "numa_cpu_bind": prefill_cpu_bind,
+                        "numa_memory_bind": "local" if prefill_cpu_bind else False,
+                    }
+                },
+                "decode": {"engine": {"type": "trtllm", "numa_cpu_bind": True, "numa_memory_bind": "preferred"}},
+            },
+        }
+    )
+    show_config_details(config)
+    output = " ".join(capsys.readouterr().out.split())
+    assert ("TRT-LLM NUMA (prefill): GPU-local CPU affinity" in output) is prefill_cpu_bind
+    assert ("--bind-memory" in output) is prefill_cpu_bind
+    assert "TRT-LLM NUMA (decode): GPU-local CPU affinity" in output
+    assert "--prefer-memory" in output
+    assert ("prefill: TLLM_NUMA_AWARE_WORKER_AFFINITY=0 (effective)" in output) is prefill_cpu_bind
+    assert "decode: TLLM_NUMA_AWARE_WORKER_AFFINITY=0 (effective)" in output
 
 
 class TestDryRunDynamoMetrics:
@@ -267,6 +450,20 @@ class TestDryRunMounts:
         output = capsys.readouterr().out
         assert "/model" in output
         assert "/logs" in output
+
+    def test_hf_snapshot_mount_shows_preserved_cache_layout(self, tmp_path, monkeypatch, capsys):
+        cache_root = tmp_path / "models--Inferact--Qwen"
+        (cache_root / "blobs").mkdir(parents=True)
+        snapshot = cache_root / "snapshots" / "revision"
+        snapshot.mkdir(parents=True)
+        monkeypatch.setattr(submit, "console", Console(width=200))
+
+        show_config_details(_make_config({"model": {"path": str(snapshot)}}))
+
+        output = capsys.readouterr().out
+        assert str(cache_root) in output
+        assert "/srtctl-model-cache" in output
+        assert str(snapshot) not in output
 
     def test_extra_mount_from_recipe(self, capsys):
         config = _make_config({"extra_mount": ["/data/custom:/custom", "/shared/cache:/cache"]})
@@ -772,6 +969,68 @@ class TestDryRunExecutionExtensions:
         assert "P2PHANDSHAKE" in output
         assert "100GB" in output
 
+    def test_vllm_mooncake_role_configs_in_dry_run(self, capsys):
+        """A vLLM role with its own mooncake_store_config shows its file and layered config."""
+        kv_cfg = '{"kv_connector":"MooncakeStoreConnector","kv_role":"kv_both"}'
+        config = _make_config(
+            {
+                "engine": "vllm",
+                "roles": {
+                    "prefill": {"args": {"kv-transfer-config": kv_cfg}},
+                    "decode": {
+                        "args": {"kv-transfer-config": kv_cfg},
+                        "mooncake_store_config": {"global_segment_size": "48GB"},
+                    },
+                },
+                "services": [
+                    {
+                        "name": "mooncake-master",
+                        "type": "mooncake-master",
+                        "options": {"store_config": {"protocol": "rdma", "global_segment_size": "24GB"}},
+                    }
+                ],
+            }
+        )
+        show_config_details(config)
+        output = capsys.readouterr().out
+        # Rich wraps long values in the narrow test console; the paths are asserted by
+        # tests/test_vllm_mooncake_roles.py, so match the row labels and sizes here.
+        assert "MOONCAKE_CONFIG_PATH" in output
+        assert "store_config (decode)" in output
+        assert "store_config (prefill)" not in output
+        assert "24GB" in output
+        assert "48GB" in output
+
+    def test_trtllm_mooncake_role_configs_in_dry_run(self, capsys):
+        """Each TRT-LLM role using the mooncake-store connector shows its client config and path."""
+        connector = {"kv_connector_config": {"connector": "mooncake-store"}}
+        config = _make_config(
+            {
+                "engine": "trtllm",
+                "roles": {
+                    "prefill": {"args": connector},
+                    "decode": {"args": connector, "mooncake_store_config": {"global_segment_size": "16GiB"}},
+                },
+                "services": [
+                    {
+                        "name": "mooncake-master",
+                        "type": "mooncake-master",
+                        "options": {"store_config": {"global_segment_size": "8GiB"}},
+                    }
+                ],
+            }
+        )
+        show_config_details(config)
+        output = capsys.readouterr().out
+        assert "MOONCAKE_CONFIG_PATH" in output
+        assert "store_config (prefill)" in output
+        assert "store_config (decode)" in output
+        assert '"capacity"' in output
+        assert "16GiB" in output
+        # model_key defaults to the served model name, unknown before the model is staged
+        # (the table wraps the placeholder, so match its start).
+        assert '"model_key": "<model' in output
+
     def test_vllm_process_local_mooncake_map_in_dry_run(self, capsys):
         config = _make_config(
             {
@@ -802,6 +1061,17 @@ class TestDryRunExecutionExtensions:
 
 class TestDryRunServices:
     """services: command, env, source, and readiness must be visible before submitting."""
+
+    def test_service_file_readiness_is_shown(self, capsys):
+        config = _make_config(
+            {
+                "services": [
+                    {"name": "donor", "command": ["/bin/true"], "readiness": {"file": {"path": "donor_{index}.ready"}}}
+                ]
+            }
+        )
+        show_config_details(config)
+        assert "file /logs/donor_{index}.ready exists" in capsys.readouterr().out
 
     def test_service_command_env_and_readiness_shown(self, capsys):
         config = _make_config(
@@ -1170,3 +1440,90 @@ def test_explicit_profiling_explains_observability_precedence(capsys):
     output = capsys.readouterr().out
     assert "superseded by profiling" in output
     assert "nsys targets" not in output
+
+
+class TestRoleGpuIndices:
+    """``roles.<role>.gpu_indices`` is validated at load and visible in the dry run."""
+
+    AGG_ONLY = {"prefill": None, "decode": None}
+
+    def _agg(self, **agg):
+        return _make_config(
+            {
+                "resources": {"gpu_type": "gb300", "gpus_per_node": 4},
+                "engine": {"type": "trtllm", "served_model_name": "test"},
+                "roles": {**self.AGG_ONLY, "agg": {"nodes": 1, "workers": 1, **agg}},
+            }
+        )
+
+    def test_mask_follows_the_named_gpus(self) -> None:
+        config = self._agg(gpus=2, gpu_indices=[0, 2])
+        assert config.topology.gpu_indices_by_mode == {"agg": (frozenset({0, 2}),)}
+        endpoints = config.allocate_worker_endpoints(["node0"])
+        assert endpoints[0].gpu_indices == frozenset({0, 2})
+        from srtctl.core.worker_backends import worker_processes
+
+        assert [p.cuda_visible_devices for p in worker_processes(config, endpoints)] == ["0,2"]
+
+    def test_visible_in_dry_run(self, capsys) -> None:
+        show_config_details(self._agg(gpus=2, gpu_indices=[0, 2]))
+        output = " ".join(capsys.readouterr().out.split())
+        assert "agg: gpu_indices=0,2 (CUDA_VISIBLE_DEVICES per worker; 1 worker(s) per node)" in output
+
+    @pytest.mark.parametrize(
+        ("agg", "message"),
+        [
+            ({"gpus": 2, "gpu_indices": [0, 0]}, "distinct GPU indices"),
+            ({"gpus": 2, "gpu_indices": [0, 4]}, "must lie in 0..3"),
+            ({"gpu_indices": [0, 2]}, "needs an explicit gpus"),
+            ({"gpus": 2, "gpu_indices": [0, 1, 2]}, "lists 3 GPUs per worker but gpus: is 2"),
+            ({"gpus": 4, "gpu_indices": [0, 1, 2, 3]}, "only applies to a partial-node worker"),
+            ({"nodes": 1, "workers": 2, "gpus": 2, "gpu_indices": [0, 2]}, "needs nodes: 2; got nodes: 1"),
+            ({"nodes": 1, "workers": 2, "gpus": 2, "gpu_indices": [[0, 2], [2, 3]]}, "no GPU in two slots"),
+            ({"nodes": 1, "workers": 2, "gpus": 2, "gpu_indices": [[0, 2], [1]]}, "lists 1 and 2 GPUs per worker"),
+            # A mixed form fails marshmallow's union field before the recipe validator runs.
+            ({"nodes": 1, "workers": 2, "gpus": 2, "gpu_indices": [0, [1, 3]]}, "Not a valid"),
+        ],
+    )
+    def test_rejected_at_load(self, agg, message) -> None:
+        from marshmallow import ValidationError
+
+        with pytest.raises(ValidationError, match=message):
+            self._agg(**agg)
+
+    def test_prefill_set_rejects_colocated_decode(self) -> None:
+        from marshmallow import ValidationError
+
+        with pytest.raises(ValidationError, match="cannot share them"):
+            _make_config(
+                {
+                    "resources": {"gpu_type": "gb300", "gpus_per_node": 4},
+                    "engine": {"type": "trtllm", "served_model_name": "test"},
+                    "roles": {
+                        "prefill": {"nodes": 1, "workers": 1, "gpus": 2, "gpu_indices": [0, 2]},
+                        "decode": {"nodes": "colocate", "workers": 1, "gpus": 2},
+                    },
+                }
+            )
+
+    def test_two_slots_per_node(self, capsys) -> None:
+        config = _make_config(
+            {
+                "resources": {"gpu_type": "gb300", "gpus_per_node": 4},
+                "engine": {"type": "trtllm", "served_model_name": "test"},
+                "roles": {
+                    **self.AGG_ONLY,
+                    "agg": {"nodes": 2, "workers": 4, "gpus": 2, "gpu_indices": [[0, 2], [1, 3]]},
+                },
+            }
+        )
+        endpoints = config.allocate_worker_endpoints(["node0", "node1"])
+        assert [(e.nodes[0], sorted(e.gpu_indices)) for e in endpoints] == [
+            ("node0", [0, 2]),
+            ("node0", [1, 3]),
+            ("node1", [0, 2]),
+            ("node1", [1, 3]),
+        ]
+        show_config_details(config)
+        output = " ".join(capsys.readouterr().out.split())
+        assert "agg: gpu_indices=0,2 | 1,3 (CUDA_VISIBLE_DEVICES per worker; 2 worker(s) per node)" in output

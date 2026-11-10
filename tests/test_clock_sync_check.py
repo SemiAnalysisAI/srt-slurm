@@ -5,7 +5,9 @@ host) are compared by raw float, so the orchestrator probes every allocation
 node's bare host for a synchronised clock before spending GPU time.
 """
 
+import re
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -229,6 +231,14 @@ class TestProbeScript:
     def _run(tmp_path: Path, tools: dict[str, str]) -> subprocess.CompletedProcess[str]:
         bindir = tmp_path / "bin"
         bindir.mkdir()
+        # Missing tools must not fall through to the test host's clock services.
+        tools = {
+            **{
+                name: f"echo '{name}: command not found' >&2; exit 127\n"
+                for name in ("timedatectl", "chronyc", "ntpq", "python3")
+            },
+            **tools,
+        }
         for name, body in tools.items():
             exe = bindir / name
             exe.write_text("#!/usr/bin/env bash\n" + body)
@@ -268,10 +278,42 @@ class TestProbeScript:
         assert lines[0].endswith(": ntpq has a selected peer")
         assert lines[1].startswith("*10.0.0.1")
 
+    def test_kernel_maxerror_vouches_when_no_daemon_answers(self, tmp_path):
+        """Hosts without systemd/D-Bus or a chrony/ntp CLI (container-rooted Slurm nodes) still prove sync."""
+        r = self._run(
+            tmp_path,
+            {
+                "timedatectl": "echo 'Failed to connect to bus: Host is down' >&2; exit 1\n",
+                "chronyc": "exit 127\n",
+                "ntpq": "exit 127\n",
+                "python3": "echo 'maxerror 4508us status 0x2001'\n",
+            },
+        )
+        assert r.returncode == 0
+        lines = r.stdout.splitlines()
+        assert len(lines) == 1  # the evidence line only; the daemon probes\' stderr stays out of the OK path
+        assert lines[0].endswith(": kernel adjtimex maxerror below 16s (maxerror 4508us status 0x2001)")
+
+    def test_failure_report_keeps_every_probe_stderr(self, tmp_path):
+        """clock_sync_<node>.out must say why nothing vouched, not just that nothing did."""
+        r = self._run(
+            tmp_path,
+            {
+                "timedatectl": "echo 'Failed to connect to bus: Host is down' >&2; exit 1\n",
+                "ntpq": "exit 1\n",
+                "python3": "echo 'kernel clock unsynchronised: state 5 status 0x41 maxerror 16000000us' >&2; exit 1\n",
+            },
+        )
+        assert r.returncode == 1
+        assert r.stdout == ""
+        assert "timedatectl: Failed to connect to bus: Host is down" in r.stderr
+        assert re.search(r"^chronyc: .*chronyc: command not found", r.stderr, re.MULTILINE)
+        assert "adjtimex: kernel clock unsynchronised: state 5 status 0x41 maxerror 16000000us" in r.stderr
+
     @pytest.mark.parametrize(
         "tools",
         [
-            {"timedatectl": "exit 127\n", "chronyc": "exit 127\n", "ntpq": "exit 127\n"},
+            {},
             {"timedatectl": "echo no\n", "chronyc": "echo 'Leap status     : Not synchronised'\n", "ntpq": "exit 1\n"},
             {"timedatectl": "echo no\n", "chronyc": "exit 1\n", "ntpq": "printf '+10.0.0.2 x 2 u 1 64 377 0 0 0\\n'\n"},
         ],
@@ -282,6 +324,69 @@ class TestProbeScript:
         assert r.returncode == 1
         assert r.stdout == ""
         assert "not NTP-synchronised" in r.stderr
+
+
+class TestAdjtimexProbe:
+    """The python one-liner the kernel branch runs on the bare host."""
+
+    @pytest.mark.parametrize(
+        "state,status,maxerror,synced",
+        [
+            pytest.param(0, 0x2001, 7_000, True, id="synced"),
+            pytest.param(5, 0x2041, 7_000, True, id="synced-without-rtcsync"),
+            pytest.param(5, 0x0040, 16_000_000, False, id="unsynced-since-boot"),
+            pytest.param(0, 0x2001, 16_000_000, False, id="at-limit-with-flag-clear"),
+            pytest.param(0, 0x2001, 15_999_999, True, id="just-below-limit"),
+            pytest.param(0, 0x2001, 16_000_001, False, id="above-limit"),
+        ],
+    )
+    def test_sync_decision(self, state: int, status: int, maxerror: int, synced: bool, capsys) -> None:
+        def adjtimex(pointer) -> int:
+            tx = pointer._obj
+            assert tx.modes == 0  # The probe must never change the host clock.
+            tx.status = status
+            tx.maxerror = maxerror
+            return state
+
+        with patch("ctypes.CDLL") as cdll:
+            cdll.return_value.adjtimex.side_effect = adjtimex
+            if synced:
+                exec(SweepOrchestrator.CLOCK_SYNC_ADJTIMEX_PROBE, {})  # noqa: S102 - execute the trusted embedded probe
+                assert capsys.readouterr().out == f"maxerror {maxerror}us status 0x{status:x}\n"
+            else:
+                with pytest.raises(SystemExit, match="kernel clock unsynchronised"):
+                    exec(SweepOrchestrator.CLOCK_SYNC_ADJTIMEX_PROBE, {})  # noqa: S102 - execute the trusted embedded probe
+                assert capsys.readouterr().out == ""
+
+    def test_syscall_failure(self, capsys) -> None:
+        with patch("ctypes.CDLL") as cdll, patch("ctypes.get_errno", return_value=1):
+            cdll.return_value.adjtimex.return_value = -1
+            with pytest.raises(SystemExit, match="adjtimex failed: errno 1"):
+                exec(SweepOrchestrator.CLOCK_SYNC_ADJTIMEX_PROBE, {})  # noqa: S102 - execute the trusted embedded probe
+        assert capsys.readouterr().out == ""
+
+    def test_embeds_in_the_bash_single_quotes(self):
+        probe = SweepOrchestrator.CLOCK_SYNC_ADJTIMEX_PROBE
+        assert "'" not in probe
+        compile(probe, "<probe>", "exec")
+        assert f"python3 -c '{probe}'" in SweepOrchestrator.CLOCK_SYNC_SCRIPT
+
+    @pytest.mark.skipif(sys.platform != "linux", reason="adjtimex(2) is Linux-only")
+    def test_reads_the_live_kernel_state(self):
+        """Whatever this host's clock state is, the struct layout must yield a sane, parseable answer."""
+        r = subprocess.run(
+            [sys.executable, "-c", SweepOrchestrator.CLOCK_SYNC_ADJTIMEX_PROBE],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if r.returncode == 0:
+            assert re.fullmatch(r"maxerror \d+us status 0x[0-9a-f]+\n", r.stdout)
+        else:
+            assert r.returncode == 1
+            assert re.fullmatch(
+                r"kernel clock unsynchronised: state [0-5] status 0x[0-9a-f]+ maxerror \d+us\n", r.stderr
+            ), r.stderr
 
 
 class TestSkipped:

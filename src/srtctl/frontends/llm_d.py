@@ -67,6 +67,10 @@ ENVOY_ACCESS_LOG = "llm-d-envoy-access.log"
 # prefill-filter and decode-filter select on it; an aggregate worker serves both.
 ROLE_LABEL = "llm-d.ai/role"
 ROLE_BY_MODE = {"prefill": "prefill", "decode": "decode", "agg": "both"}
+# Selects the EPP's metric names per endpoint; unlabelled endpoints get vLLM's, which an
+# SGLang worker never exports, so the EPP never counts it ready
+# (pkg/epp/framework/plugins/datalayer/extractor/metrics/mapping_registry.go).
+ENGINE_LABEL = "llm-d.ai/engine-type"
 # Gauge of endpoints whose metrics the EPP scraped within its staleness window
 # (pkg/epp/metrics/llm_d_router_metrics.go).
 READY_ENDPOINTS_METRIC = "llm_d_epp_ready_endpoints"
@@ -447,7 +451,7 @@ class LLMDFrontend(StaticRouterFrontend):
         )
 
     def endpoints_document(
-        self, backend_processes: list[Process], network_interface: str | None
+        self, backend_processes: list[Process], network_interface: str | None, engine: str
     ) -> dict[str, list[dict[str, Any]]]:
         """The file-discovery endpoints: every routable worker, at its proxy's port when it has one."""
         endpoints = []
@@ -460,7 +464,7 @@ class LLMDFrontend(StaticRouterFrontend):
                     "namespace": POOL,
                     "address": self.resolve_worker_host(process.node, network_interface),
                     "port": str(_routed_port(process)),
-                    "labels": {ROLE_LABEL: ROLE_BY_MODE[process.endpoint_mode]},
+                    "labels": {ROLE_LABEL: ROLE_BY_MODE[process.endpoint_mode], ENGINE_LABEL: engine},
                 }
             )
         return {"endpoints": endpoints}
@@ -506,7 +510,7 @@ class LLMDFrontend(StaticRouterFrontend):
             self.collect_workers(backend, backend_processes, runtime.network_interface), config, stop_event
         )
 
-        endpoints = self.endpoints_document(backend_processes, runtime.network_interface)
+        endpoints = self.endpoints_document(backend_processes, runtime.network_interface, backend.type)
         (runtime.log_dir / ENDPOINTS_FILE).write_text(yaml.safe_dump(endpoints, sort_keys=False))
         epp_config = config.frontend.epp_config
         epp_document = epp_config_document(

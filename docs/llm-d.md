@@ -92,8 +92,9 @@ srtctl writes three files into the log directory (every container sees it at `/l
 
 - `llm-d-endpoints.yaml`: one endpoint per routable worker process (the one with an HTTP
   port: a multi-node worker's leader), at its IPv4 address on the cluster's network
-  interface, labelled `llm-d.ai/role: prefill`, `decode`, or `both` (aggregate). A decode
-  endpoint is its sidecar's port.
+  interface, labelled `llm-d.ai/role: prefill`, `decode`, or `both` (aggregate) and
+  `llm-d.ai/engine-type: vllm` or `sglang`, which selects the metric names the EPP reads
+  (unlabelled endpoints get vLLM's). A decode endpoint is its sidecar's port.
 - `llm-d-epp-config.yaml`: `frontend.epp_config` with the
   [`file-discovery`](https://github.com/llm-d/llm-d-router/blob/71f4f0999f95b96c49a9d0c4afbd18dfdb943c26/pkg/epp/framework/plugins/datalayer/discovery/file/plugin.go)
   plugin (`watchFile: false`) and `dataLayer.discovery` added. `discovery.pluginRef` is

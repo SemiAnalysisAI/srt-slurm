@@ -646,8 +646,9 @@ def test_external_lb_ranks_are_endpoints_with_their_own_ports() -> None:
     assert len({(p.node, p.http_port) for p in processes}) == 16
     assert processes[9].engine_suffix == "_dp9"
     with patch("srtctl.frontends.static_router.get_hostname_ip", side_effect=lambda node, _: node):
-        document = LLMDFrontend().endpoints_document(processes, None)
+        document = LLMDFrontend().endpoints_document(processes, None, "vllm")
     assert len(document["endpoints"]) == 16
+    assert document["endpoints"][9]["labels"] == {"llm-d.ai/role": "both", "llm-d.ai/engine-type": "vllm"}
     frontend = LLMDFrontend()
     assert frontend.health_expectations(config, processes) == (0, 16, "16 llm-d endpoints")
     assert frontend.worker_metrics_port(processes[9], MagicMock()) == processes[9].http_port

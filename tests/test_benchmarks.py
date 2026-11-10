@@ -40,6 +40,17 @@ class TestBenchmarkRegistry:
 class TestSABenchRunner:
     """Test SA-Bench runner."""
 
+    def test_environment_reaches_benchmark_client(self):
+        from unittest.mock import MagicMock
+
+        from srtctl.core.config import load_config
+
+        config = load_config("examples/trtllm/dynamo-sidecar-disagg.yaml")
+        assert get_runner("sa-bench").get_environment(config, MagicMock()) == {
+            "HF_HUB_CACHE": "/hf/hub",
+            "HF_HUB_OFFLINE": "1",
+        }
+
     def test_validate_config_missing_isl(self):
         """Validates that isl is required."""
         from srtctl.benchmarks.sa_bench import SABenchRunner
@@ -125,6 +136,7 @@ class TestSABenchRunner:
         runtime.frontend_port = 8000
         runtime.model_path = "/model"
         runtime.is_hf_model = False
+        runtime.worker_model_arg = "/model"
 
         config = SrtConfig(
             name="test",
@@ -153,6 +165,7 @@ class TestSABenchRunner:
         runtime.frontend_port = 8000
         runtime.model_path = "/model"
         runtime.is_hf_model = False
+        runtime.worker_model_arg = "/model"
 
         config = SrtConfig(
             name="test",
@@ -165,6 +178,66 @@ class TestSABenchRunner:
         assert cmd[-2] == ""  # empty dataset path
         assert cmd[-1] == "false"  # per-request HTTP sessions by default
 
+    def test_build_command_custom_endpoint(self):
+        """build_command passes the API path through to bench.sh."""
+        from unittest.mock import MagicMock
+
+        from srtctl.benchmarks.sa_bench import SABenchRunner
+
+        runner = SABenchRunner()
+        runtime = MagicMock(frontend_port=8000, worker_model_arg="/model")
+
+        cmd = runner.build_command(self._endpoint_config("/v1/chat/completions"), runtime)
+
+        assert cmd[-2:] == ["", "/v1/chat/completions"]
+
+    def test_build_command_cache_precedes_custom_endpoint(self):
+        """The cache and endpoint occupy distinct trailing bench.sh arguments."""
+        from dataclasses import replace
+        from unittest.mock import MagicMock
+
+        from srtctl.benchmarks.sa_bench import DATASET_CACHE_MOUNT, SABenchRunner
+
+        runner = SABenchRunner()
+        runtime = MagicMock(frontend_port=8000, worker_model_arg="/model")
+        config = self._endpoint_config("/v1/chat/completions")
+        config = replace(config, benchmark=replace(config.benchmark, dataset_cache_dir="/lustre/cache"))
+
+        cmd = runner.build_command(config, runtime)
+
+        assert cmd[-2:] == [DATASET_CACHE_MOUNT, "/v1/chat/completions"]
+
+    def _endpoint_config(self, endpoint):
+        from srtctl.core.schema import BenchmarkConfig, ModelConfig, ResourceConfig, SrtConfig
+
+        return SrtConfig(
+            name="test",
+            model=ModelConfig(path="/model", container="/image", precision="fp4"),
+            resources=ResourceConfig(gpu_type="h100"),
+            benchmark=BenchmarkConfig(
+                type="sa-bench",
+                isl=8192,
+                osl=1024,
+                concurrencies="2560",
+                endpoint=endpoint,
+            ),
+        )
+
+    @pytest.mark.parametrize("endpoint", ["/v1/completions", "/v1/chat/completions"])
+    def test_validate_config_accepts_both_api_paths(self, endpoint):
+        """The dynamo adapter serves both APIs, so neither needs extra config."""
+        from srtctl.benchmarks.sa_bench import SABenchRunner
+
+        assert SABenchRunner().validate_config(self._endpoint_config(endpoint)) == []
+
+    def test_validate_config_rejects_relative_endpoint(self):
+        """bench.sh appends the path to the frontend URL, so it must be absolute."""
+        from srtctl.benchmarks.sa_bench import SABenchRunner
+
+        errors = SABenchRunner().validate_config(self._endpoint_config("v1/chat/completions"))
+
+        assert any("absolute path" in error for error in errors)
+
     def test_build_command_enables_http_connection_reuse(self):
         """Explicit opt-in is appended without shifting existing arguments."""
         from unittest.mock import MagicMock
@@ -173,7 +246,7 @@ class TestSABenchRunner:
         from srtctl.core.schema import BenchmarkConfig, ModelConfig, ResourceConfig, SrtConfig
 
         runner = SABenchRunner()
-        runtime = MagicMock(frontend_port=8000, model_path="/model", is_hf_model=False)
+        runtime = MagicMock(frontend_port=8000, worker_model_arg="/model")
         config = SrtConfig(
             name="test",
             model=ModelConfig(path="/model", container="/image", precision="fp4"),
@@ -192,6 +265,84 @@ class TestSABenchRunner:
 
         assert cmd[-2] == "/data/bench.jsonl"
         assert cmd[-1] == "true"
+
+    def test_build_command_passes_container_cache_path(self):
+        """bench.sh receives the mount point, never the host path."""
+        from unittest.mock import MagicMock
+
+        from srtctl.benchmarks.sa_bench import DATASET_CACHE_MOUNT, SABenchRunner
+        from srtctl.core.schema import BenchmarkConfig, ModelConfig, ResourceConfig, SrtConfig
+
+        runner = SABenchRunner()
+        runtime = MagicMock(frontend_port=8000, worker_model_arg="/model")
+        config = SrtConfig(
+            name="test",
+            model=ModelConfig(path="/model", container="/image", precision="fp4"),
+            resources=ResourceConfig(gpu_type="h100"),
+            benchmark=BenchmarkConfig(
+                type="sa-bench",
+                isl=1024,
+                osl=128,
+                concurrencies="4x8",
+                dataset_cache_dir="/lustre/shared/sa-bench-cache",
+            ),
+        )
+
+        cmd = runner.build_command(config, runtime)
+
+        assert cmd[-1] == DATASET_CACHE_MOUNT
+        assert "/lustre/shared/sa-bench-cache" not in cmd
+
+    def test_get_container_mounts_adds_cache_dir(self, tmp_path):
+        """The host cache dir is created and mounted at the fixed container path."""
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        from srtctl.benchmarks.sa_bench import DATASET_CACHE_MOUNT, SABenchRunner
+        from srtctl.core.schema import BenchmarkConfig, ModelConfig, ResourceConfig, SrtConfig
+
+        runner = SABenchRunner()
+        runtime = MagicMock(container_mounts={Path("/logs"): Path("/logs")})
+        host_cache = tmp_path / "sa-bench-cache"
+        config = SrtConfig(
+            name="test",
+            model=ModelConfig(path="/model", container="/image", precision="fp4"),
+            resources=ResourceConfig(gpu_type="h100"),
+            benchmark=BenchmarkConfig(
+                type="sa-bench", isl=1024, osl=128, concurrencies="4x8", dataset_cache_dir=str(host_cache)
+            ),
+        )
+
+        mounts = runner.get_container_mounts(config, runtime)
+
+        assert host_cache.is_dir()
+        assert mounts[host_cache.resolve()] == Path(DATASET_CACHE_MOUNT)
+        assert mounts[Path("/logs")] == Path("/logs")
+
+    def test_get_container_mounts_unchanged_without_cache_dir(self):
+        """Mounts are untouched when the feature is not configured."""
+        from pathlib import Path
+        from unittest.mock import MagicMock
+
+        from srtctl.benchmarks.sa_bench import SABenchRunner
+        from srtctl.core.schema import BenchmarkConfig, ModelConfig, ResourceConfig, SrtConfig
+
+        runner = SABenchRunner()
+        runtime = MagicMock(container_mounts={Path("/logs"): Path("/logs")})
+        config = SrtConfig(
+            name="test",
+            model=ModelConfig(path="/model", container="/image", precision="fp4"),
+            resources=ResourceConfig(gpu_type="h100"),
+            benchmark=BenchmarkConfig(type="sa-bench", isl=1024, osl=128, concurrencies="4x8"),
+        )
+
+        assert runner.get_container_mounts(config, runtime) == {Path("/logs"): Path("/logs")}
+
+    def test_dataset_cache_dir_schema_default(self):
+        """The YAML field stays opt-in when omitted."""
+        from srtctl.core.schema import BenchmarkConfig
+
+        assert BenchmarkConfig().dataset_cache_dir is None
 
     def test_http_connection_reuse_schema_default_and_roundtrip(self):
         """The YAML field is typed and remains opt-in when omitted."""
@@ -243,6 +394,7 @@ class TestCustomBenchmarkRunner:
         dynamo_sidecar=False,
         trtllm_config=None,
         engine_args=None,
+        backend=None,
     ):
         from types import SimpleNamespace
 
@@ -266,7 +418,9 @@ class TestCustomBenchmarkRunner:
         def get_environment_for_mode(mode):
             return dict(mode_environments.get(mode, {}))
 
-        if backend_type == "trtllm":
+        if backend is not None:
+            backend_type = backend.type
+        elif backend_type == "trtllm":
             from srtctl.core.schema import RoleConfig
 
             backend = TRTLLMBackend(
@@ -294,6 +448,7 @@ class TestCustomBenchmarkRunner:
                 aggregated_environment=aggregated_environment or {},
                 get_config_for_mode=get_config_for_mode,
                 get_environment_for_mode=get_environment_for_mode,
+                owns_dp_ranks=lambda process: False,
             )
 
         stage = Stage()
@@ -379,9 +534,19 @@ class TestCustomBenchmarkRunner:
         ):
             return stage._get_benchmark_env(CustomBenchmarkRunner())
 
-    @pytest.mark.parametrize("dp_key", ["dp-size", "dp_size", "data-parallel-size"])
-    def test_sglang_attention_dp_custom_metrics_scrape_followers_in_topology_order(self, dp_key):
-        env = self._custom_env({"prefill": {dp_key: 8}, "decode": {dp_key: 8}})
+    @pytest.mark.parametrize(
+        "dp_args",
+        [
+            {"dp-size": 8},
+            {"dp_size": 8},
+            {"data-parallel-size": 8},
+            {"dp-size": 8, "enable-dp-attention": True},
+            {"attn-dp-size": 8},
+            {"attention_data_parallel_size": 8},
+        ],
+    )
+    def test_sglang_attention_dp_custom_metrics_scrape_followers_in_topology_order(self, dp_args):
+        env = self._custom_env({"prefill": dp_args, "decode": dp_args})
 
         # Routing still targets logical leaders; only metrics include follower ranks.
         assert env["SRT_PREFILL_ENDPOINTS"] == "ip-node-p0:7500"
@@ -402,6 +567,75 @@ class TestCustomBenchmarkRunner:
         env = self._custom_env({"prefill": {"tp-size": 8}, "decode": {"tp-size": 8}})
 
         assert env["AIPERF_SERVER_METRICS_URLS"] == "http://ip-node-p0:7500/metrics,http://ip-node-d0:7504/metrics"
+
+    @pytest.mark.parametrize(
+        "dp_launch_mode,decode,nodes,owners",
+        [
+            # DEP8 on two 4-GPU nodes: each node's worker serves and counts DP ranks 0-3 or 4-7.
+            ("per_node", {"data-parallel-size": 8}, 2, [0, 1]),
+            ("per_gpu", {"data-parallel-size": 8}, 2, list(range(8))),
+            # A TP4 replica exactly fills a node.
+            ("per_node", {"tensor-parallel-size": 4, "data-parallel-size": 2}, 2, [0, 1]),
+            # Replicas spanning nodes, by TP, PP or PCP: the follower nodes run headless.
+            ("per_node", {"tensor-parallel-size": 8, "data-parallel-size": 2}, 4, [0]),
+            ("per_node", {"tensor-parallel-size": 2, "pipeline-parallel-size": 4, "data-parallel-size": 2}, 4, [0]),
+            (
+                "per_node",
+                {"tensor-parallel-size": 4, "prefill-context-parallel-size": 2, "data-parallel-size": 2},
+                4,
+                [0],
+            ),
+            # No data parallelism: one TP8 engine.
+            ("per_node", {"tensor-parallel-size": 8}, 2, [0]),
+            ("per_gpu", {"tensor-parallel-size": 8}, 2, [0]),
+        ],
+        ids=["dep8-per-node", "dep8-per-gpu", "tp4-dp2", "tp8-dp2", "pp4-dp2", "pcp2-dp2", "tp8", "tp8-per-gpu"],
+    )
+    def test_vllm_custom_metrics_scrape_followers_that_own_dp_ranks(self, dp_launch_mode, decode, nodes, owners):
+        from unittest.mock import patch
+
+        from srtctl.backends import VLLMBackend
+        from srtctl.benchmarks.custom import CustomBenchmarkRunner
+        from srtctl.core.schema import RoleConfig
+        from srtctl.core.topology import Endpoint
+
+        backend = VLLMBackend(
+            dp_launch_mode=dp_launch_mode,
+            roles={"prefill": RoleConfig(args={"tensor-parallel-size": 4}), "decode": RoleConfig(args=decode)},
+        )
+        endpoints = [
+            Endpoint("prefill", 0, ("node-p0",), frozenset(range(4))),
+            Endpoint("decode", 0, tuple(f"node-d{i}" for i in range(nodes)), frozenset(range(4))),
+        ]
+        processes = backend.endpoints_to_processes(endpoints, frontend_type="dynamo")
+        stage = self._benchmark_stage("dynamo", processes, backend=backend)
+        with patch(
+            "srtctl.cli.mixins.benchmark_stage.get_hostname_ip",
+            side_effect=lambda node, interface: f"ip-{node}",
+        ):
+            env = stage._get_benchmark_env(CustomBenchmarkRunner())
+
+        decode_processes = [p for p in processes if p.endpoint_mode == "decode"]
+        # Routing still targets logical leaders; only metrics include follower ranks.
+        assert env["SRT_DECODE_ENDPOINTS"] == f"ip-node-d0:{decode_processes[0].sys_port}"
+        assert env["AIPERF_SERVER_METRICS_URLS"].split(",") == [
+            f"http://ip-{p.node}:{p.sys_port}/metrics" for p in [processes[0], *(decode_processes[i] for i in owners)]
+        ]
+
+    @pytest.mark.parametrize("dp_launch_mode", ["per_node", "per_gpu"])
+    def test_vllm_engine_without_data_parallelism_owns_no_dp_ranks(self, dp_launch_mode):
+        from srtctl.backends import VLLMBackend
+        from srtctl.core.schema import RoleConfig
+        from srtctl.core.topology import Endpoint
+
+        backend = VLLMBackend(
+            dp_launch_mode=dp_launch_mode, roles={"agg": RoleConfig(args={"tensor-parallel-size": 4})}
+        )
+        [process] = backend.endpoints_to_processes(
+            [Endpoint("agg", 0, ("node0",), frozenset(range(4)))], frontend_type="dynamo"
+        )
+
+        assert not backend.owns_dp_ranks(process)
 
     def test_disaggregated_worker_endpoints_use_logical_leaders(self):
         from unittest.mock import patch
@@ -484,13 +718,17 @@ class TestCustomBenchmarkRunner:
         from srtctl.benchmarks.custom import CustomBenchmarkRunner
         from srtctl.core.topology import Process
 
+        # Sidecar topologies give SGLang followers an HTTP port for their health server's /metrics.
         processes = [
             Process("node-a", frozenset(range(4)), 7500, 6100, "prefill", 0, node_rank=0),
-            Process("node-b", frozenset(range(4)), 7501, 0, "prefill", 0, node_rank=1),
+            Process("node-b", frozenset(range(4)), 7501, 6100, "prefill", 0, node_rank=1),
             Process("node-c", frozenset(range(4)), 7502, 6100, "decode", 0, node_rank=0),
-            Process("node-d", frozenset(range(4)), 7503, 0, "decode", 0, node_rank=1),
+            Process("node-d", frozenset(range(4)), 7503, 6100, "decode", 0, node_rank=1),
         ]
-        stage = self._benchmark_stage("dynamo", processes, dynamo_sidecar=True)
+        tp8 = {"tensor-parallel-size": 8}
+        stage = self._benchmark_stage(
+            "dynamo", processes, dynamo_sidecar=True, engine_args={"prefill": tp8, "decode": tp8}
+        )
 
         with patch(
             "srtctl.cli.mixins.benchmark_stage.get_hostname_ip",
@@ -500,6 +738,8 @@ class TestCustomBenchmarkRunner:
 
         assert env["SRT_PREFILL_ENDPOINTS"] == "ip-node-a:6100"
         assert env["SRT_DECODE_ENDPOINTS"] == "ip-node-c:6100"
+        # One URL per logical leader, aligned with SRT_*_ENDPOINTS: the native SGLang endpoint.
+        # Followers serve /metrics too under sidecars, but custom runners list leaders only.
         assert env["AIPERF_SERVER_METRICS_URLS"] == ("http://ip-node-a:6100/metrics,http://ip-node-c:6100/metrics")
 
     def test_aggregated_worker_endpoint_uses_http_port_without_dynamo(self):
@@ -858,14 +1098,23 @@ class TestCustomBenchmarkRunner:
     def test_sidecar_metric_urls_ignore_standalone_publishing_option(
         self, benchmark_type, publish_metrics, publish_events_and_metrics
     ):
-        """The standalone dynamo.trtllm flag does not change existing sidecar URLs."""
+        """The standalone dynamo.trtllm flag does not change sidecar URLs.
+
+        Built-in runners advertise the rank-zero sidecar's runtime endpoint only with the
+        legacy combined flag. Custom runners always get one live URL per logical worker for
+        drain detection: TRT-LLM's OpenEngine gRPC server serves no Prometheus endpoint of
+        its own, so that is the sidecar's runtime endpoint.
+        """
         from unittest.mock import patch
 
         from srtctl.benchmarks.custom import CustomBenchmarkRunner
         from srtctl.benchmarks.trace_replay import TraceReplayRunner
         from srtctl.core.topology import Process
 
-        processes = [Process("node-a", frozenset(range(4)), 7500, 6100, "agg", 0, node_rank=0)]
+        processes = [
+            Process("node-a", frozenset(range(4)), 7500, 6100, "agg", 0, node_rank=0),
+            Process("node-b", frozenset(range(4)), 7501, 0, "agg", 0, node_rank=1),
+        ]
         stage = self._benchmark_stage(
             "dynamo",
             processes,
@@ -883,9 +1132,7 @@ class TestCustomBenchmarkRunner:
         ):
             env = stage._get_benchmark_env(runner)
 
-        if benchmark_type == "custom":
-            assert env["AIPERF_SERVER_METRICS_URLS"] == "http://ip-node-a:6100/metrics"
-        elif publish_events_and_metrics:
+        if benchmark_type == "custom" or publish_events_and_metrics:
             assert env["AIPERF_SERVER_METRICS_URLS"] == "http://ip-node-a:7500/metrics"
         else:
             assert "AIPERF_SERVER_METRICS_URLS" not in env
@@ -1031,6 +1278,7 @@ class TestMooncakeRouterRunner:
         runtime = MagicMock()
         runtime.frontend_port = 8000
         runtime.is_hf_model = False  # Local model mounted at /model
+        runtime.worker_model_arg = "/model"
 
         cmd = runner.build_command(config, runtime)
 
@@ -1111,6 +1359,7 @@ class TestTraceReplayRunner:
         runtime = MagicMock()
         runtime.frontend_port = 8000
         runtime.is_hf_model = False
+        runtime.worker_model_arg = "/model"
 
         from srtctl.core.schema import BenchmarkConfig, ModelConfig, ResourceConfig, SrtConfig
 
@@ -1149,6 +1398,7 @@ class TestTraceReplayRunner:
         runtime = MagicMock()
         runtime.frontend_port = 8000
         runtime.is_hf_model = False
+        runtime.worker_model_arg = "/model"
 
         from srtctl.core.schema import BenchmarkConfig, ModelConfig, ResourceConfig, SrtConfig
 
@@ -1177,6 +1427,7 @@ class TestTraceReplayRunner:
         runtime = MagicMock()
         runtime.frontend_port = 8000
         runtime.is_hf_model = False
+        runtime.worker_model_arg = "/model"
 
         from srtctl.core.schema import BenchmarkConfig, ModelConfig, ResourceConfig, SrtConfig
 
@@ -1222,6 +1473,7 @@ class TestTraceReplayRunner:
         runtime = MagicMock()
         runtime.frontend_port = 8000
         runtime.is_hf_model = False
+        runtime.worker_model_arg = "/model"
 
         from srtctl.core.schema import BenchmarkConfig, ModelConfig, ResourceConfig, SrtConfig
 
@@ -1941,6 +2193,121 @@ class TestRunPostEval:
                 with patch("srtctl.cli.do_sweep.start_srun_process", return_value=mock_proc):
                     result = orch._run_post_eval(stop)
         assert result == 0
+
+    @staticmethod
+    def _run_eval_with_endpoint_probes(orch, *, eval_only):
+        import os
+        import threading
+        from unittest.mock import MagicMock, patch
+
+        proc = MagicMock()
+        proc.poll.return_value = 0
+        proc.returncode = 0
+        with (
+            patch.dict(
+                os.environ,
+                {"EVAL_ONLY": str(eval_only).lower(), "RUN_EVAL": str(not eval_only).lower()},
+                clear=False,
+            ),
+            patch("srtctl.cli.mixins.benchmark_stage.wait_for_model", return_value=True) as model_ready,
+            patch("srtctl.cli.do_sweep.wait_for_port", return_value=True) as port_ready,
+            patch("srtctl.cli.do_sweep.start_srun_process", return_value=proc) as launch,
+        ):
+            assert orch._run_post_eval(threading.Event()) == 0
+        return model_ready, port_ready, launch.call_args.kwargs
+
+    @pytest.mark.parametrize(
+        ("placement", "expected_node"), [("head", "node0"), ("first_decode", "node1"), ("last_decode", "node2")]
+    )
+    @pytest.mark.parametrize("eval_only", [True, False], ids=["eval-only", "post-benchmark"])
+    @pytest.mark.parametrize("custom_command", [False, True], ids=["lm-eval", "custom-command"])
+    def test_eval_runs_on_the_frontend_it_probes(self, placement, expected_node, eval_only, custom_command):
+        """Local eval URLs reach the same placed frontend as the readiness probe."""
+        from dataclasses import replace
+
+        from srtctl.core.schema import PostEvalConfig
+
+        orch = self._make_orchestrator()
+        orch.config = replace(
+            orch.config,
+            frontend=replace(
+                orch.config.frontend,
+                enable_multiple_frontends=False,
+                placement=PlacementConfig(node=placement),
+            ),
+            post_eval=PostEvalConfig(command=["bash", "/eval.sh", "{endpoint}"])
+            if custom_command
+            else PostEvalConfig(),
+        )
+        topology = orch._compute_frontend_topology()
+        assert topology.frontend_nodes == [expected_node]
+        assert topology.nginx_node is None
+
+        model_ready, port_ready, launch = self._run_eval_with_endpoint_probes(orch, eval_only=eval_only)
+
+        if eval_only:
+            model_ready.assert_called_once()
+            assert model_ready.call_args.kwargs["host"] == expected_node
+            assert model_ready.call_args.kwargs["port"] == topology.public_port
+            port_ready.assert_not_called()
+        else:
+            port_ready.assert_called_once_with(expected_node, topology.public_port, timeout=30)
+            model_ready.assert_not_called()
+        assert launch["nodelist"] == [expected_node]
+        assert launch["step_name"] == "eval"
+        assert launch["command"][2] == f"http://localhost:{topology.public_port}"
+        assert launch["command"][1] == ("/eval.sh" if custom_command else "/srtctl-benchmarks/lm-eval/bench.sh")
+
+    def test_eval_uses_the_frontend_heterogeneous_component(self):
+        """A frontend on the decode side launches eval in the decode Slurm component."""
+        from dataclasses import replace
+
+        orch = self._make_orchestrator()
+        orch.config = replace(
+            orch.config,
+            frontend=replace(
+                orch.config.frontend,
+                enable_multiple_frontends=False,
+                placement=PlacementConfig(node="first_decode"),
+            ),
+        )
+        orch.runtime = replace(
+            orch.runtime,
+            nodes=replace(
+                orch.runtime.nodes,
+                het=True,
+                prefill_group=("node0",),
+                decode_group=("node1", "node2"),
+            ),
+        )
+
+        model_ready, _, launch = self._run_eval_with_endpoint_probes(orch, eval_only=True)
+
+        assert model_ready.call_args.kwargs["host"] == "node1"
+        assert launch["nodelist"] == ["node1"]
+        assert launch["het_group"] == 1
+
+    def test_eval_runs_on_the_direct_worker_public_endpoint(self):
+        """Direct serving uses the aggregate worker's node even when the job head differs."""
+        from dataclasses import replace
+
+        from srtctl.backends import VLLMBackend
+        from srtctl.core.schema import FrontendConfig, RoleConfig
+
+        orch = self._make_orchestrator()
+        orch.config = replace(
+            orch.config,
+            engine=VLLMBackend(),
+            roles={"agg": RoleConfig(nodes=1, workers=1, gpus=8)},
+            frontend=FrontendConfig(type="vllm", enable_multiple_frontends=False),
+        )
+        orch.runtime = replace(orch.runtime, nodes=replace(orch.runtime.nodes, worker=("node1",)))
+
+        model_ready, _, launch = self._run_eval_with_endpoint_probes(orch, eval_only=True)
+
+        assert model_ready.call_args.kwargs["host"] == "node1"
+        assert launch["nodelist"] == ["node1"]
+        assert launch["command"][2] == "http://localhost:8000"
 
     def test_env_var_passthrough(self):
         """Eval env vars are passed through to srun."""

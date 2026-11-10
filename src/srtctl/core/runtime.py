@@ -19,9 +19,16 @@ from srtctl.core.power.contract import CONTAINER_LOG_DIR
 from srtctl.ports import FRONTEND_PUBLIC_PORT
 
 from .config import get_srtslurm_setting
-from .slurm import get_hostname_ip, get_slurm_het_nodelists, get_slurm_nodelist
+from .slurm import (
+    DEFAULT_CONTAINER_PREPARE_TIMEOUT_SECONDS,
+    get_hostname_ip,
+    get_slurm_het_nodelists,
+    get_slurm_nodelist,
+)
 
 logger = logging.getLogger(__name__)
+
+HF_MODEL_CACHE_MOUNT = Path("/srtctl-model-cache")
 
 if TYPE_CHECKING:
     from srtctl.core.schema import DynamoConfig, SrtConfig
@@ -312,6 +319,60 @@ class Nodes:
         )
 
 
+def resolve_model_path(path: str) -> tuple[Path, bool]:
+    """Resolve ``model.path`` into an absolute path and an is-HF-model flag.
+
+    HuggingFace ids ("hf:facebook/opt-125m") are returned unvalidated as Paths —
+    they are downloaded at runtime and never mounted. Local paths are resolved
+    and checked here so a typo fails before anything is launched.
+    """
+    model_path_str = os.path.expandvars(path)
+    if model_path_str.startswith("hf:"):
+        return Path(model_path_str[3:]), True
+
+    model_path = Path(model_path_str).resolve()
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model path does not exist: {model_path}")
+    if not model_path.is_dir():
+        raise ValueError(f"Model path is not a directory: {model_path}")
+    return model_path, False
+
+
+def resolve_container_image(image: str) -> Path:
+    """Resolve ``model.container`` into a path or a registry image name.
+
+    Only file-like values (starting with "/" or "./") are validated; registry
+    names such as "nvcr.io/nvidia/pytorch:23.12" are returned as-is, wrapped in
+    a Path for type compatibility with the rest of the runtime.
+    """
+    container_image_str = os.path.expandvars(image)
+    if not container_image_str.startswith(("/", "./")):
+        return Path(container_image_str)
+
+    container_image = Path(container_image_str).resolve()
+    if not container_image.exists():
+        raise FileNotFoundError(f"Container image path does not exist: {container_image}")
+    if not container_image.is_file():
+        raise ValueError(f"Container image path is not a file: {container_image}")
+    return container_image
+
+
+def resolve_local_model_mount(
+    model_path: Path,
+    hf_cache_mount: Path = HF_MODEL_CACHE_MOUNT,
+) -> tuple[Path, Path, Path]:
+    """Return host mount, container mount, and container-side model path.
+
+    Hugging Face snapshots use relative links into ``../../blobs``. Mounting a
+    snapshot directly at ``/model`` relocates those links and makes the model
+    unreadable, so mount the repository cache root and preserve its layout.
+    """
+    cache_root = model_path.parent.parent
+    if model_path.parent.name == "snapshots" and (cache_root / "blobs").is_dir():
+        return cache_root.resolve(), hf_cache_mount, hf_cache_mount / model_path.relative_to(cache_root)
+    return model_path, Path("/model"), Path("/model")
+
+
 @dataclass(frozen=True)
 class RuntimeContext:
     """Runtime context with all computed values.
@@ -341,11 +402,17 @@ class RuntimeContext:
     # Fields with defaults must come after required fields
     # HuggingFace model support - True if model.path was "hf:model/name"
     is_hf_model: bool = False
+    hf_snapshot_path: str | None = None
     gpu_type: str | None = None
     visible_devices_env: str = "CUDA_VISIBLE_DEVICES"
 
     # Container mounts: host_path -> container_path
     container_mounts: dict[Path, Path] = field(default_factory=dict)
+
+    # Opt-in reuse of a job-scoped named Pyxis container for each image/remap mode.
+    reuse_container: bool = False
+    # Resolved health-check budget, shared by container preparation and lock waiting.
+    container_prepare_timeout_seconds: float = DEFAULT_CONTAINER_PREPARE_TIMEOUT_SECONDS
 
     # Additional srun options
     srun_options: dict[str, str] = field(default_factory=dict)
@@ -355,14 +422,19 @@ class RuntimeContext:
 
     # Frontend port (for benchmark endpoint)
     frontend_port: int = FRONTEND_PUBLIC_PORT
+    # Listener node from the frontend topology, supplied to worker command builders.
+    frontend_node: str | None = None
 
     # Optional lustre->node-local model staging (see model.stage_dir)
     stage_dir: str | None = None
     staged_model_path: Path | None = None
+    container_model_path: Path | None = None
     # Request plane for dynamo workers
     request_plane: str = "tcp"
     # Full Dynamo configuration for native sidecar launch settings.
     dynamo: "DynamoConfig | None" = None
+    # srtslurm.yaml release_nodes_before_postprocess: shrink the job to the batch host before post-processing.
+    release_nodes_before_postprocess: bool = False
 
     @property
     def container_log_dir(self) -> Path:
@@ -426,48 +498,18 @@ class RuntimeContext:
             log_dir = log_dir_base / job_id / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
 
-        # Resolve model path (expand env vars)
-        # Support HuggingFace model IDs with "hf:" prefix (e.g., "hf:facebook/opt-125m")
-        model_path_str = os.path.expandvars(config.model.path)
-        is_hf_model = model_path_str.startswith("hf:")
-
-        if is_hf_model:
-            # HuggingFace model ID - store as Path for compatibility, skip validation
-            hf_model_id = model_path_str[3:]  # Remove "hf:" prefix
-            model_path = Path(hf_model_id)
-        else:
-            # Local path - validate exists
-            model_path = Path(model_path_str).resolve()
-            if not model_path.exists():
-                raise FileNotFoundError(f"Model path does not exist: {model_path}")
-            if not model_path.is_dir():
-                raise ValueError(f"Model path is not a directory: {model_path}")
-
-        # Resolve container image (expand env vars)
-        # container_image can be either:
-        # 1. A path to a container file (e.g., /containers/sglang.sqsh) - validate it exists
-        # 2. An image name (e.g., nvcr.io/nvidia/pytorch:23.12) - don't validate
-        container_image_str = os.path.expandvars(config.model.container)
-
-        # If it looks like a file path (starts with / or ./), validate it exists
-        # Image names are typically registry paths without leading / or ./
-        if container_image_str.startswith(("/", "./")):
-            container_image = Path(container_image_str).resolve()
-            if not container_image.exists():
-                raise FileNotFoundError(f"Container image path does not exist: {container_image}")
-            if not container_image.is_file():
-                raise ValueError(f"Container image path is not a file: {container_image}")
-        else:
-            # Image name (e.g., nvcr.io/nvidia/pytorch:23.12) - keep as string, convert to Path for type compatibility
-            container_image = Path(container_image_str)
+        model_path, is_hf_model = resolve_model_path(config.model.path)
+        container_image = resolve_container_image(config.model.container)
 
         # Build container mounts
         container_mounts: dict[Path, Path] = {
             log_dir: Path(CONTAINER_LOG_DIR),
         }
         # Only mount local model paths - HF models are downloaded at runtime
+        container_model_path: Path | None = None
         if not is_hf_model:
-            container_mounts[model_path] = Path("/model")
+            model_mount, model_mount_target, container_model_path = resolve_local_model_mount(model_path)
+            container_mounts[model_mount] = model_mount_target
 
         # Optional: stage the model to node-local storage before workers start.
         # Mount the node-local ROOT (parent of stage_dir; it pre-exists on nodes)
@@ -550,6 +592,10 @@ class RuntimeContext:
         environment.update(config.environment)
 
         visible_devices_env = get_srtslurm_setting("visible_devices_env", "CUDA_VISIBLE_DEVICES")
+        container_prepare_timeout_seconds = float(
+            config.health_check.max_attempts * config.health_check.interval_seconds
+        )
+        release_nodes_before_postprocess = bool(get_srtslurm_setting("release_nodes_before_postprocess", False))
         temp_context = cls(
             job_id=job_id,
             run_name=run_name,
@@ -564,11 +610,16 @@ class RuntimeContext:
             network_interface=network_interface,
             visible_devices_env=visible_devices_env,
             container_mounts={},
+            reuse_container=config.reuse_container,
+            container_prepare_timeout_seconds=container_prepare_timeout_seconds,
             srun_options=dict(config.srun_options),
             environment=environment,
             is_hf_model=is_hf_model,
+            hf_snapshot_path=config.model.hf_snapshot_path,
+            container_model_path=container_model_path,
             request_plane=config.dynamo.request_plane,
             dynamo=config.dynamo,
+            release_nodes_before_postprocess=release_nodes_before_postprocess,
         )
 
         # Expand FormattablePath mounts
@@ -591,24 +642,33 @@ class RuntimeContext:
             network_interface=network_interface,
             visible_devices_env=visible_devices_env,
             container_mounts=container_mounts,
+            reuse_container=config.reuse_container,
+            container_prepare_timeout_seconds=container_prepare_timeout_seconds,
             srun_options=dict(config.srun_options),
             environment=environment,
             is_hf_model=is_hf_model,
+            hf_snapshot_path=config.model.hf_snapshot_path,
             stage_dir=stage_dir,
             staged_model_path=staged_model_path,
+            container_model_path=container_model_path,
             request_plane=config.dynamo.request_plane,
             dynamo=config.dynamo,
+            release_nodes_before_postprocess=release_nodes_before_postprocess,
         )
 
     @property
-    def worker_model_arg(self) -> str:
-        """Model path passed to the serving worker: the staged node-local path
-        when model staging is enabled, else the "/model" mount (or the HF id)."""
+    def shared_model_arg(self) -> str:
+        """Shared container model path or HF ID, also available to gateway tokenizers."""
         if self.is_hf_model:
-            return str(self.model_path)
-        if self.staged_model_path is not None:
+            return self.hf_snapshot_path or str(self.model_path)
+        return str(self.container_model_path or "/model")
+
+    @property
+    def worker_model_arg(self) -> str:
+        """Worker model path, using node-local staging when enabled for a local model."""
+        if not self.is_hf_model and self.staged_model_path is not None:
             return str(self.staged_model_path)
-        return "/model"
+        return self.shared_model_arg
 
     def format_string(self, template: str, **extra_kwargs) -> str:
         """Format a template string with runtime values.

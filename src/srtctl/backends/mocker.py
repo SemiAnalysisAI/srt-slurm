@@ -27,7 +27,7 @@ from typing import (
 from marshmallow import Schema
 from marshmallow_dataclass import dataclass
 
-from srtctl.backends.base import Backend, BoundRolesField, RoleSettings
+from srtctl.backends.base import Backend, BoundRolesField, RoleSettings, WorkerMode
 from srtctl.ports import DYN_SYSTEM_PORT_BASE
 
 if TYPE_CHECKING:
@@ -109,6 +109,7 @@ class MockerBackend(Backend):
         gpus_per_node: int,
         available_nodes: Sequence[str],
         spread_workers: bool = False,
+        gpu_indices_by_mode: Mapping[WorkerMode, Sequence[frozenset[int]]] | None = None,
     ) -> list["Endpoint"]:
         """Allocate endpoints to nodes."""
         from srtctl.core.topology import allocate_endpoints
@@ -123,6 +124,7 @@ class MockerBackend(Backend):
             gpus_per_node=gpus_per_node,
             available_nodes=available_nodes,
             spread_workers=spread_workers,
+            gpu_indices_by_mode=gpu_indices_by_mode,
         )
 
     def endpoints_to_processes(
@@ -161,8 +163,7 @@ class MockerBackend(Backend):
         mode = process.endpoint_mode
         config = self.get_config_for_mode(mode)
 
-        # Determine model path: HF model ID or container mount path
-        model_arg = str(runtime.model_path) if runtime.is_hf_model else "/model"
+        model_arg = runtime.worker_model_arg
 
         # Register under the name the benchmark client requests (the model path
         # basename, see SrtConfig.served_model_name). Left to its own devices the

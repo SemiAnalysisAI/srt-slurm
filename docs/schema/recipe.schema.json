@@ -484,6 +484,18 @@
           "description": "Container path to dataset file (mount via extra_mount)",
           "default": null
         },
+        "dataset_cache_dir": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Host dir where sa-bench caches generated \"random\" datasets so repeated sweeps skip the (minutes-long) tokenize/decode prompt build. Mounted into the benchmark container by SABenchRunner.",
+          "default": null
+        },
         "agentperf_client_dir": {
           "anyOf": [
             {
@@ -536,6 +548,18 @@
           "type": "boolean",
           "description": "Pass --use-chat-template to benchmark (default: true)",
           "default": true
+        },
+        "endpoint": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "SA-Bench API path (see benchmark_serving.py --endpoint).",
+          "default": null
         },
         "reuse_http_connections": {
           "type": "boolean",
@@ -633,7 +657,7 @@
             "acpi",
             "dcgm"
           ],
-          "description": "``auto`` tries ACPI then DCGM and is best-effort; naming ``acpi`` or ``dcgm`` explicitly makes that provider mandatory.",
+          "description": "``auto`` uses ACPI when some socket-total sensor reads a positive value, else DCGM fields 1130+1132, else 1130 alone (either DCGM rung accepted only if some socket reads a positive 1130; SysIO alone cannot vouch), logging each step down; naming ``acpi`` or ``dcgm`` explicitly makes that provider mandatory (it still proves itself, but exits instead of stepping).",
           "default": "auto"
         },
         "sample_interval_seconds": {
@@ -665,16 +689,17 @@
       "properties": {
         "port": {
           "type": "integer",
-          "description": "Port the exporter listens on and the head-node collector scrapes.",
+          "description": "TCP port the per-node exporter listens on for ``/metrics``.",
           "default": 9405
         },
         "source": {
           "enum": [
             "auto",
             "acpi",
-            "dcgm"
+            "dcgm",
+            "rapl"
           ],
-          "description": "Power reading back-end passed through to the bundled Rust binary's own ``--source`` flag (``auto`` | ``acpi`` | ``dcgm``). ``auto`` tries DCGM first and falls back to ACPI when libdcgm.so is absent or reports no CPU entities. Has no effect when the Python stdlib fallback exporter is used instead of the binary -- that fallback is ACPI-only.",
+          "description": "Power reading back-end passed through to the bundled Rust binary's own ``--source`` flag (``auto`` | ``acpi`` | ``dcgm`` | ``rapl``). ``auto`` tries ACPI first (the only source with the socket envelope) and falls back to DCGM when no ACPI power_meter hwmon sensors exist or no socket-total sensor reads positive on two probes; DCGM watches fields 1130+1132 and falls back to 1130 alone if this libdcgm refuses the pair, and is accepted only if some socket reads a positive 1130. DCGM mode reports field 1130 = the CPU rail (plus 1132 = SysIO), about half the ACPI envelope, and the energy report flags such runs as \"CPU rail only\". ``rapl`` reads the x86 RAPL package energy counters (AMD EPYC, Intel Xeon), whose ``energy_uj`` files are root-only unless a cluster admin grants read access; ``auto`` never selects it. Has no effect when the Python stdlib fallback exporter is used instead of the binary -- that fallback is ACPI-only.",
           "default": "auto"
         }
       },
@@ -737,8 +762,8 @@
         },
         "sidecar_port": {
           "type": "integer",
-          "description": "Base loopback gRPC port between engine and sidecar; co-located workers get deterministic offsets.",
-          "default": 50051
+          "description": "Base gRPC port between engine and sidecar; co-located workers get deterministic offsets. The sidecar dials it on loopback; vLLM and SGLang bind it on the engine's host (0.0.0.0).",
+          "default": 19000
         },
         "sidecar_binary": {
           "anyOf": [
@@ -861,6 +886,20 @@
         }
       },
       "description": "Where Dynamo comes from. Exactly one of ``git``, ``pypi``, or ``wheel``."
+    },
+    "FileProbe": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "type": "string",
+          "description": "Relative marker path under /logs; service placeholders such as {index} are expanded per instance. The previous marker is removed before launching that instance, so readiness requires a fresh file."
+        }
+      },
+      "description": "Ready when a service-owned marker file exists in the run's shared logs directory.",
+      "required": [
+        "path"
+      ]
     },
     "FrontendConfig": {
       "type": "object",
@@ -1439,7 +1478,7 @@
       "properties": {
         "path": {
           "type": "string",
-          "description": "Model weights directory, or a `model_paths` alias from srtslurm.yaml. Mounted at /model."
+          "description": "Model weights directory, model_paths alias, or hf:<repo-id>. Local paths are mounted at /model."
         },
         "container": {
           "type": "string",
@@ -1459,6 +1498,18 @@
             }
           ],
           "description": "Optional: stage the model from shared storage to this node-local dir before workers start (e.g. \"/raid/scratch/models\"). None = use path directly.",
+          "default": null
+        },
+        "hf_snapshot_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "TRT-LLM container path to an HF cache snapshot; pins weights and benchmark tokenizer.",
           "default": null
         }
       },
@@ -1932,6 +1983,11 @@
           "description": "Extra mounts as `host:container[:ro]` strings; `$VARS` expand, `{placeholders}` do not.",
           "default": null
         },
+        "reuse_container": {
+          "type": "boolean",
+          "description": "Reuse a named Pyxis container per image and root-remap mode on each node of this job, avoiding repeated root filesystem extraction into host RAM. Off by default.",
+          "default": false
+        },
         "srun_options": {
           "type": "object",
           "additionalProperties": {
@@ -2152,6 +2208,11 @@
           "description": "Extra mounts as `host:container[:ro]` strings; `$VARS` expand, `{placeholders}` do not.",
           "default": null
         },
+        "reuse_container": {
+          "type": "boolean",
+          "description": "Reuse a named Pyxis container per image and root-remap mode on each node of this job, avoiding repeated root filesystem extraction into host RAM. Off by default.",
+          "default": false
+        },
         "srun_options": {
           "type": "object",
           "additionalProperties": {
@@ -2351,7 +2412,7 @@
         },
         "spread_workers": {
           "type": "boolean",
-          "description": "If True, place each partial-node worker on its own node instead of packing multiple onto the same node. Caller must reserve enough nodes (e.g. give roles.decode as many nodes as workers when its gpus < gpus_per_node).",
+          "description": "If True, place each partial-node worker on its own node instead of packing multiple onto the same node. Caller must reserve enough nodes (e.g. give roles.decode as many nodes as workers when its gpus < gpus_per_node). With roles.decode.nodes: colocate, the decode workers go one per prefill node in turn, each on that node's highest free GPUs.",
           "default": false
         },
         "het_jobs": {
@@ -2443,6 +2504,30 @@
             }
           ],
           "description": "GPUs per worker. Defaults to `nodes * gpus_per_node // workers`; required when decode colocates.",
+          "default": null
+        },
+        "gpu_indices": {
+          "anyOf": [
+            {
+              "type": "array",
+              "items": {
+                "type": "integer"
+              }
+            },
+            {
+              "type": "array",
+              "items": {
+                "type": "array",
+                "items": {
+                  "type": "integer"
+                }
+              }
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The node's GPU layout for this role's partial-node workers, when they must not take the first contiguous GPUs: one list is the physical GPUs of the single worker on each node (`[0, 2]` puts a TP2 worker on one GPU per socket of a 4-GPU node); a list of lists is the GPUs of each worker slot on a node (`[[0, 2], [1, 3]]` runs two such workers per node). Every list has `gpus` distinct entries below `resources.gpus_per_node`, the lists do not overlap, and workers fill the slots in order before moving to the next node. The device mask, vLLM `--device-ids`, the Mooncake device map and the NUMA binding follow it.",
           "default": null
         },
         "srun_options": {
@@ -2542,6 +2627,11 @@
           ],
           "description": "`true` for the default ZMQ publisher, or a mapping with `publisher` / `topic`.",
           "default": null
+        },
+        "mooncake_store_config": {
+          "type": "object",
+          "description": "TRT-LLM and vLLM: Mooncake store config keys for this role's workers (`global_segment_size`, `local_buffer_size`, TRT-LLM's `role`, ...), layered over the `mooncake-master` service's `options.store_config`, so prefill and decode can differ. Pool-wide keys stay there.",
+          "default": {}
         },
         "sidecar": {
           "anyOf": [
@@ -2836,7 +2926,7 @@
               "type": "null"
             }
           ],
-          "description": "Optional TCP port gate; the job waits for it on every service node before continuing.",
+          "description": "Optional TCP, HTTP, log or marker-file gate; the job waits for it on every service node before continuing.",
           "default": null
         },
         "inherit_discovery_env": {
@@ -2929,7 +3019,7 @@
         },
         "options": {
           "type": "object",
-          "description": "Kind-specific settings (``nats``: ``max_payload_mb``; ``mooncake-master``: ``store_config`` and ``device_names_by_gpu`` for vLLM). Unknown keys are rejected by the kind.",
+          "description": "Kind-specific settings (``nats``: ``max_payload_mb``; ``mooncake-master``: ``store_config`` for vLLM and TRT-LLM, ``device_names_by_gpu`` for vLLM). Unknown keys are rejected by the kind.",
           "default": {}
         },
         "metrics": {
@@ -3068,6 +3158,18 @@
             }
           ],
           "description": "Log-pattern probe against ``service_<name>.out``.",
+          "default": null
+        },
+        "file": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FileProbe"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Marker-file probe relative to the shared logs directory; removes the old marker before launch.",
           "default": null
         },
         "timeout_seconds": {
@@ -3244,19 +3346,20 @@
             },
             {
               "enum": [
-                "local"
+                "local",
+                "preferred"
               ]
             },
             {
               "type": "null"
             }
           ],
-          "description": "Worker memory policy. None (default) uses `numactl -m 0,1` only for gb200/gb300/vrnvl72 prefill and decode workers (case-sensitive GPU type). True uses nodes 0,1 for any GPU type or mode; False leaves the policy unchanged. CPU binding does not change these policies. \"local\" requires numa_cpu_bind=True and strictly binds memory to the task GPU's NUMA node. Local mode fails startup if GPU NUMA affinity is unknown. Local memory exhaustion can fail allocations; existing/shared pages are not migrated.",
+          "description": "Worker memory policy. None (default) uses `numactl -m 0,1` only for gb200/gb300/vrnvl72 prefill and decode workers (case-sensitive GPU type). True uses nodes 0,1 for any GPU type or mode; False leaves the policy unchanged. CPU binding does not change these policies. \"local\" requires numa_cpu_bind=True and strictly binds memory to the task GPU's NUMA node. Local mode fails startup if GPU NUMA affinity is unknown. Local memory exhaustion can fail allocations; existing/shared pages are not migrated. \"preferred\" also requires numa_cpu_bind=True and launches the worker under `numactl --cpunodebind=<node> --preferred=<node>`: allocations prefer the GPU's NUMA node and fall back to other nodes when it is full.",
           "default": null
         },
         "numa_cpu_bind": {
           "type": "boolean",
-          "description": "Optional stricter NUMA CPU affinity for the worker process, in addition to numa_memory_bind. A previous post-hoc `taskset -pc <cpuset> $PPID` approach (see bind-b300-prefill-cpus.sh) only pins the leader PID *after* launch, so secondary threads spawned by Python/UCX/MPI/TRT-LLM can still land cross-socket. When true, srtctl instead: 1. sets TLLM_NUMA_AWARE_WORKER_AFFINITY=0 (disables TRT-LLM's own internal NUMA thread-pinning, which fights with the OS-level mask) 2. wraps the worker command (prefill/decode/agg) in `taskset -c <cpu_list>`, applied *before* exec so every spawned thread inherits the mask. The CPU list is discovered at runtime (configs/numa_cpu_bind.sh) from the physical GPU this task owns, not a static SLURM_LOCALID table \u2014 a static table assumes SLURM_LOCALID is a node-wide GPU ordinal, which breaks when two endpoints share a node (each gets its own srun step, so LOCALID restarts at 0 for both). Set numa_memory_bind=\"local\" to also bind memory to that same NUMA node.",
+          "description": "Set worker CPU affinity with `numactl --cpunodebind=<node>` before exec so child processes and threads inherit it. Requires numactl. configs/numa_cpu_bind.sh resolves the NUMA node from the task's physical GPU via CUDA_VISIBLE_DEVICES and SLURM_LOCALID, including colocated workers. Defaults TLLM_NUMA_AWARE_WORKER_AFFINITY to 0 for every memory policy so TRT-LLM preserves the launch CPU mask. Explicit roles.<role>.env values override this default; top-level environment overrides both. Enabling native worker affinity explicitly may change the CPU mask after launch. Set numa_memory_bind to \"local\" for strict memory binding, or \"preferred\" for GPU-local memory with fallback.",
           "default": false
         }
       },
@@ -3403,7 +3506,7 @@
               "type": "null"
             }
           ],
-          "description": "GPU power exporter image, port, command, labels and metrics. When `enabled` with no exporter and no CPU leg, the cluster `default_gpu_exporter` is used.",
+          "description": "GPU power exporter image, port, command, labels and metrics. When `enabled` and this key is unset, the cluster `default_gpu_exporter` is used, with or without a CPU leg.",
           "default": null
         },
         "collect_interval_ms": {
@@ -3423,7 +3526,7 @@
         },
         "clock_sync_check": {
           "type": "boolean",
-          "description": "Before any server starts, verify every allocation node reports an NTP-synchronised system clock. Sample timestamps (orchestrator host) and window boundaries (benchmark client host) are compared directly, so an unsynchronised node silently misaligns the measurement. Fails the job when ``required`` is true; otherwise the run continues and the manifest records ``clock_sync_unverified`` with ``publication_valid: false``. Set false on clusters where timedatectl/chronyc/ntpq are unavailable to unprivileged users.",
+          "description": "Before any server starts, verify every allocation node reports an NTP-synchronised system clock. Sample timestamps (orchestrator host) and window boundaries (benchmark client host) are compared directly, so an unsynchronised node silently misaligns the measurement. Fails the job when ``required`` is true; otherwise the run continues and the manifest records ``clock_sync_unverified`` with ``publication_valid: false``. Probes timedatectl, chronyc, ntpq, then kernel maxerror < 16 seconds via adjtimex(2) (python3) for hosts with no queryable time daemon. These are synchronisation-status checks, not bounds on inter-node clock skew. Set false only where none of those is available to unprivileged users.",
           "default": true
         },
         "startup_timeout_seconds": {

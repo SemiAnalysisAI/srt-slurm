@@ -22,7 +22,7 @@ FRONTEND_INTERNAL_PORT = 8180
 # Shared worker endpoint ports.
 # SGLang uses this for --kv-events-config; vLLM uses it for
 # DYN_VLLM_KV_EVENT_PORT.
-KV_EVENTS_PORT_BASE = 5200
+KV_EVENTS_PORT_BASE = 3000
 
 # SGLang backend ports.
 SGLANG_HTTP_PORT_BASE = 6100
@@ -60,6 +60,8 @@ TRTLLM_DIST_INIT_PORT_BASE = 29500
 # of the engine's own NCCL free-port scan, which starts 100 to 1000 ports above it.
 TOKENSPEED_PORT_BASE = 10000
 TOKENSPEED_PORT_STRIDE = 1024
+TOKENSPEED_ZMQ_PORT_BASE = 31000
+TOKENSPEED_METRICS_PORT_BASE = 6800
 
 # Mooncake transfer-engine ports (shared by SGLang and vLLM backends).
 MOONCAKE_MASTER_PORT = 8700
@@ -103,8 +105,14 @@ KVBM_ZMQ_PORT_BASE = 5600
 RAY_GCS_PORT = 6379
 RAY_DASHBOARD_PORT = 8265
 
-# Dynamo sidecar gRPC listener next to a native engine (dynamo.sidecar_port).
-DYNAMO_SIDECAR_GRPC_PORT = 50051
+# Dynamo sidecar gRPC listener next to a native engine (dynamo.sidecar_port), one
+# per sidecar process across the job. Keep this block below Linux's default
+# ephemeral range (32768-60999): a loopback connect to a port inside it can be
+# handed that port as its source and connect to itself, and the TIME_WAIT socket
+# it leaves makes the engine's bind fail. 19000 clears SGLang NCCL (17500 + n)
+# and TokenSpeed's per-node scans (below 18200 at 8 processes per node), and
+# stays under vLLM's scan ranges (20000) for up to 1000 sidecars.
+DYNAMO_SIDECAR_GRPC_PORT = 19000
 
 
 def rank_offset_subscriber_port(port: int, rank: int) -> int:
@@ -157,3 +165,6 @@ MORIIO_HANDSHAKE_PORTS = PortKind("moriio_handshake", VLLM_MORIIO_HANDSHAKE_PORT
 MORIIO_NOTIFY_PORTS = PortKind("moriio_notify", VLLM_MORIIO_NOTIFY_PORT_BASE)
 TRTLLM_DIST_INIT_PORTS = PortKind("trtllm_dist_init", TRTLLM_DIST_INIT_PORT_BASE)
 TOKENSPEED_PORTS = PortKind("tokenspeed", TOKENSPEED_PORT_BASE, TOKENSPEED_PORT_STRIDE, per_node=True)
+# SMG binds one handshake per endpoint on the frontend node, including remote workers.
+TOKENSPEED_ZMQ_PORTS = PortKind("tokenspeed_zmq", TOKENSPEED_ZMQ_PORT_BASE)
+TOKENSPEED_METRICS_PORTS = PortKind("tokenspeed_metrics", TOKENSPEED_METRICS_PORT_BASE, per_node=True)

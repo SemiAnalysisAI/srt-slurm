@@ -17,7 +17,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
 from srtctl.backends.base import WorkerMode
-from srtctl.backends.sglang import SGLangBackend
 from srtctl.backends.trtllm import TRTLLMBackend
 from srtctl.core.fingerprint import format_identity_verification, verify_identity
 from srtctl.core.health import wait_for_model
@@ -32,6 +31,7 @@ from srtctl.core.power.contract import (
 from srtctl.core.processes import terminate_and_reap
 from srtctl.core.slurm import get_hostname_ip, start_srun_process
 from srtctl.core.status import JobStage, JobStatus, StatusReporter
+from srtctl.core.telemetry import sidecar_logical_worker_metrics_target, sidecar_worker_metrics_targets
 from srtctl.frontends import FRONTEND_NONE, get_frontend
 from srtctl.ports import FRONTEND_PUBLIC_PORT, SGLANG_HTTP_PORT_BASE
 from srtctl.runtime_scripts.nsys_window import finish as finish_nsys_windows
@@ -43,6 +43,7 @@ MANUAL_POLL_SECONDS = 5.0
 
 if TYPE_CHECKING:
     from srtctl.benchmarks.base import BenchmarkRunner
+    from srtctl.cli.mixins.frontend_stage import FrontendTopology
     from srtctl.cli.mixins.telemetry_stage import TelemetryStageMixin
     from srtctl.core.processes import ManagedProcess, ProcessRegistry
     from srtctl.core.runtime import RuntimeContext
@@ -114,14 +115,13 @@ class BenchmarkStageMixin:
         """Backend worker processes."""
         raise NotImplementedError
 
-    def _orchestrator_node(self) -> str:
-        """Node the frontend/orchestrator runs on (honors frontend.placement.node)."""
-        placement = self.config.frontend.placement.location
-        if placement == "head":
-            return self.runtime.nodes.head
-        from srtctl.core.topology import placed_node
+    def capture_power_worker_identity(self, registry: "ProcessRegistry") -> None:
+        """Record the GPUs each worker holds for power telemetry (TelemetryStageMixin)."""
+        raise NotImplementedError
 
-        return placed_node(self.backend_processes, placement, self.runtime.nodes.head, kind="frontend.placement.node")
+    def _compute_frontend_topology(self) -> "FrontendTopology":
+        """Frontend and nginx placement (FrontendStageMixin)."""
+        raise NotImplementedError
 
     @property
     def frontend(self) -> "Frontend | None":
@@ -136,7 +136,10 @@ class BenchmarkStageMixin:
         direct_nodes = frontend.direct_endpoint_nodes(self.backend_processes) if frontend is not None else []
         if len(direct_nodes) == 1:
             return direct_nodes[0]
-        return self._orchestrator_node()
+        if self.config.frontend.placement.location == "head":
+            return self.runtime.nodes.head
+        topology = self._compute_frontend_topology()
+        return topology.nginx_node or topology.frontend_nodes[0]
 
     def _benchmark_node(self) -> str:
         """Node the benchmark client runs on (honors benchmark.placement.node).
@@ -360,6 +363,8 @@ class BenchmarkStageMixin:
             return 1
 
         logger.info("Server is healthy")
+        if self.config.telemetry.enabled and self.config.telemetry.dcgm_exporter is not None:
+            self.capture_power_worker_identity(registry)
         write_server_ready_marker(self.runtime.log_dir)
 
         # Identity verification: compare recipe identity against runtime fingerprints
@@ -525,6 +530,8 @@ class BenchmarkStageMixin:
             nodelist=[bench_node],
             output=str(log_file),
             container_image=str(container_image),
+            reuse_container=self.runtime.reuse_container,
+            container_prepare_timeout_seconds=self.runtime.container_prepare_timeout_seconds,
             container_mounts=container_mounts,
             env_to_set=env_to_set,
             srun_options=self.runtime.srun_options,
@@ -719,19 +726,20 @@ class BenchmarkStageMixin:
         windows_dir = self.runtime.container_log_dir / telemetry.storage_subdir / WINDOWS_DIRNAME
         return {MEASUREMENT_WINDOW_DIR_ENV: str(windows_dir)}
 
-    def _get_aiperf_server_metrics_env(
-        self,
-        logical_endpoints: list[tuple[WorkerMode, str, int]] | None = None,
-        *,
-        logical_workers_only: bool = False,
-    ) -> dict[str, str]:
+    def _get_aiperf_server_metrics_env(self, *, logical_workers_only: bool = False) -> dict[str, str]:
         """Build server metrics URLs for AIPerf benchmarks.
 
         Built-in AIPerf runners retain their existing physical-process metrics
         behavior, which is required by vLLM data-parallel layouts. Custom
-        benchmarks use logical worker leaders so distributed SGLang follower
-        ranks are not advertised as separate engines, except the followers of a
-        role that owns attention-DP ranks (see ``_process_owns_dp_ranks``).
+        benchmarks use logical worker leaders so distributed follower ranks are
+        not advertised as separate engines, except followers that run
+        data-parallel ranks of their own: SGLang attention-DP ranks and vLLM
+        per-GPU or node-local DP groups (see ``_process_owns_dp_ranks``).
+        In a Dynamo sidecar job, built-in runners get exactly what Tachometer
+        scrapes (``sidecar_worker_metrics_targets``): each sidecar's runtime
+        endpoint and each native engine's own Prometheus endpoint. Custom
+        runners keep one URL per logical leader, aligned with
+        ``SRT_*_ENDPOINTS`` (``sidecar_logical_worker_metrics_target``).
         """
         urls: list[str] = []
         frontend = self.frontend
@@ -749,19 +757,30 @@ class BenchmarkStageMixin:
                 (not self.config.dynamo.sidecar and backend.dynamo_metrics_flags) or backend.publish_events_and_metrics
             )
         )
-        if logical_workers_only:
-            # Sidecars use native worker commands, so publish_metrics does not
-            # control their existing logical-worker URL discovery. Their native
-            # HTTP metrics live on the logical endpoint, not the sidecar's port.
-            if self.config.dynamo.sidecar:
-                if logical_endpoints is None:
-                    logical_endpoints = self._logical_worker_endpoints()
-                urls = [
-                    f"http://{host}:{port}{path}"
-                    for mode, host, port in logical_endpoints
-                    if (path := frontend.worker_metrics_path(backend, mode)) is not None
-                ]
-            elif not dynamo_trtllm_metrics_disabled:
+        if self.config.dynamo.sidecar and logical_workers_only:
+            # One live URL per routable logical leader, in SRT_*_ENDPOINTS order;
+            # consumers such as drain detection read them positionally. Like the
+            # other sidecar URLs before it, this list is not gated on TRT-LLM's
+            # publish flags, which never reach a sidecar.
+            for process in self.backend_processes:
+                if frontend.worker_endpoint_port(process, self.config, self.runtime) is None:
+                    continue
+                target = sidecar_logical_worker_metrics_target(process, self.backend_processes, backend, frontend)
+                if target is not None:
+                    host = get_hostname_ip(process.node, self.runtime.network_interface)
+                    urls.append(f"http://{url_host(host)}:{target.port}{target.path}")
+        elif self.config.dynamo.sidecar:
+            # Only processes that run a sidecar serve its runtime metrics, and the
+            # native engine serves its own on a separate port (none for TRT-LLM's
+            # gRPC server). TRT-LLM sidecars do not receive --publish-metrics, so
+            # only the legacy combined flag opens the gate above; runtime-only
+            # metrics are not advertised as an engine-metrics capture.
+            if not dynamo_trtllm_metrics_disabled:
+                for target in sidecar_worker_metrics_targets(self.backend_processes, backend, frontend):
+                    host = get_hostname_ip(target.process.node, self.runtime.network_interface)
+                    urls.append(f"http://{url_host(host)}:{target.port}{target.path}")
+        elif logical_workers_only:
+            if not dynamo_trtllm_metrics_disabled:
                 for process in self.backend_processes:
                     routable = frontend.worker_endpoint_port(process, self.config, self.runtime) is not None
                     if not routable and not self._process_owns_dp_ranks(process):
@@ -794,9 +813,7 @@ class BenchmarkStageMixin:
                 urls.append(f"http://{host}:{port}{metrics_path}")
         # Dynamo TRT-LLM engine metrics require either the metrics-only
         # flag (the default) or the legacy combined flag (also enabled by
-        # observability). Retain the existing sidecar gate because sidecars
-        # do not receive --publish-metrics. An explicit legacy False disables
-        # both flags. Runtime-only metrics may still exist with publication disabled,
+        # observability). An explicit legacy False disables both flags. Runtime-only metrics may still exist with publication disabled,
         # but must not be advertised as an engine-metrics capture.
         elif not dynamo_trtllm_metrics_disabled:
             for process in self.backend_processes:
@@ -834,14 +851,17 @@ class BenchmarkStageMixin:
         return {"AIPERF_SERVER_METRICS_URLS": ",".join(urls)}
 
     def _process_owns_dp_ranks(self, process: "Process") -> bool:
-        """Whether a worker rank exports metrics for SGLang attention-DP ranks of its own.
+        """Whether a worker rank exports metrics for data-parallel ranks of its own.
 
-        A pure-TP follower serves no engine of its own. With ``dp-size`` > 1,
-        every physical process schedules distinct DP ranks and exports their
-        cache and load metrics, so scraping only the leader drops them.
+        A pure-TP follower serves no engine of its own. With SGLang attention DP
+        (``attn-dp-size`` or ``dp-size`` > 1), every physical process schedules
+        distinct DP ranks and exports their cache and load metrics. With vLLM
+        data parallelism, every per-GPU rank and every node-local DP group serves
+        the requests routed to its ranks and exports their request, token and
+        speculative-decoding counters. Scraping only the leader drops them. The
+        backend decides (``Backend.owns_dp_ranks``).
         """
-        backend = self.config.backend
-        return isinstance(backend, SGLangBackend) and backend.data_parallel_size(process.endpoint_mode) > 1
+        return self.config.backend.owns_dp_ranks(process)
 
     def _get_benchmark_env(self, runner: "BenchmarkRunner") -> dict[str, str]:
         """Get environment variables for the benchmark script."""
@@ -900,7 +920,7 @@ class BenchmarkStageMixin:
                 env.update(self._get_aiperf_server_metrics_env())
             elif is_custom:
                 assert logical_endpoints is not None
-                env.update(self._get_aiperf_server_metrics_env(logical_endpoints, logical_workers_only=True))
+                env.update(self._get_aiperf_server_metrics_env(logical_workers_only=True))
         if isinstance(runner, AIPerfBenchmarkRunner) and self.config.benchmark.aiperf_package:
             env["AIPERF_PACKAGE"] = self.config.benchmark.aiperf_package
 

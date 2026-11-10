@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from srtctl.backends.sglang import MooncakeKVStoreConfig
+    from srtctl.backends.trtllm import TRTLLMMooncakeKVStoreConfig
     from srtctl.backends.vllm import VLLMFailoverConfig, VLLMMooncakeKVStoreConfig
     from srtctl.core.runtime import RuntimeContext
     from srtctl.core.schema import ProfilingConfig
@@ -99,6 +100,9 @@ class RoleSettings(ABC):  # noqa: B024 - its members are declared for the type c
         @property
         def kv_events(self) -> bool | Mapping[str, Any] | None: ...
 
+        @property
+        def mooncake_store_config(self) -> Mapping[str, Any]: ...
+
 
 class BoundRolesField(fields.Field):
     """Marshmallow field for an engine's ``roles``: bound by SrtConfig, never read from a recipe, never dumped."""
@@ -125,6 +129,12 @@ def role_env(roles: Mapping[str, RoleSettings], mode: str) -> dict[str, str]:
     """``roles.<role>.env`` for a worker mode, as a fresh dict; empty when the role is absent."""
     role = role_for_mode(roles, mode)
     return dict(role.env) if role is not None else {}
+
+
+def role_mooncake_store_config(roles: Mapping[str, RoleSettings], mode: str) -> dict[str, Any]:
+    """``roles.<role>.mooncake_store_config`` for a worker mode, as a fresh dict; empty when the role is absent."""
+    role = role_for_mode(roles, mode)
+    return dict(role.mooncake_store_config) if role is not None else {}
 
 
 def role_kv_events(roles: Mapping[str, RoleSettings], mode: str, defaults: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -166,7 +176,9 @@ class Backend(ABC):
         raise NotImplementedError
 
     @property
-    def mooncake_kv_store(self) -> "MooncakeKVStoreConfig | VLLMMooncakeKVStoreConfig | None":
+    def mooncake_kv_store(
+        self,
+    ) -> "MooncakeKVStoreConfig | VLLMMooncakeKVStoreConfig | TRTLLMMooncakeKVStoreConfig | None":
         """The recipe's Mooncake KV store block, or None when the engine has none.
 
         Set, it implies the mooncake-master service and the MOONCAKE_* worker
@@ -232,8 +244,13 @@ class Backend(ABC):
         gpus_per_node: int,
         available_nodes: Sequence[str],
         spread_workers: bool = False,
+        gpu_indices_by_mode: Mapping[WorkerMode, Sequence[frozenset[int]]] | None = None,
     ) -> list["Endpoint"]:
-        """Allocate logical endpoints based on resource requirements."""
+        """Allocate logical endpoints based on resource requirements.
+
+        ``gpu_indices_by_mode`` carries ``roles.<role>.gpu_indices``: the physical
+        GPU set of each worker slot on a node of that mode.
+        """
         raise NotImplementedError
 
     @abstractmethod
@@ -277,7 +294,9 @@ class Backend(ABC):
         """
         return {}
 
-    def get_mooncake_worker_env(self, infra_node_ip: str, local_hostname: str) -> dict[str, str]:
+    def get_mooncake_worker_env(
+        self, infra_node_ip: str, local_hostname: str, mode: WorkerMode | None = None
+    ) -> dict[str, str]:
         """MOONCAKE_* environment for a worker; empty when mooncake_kv_store is None.
 
         - MOONCAKE_LOCAL_HOSTNAME defaults to the worker's resolved IP, but the
@@ -291,6 +310,7 @@ class Backend(ABC):
             infra_node_ip: Resolved IP of the infra node where mooncake_master runs.
             local_hostname: Resolved IP of the worker's own node, for peer-to-peer
                 transfers. Defaults to the worker's primary network interface IP.
+            mode: The worker's mode, for engines whose client config differs by role.
         """
         store = self.mooncake_kv_store
         if store is None:
@@ -301,6 +321,17 @@ class Backend(ABC):
             "MOONCAKE_MASTER": f"{infra_node_ip}:{MOONCAKE_MASTER_PORT}",
             "MOONCAKE_TE_META_DATA_SERVER": f"http://{infra_node_ip}:{MOONCAKE_HTTP_METADATA_PORT}/metadata",
         }
+
+    def mooncake_store_configs(self, infra_node_ip: str, served_model_name: str) -> dict[str, dict[str, Any]]:
+        """Mooncake client configs to write into log_dir before workers start, by file name.
+
+        log_dir is mounted at /logs in every worker, where get_mooncake_worker_env
+        points MOONCAKE_CONFIG_PATH. Empty for an engine that reads its Mooncake
+        settings from the MOONCAKE_* environment instead (SGLang).
+        ``served_model_name`` is the name the workers serve, for engines that key the
+        pool by the model.
+        """
+        return {}
 
     def get_failover_environment(self, process: "Process", job_id: str) -> dict[str, str]:
         """Shadow engine recovery environment for a worker; empty when failover is None."""
@@ -326,3 +357,46 @@ class Backend(ABC):
         to ``False``; override for an engine with a gRPC server.
         """
         return False
+
+    def direct_worker_scheme(self, mode: WorkerMode) -> str:
+        """URL transport of the engine's native workers behind a static router."""
+        return "grpc" if self.is_grpc_mode(mode) else "http"
+
+    def router_worker_address(self, process: "Process", frontend_node: str | None = None) -> tuple[str, int] | None:
+        """Listener node and port advertised to a router, or None for an unrouted rank.
+
+        Native HTTP/gRPC listeners belong to the worker node. Engines whose
+        connections terminate at the gateway override this without changing
+        the physical worker's node or HTTP port.
+        """
+        return (process.node, process.http_port) if process.http_port > 0 else None
+
+    def owns_dp_ranks(self, process: "Process") -> bool:
+        """Whether this worker process runs data-parallel ranks of its own and exports their metrics.
+
+        A custom benchmark gets one metrics URL per logical worker leader, plus
+        every follower for which this is true. Defaults to ``False``: a
+        follower rank reports through its leader.
+        """
+        return False
+
+    def runs_dynamo_sidecar(self, process: "Process", endpoint_processes: list["Process"]) -> bool:
+        """In Dynamo sidecar mode (``dynamo.sidecar``), whether this process launches a Dynamo sidecar.
+
+        A sidecar starts the Dynamo runtime's system status server on
+        ``DYN_SYSTEM_PORT`` (``Process.sys_port``), which serves the runtime's
+        ``/metrics``; a process that runs only the native engine binds nothing
+        there. ``endpoint_processes`` are every process of the same logical
+        worker, as the command builder sees them. Defaults to ``False``: an
+        engine without sidecar support runs none.
+        """
+        return False
+
+    def sidecar_engine_metrics_port(self, process: "Process", endpoint_processes: list["Process"]) -> int | None:
+        """In Dynamo sidecar mode, the allocated port the native engine serves Prometheus on.
+
+        The engine serves it at ``prometheus_metrics_path`` on this process's
+        node. ``None`` when the process's engine serves no Prometheus endpoint
+        (the default, and every engine without sidecar support).
+        """
+        return None

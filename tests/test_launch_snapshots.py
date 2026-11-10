@@ -12,6 +12,7 @@ exactly what moved on the cluster.
 from __future__ import annotations
 
 import difflib
+import os
 from pathlib import Path
 
 import pytest
@@ -39,10 +40,59 @@ def test_launch_plan_matches_snapshot(recipe: Path):
         )
 
 
+@pytest.mark.parametrize("custom_passthrough", [False, True], ids=["builtin-env", "recipe-env"])
+def test_eval_only_snapshot_ignores_ambient_eval_environment(monkeypatch, custom_passthrough: bool) -> None:
+    recipe = REPO_ROOT / "examples/trtllm/trtllm-serve-disagg-eval-only.yaml"
+    if custom_passthrough:
+        from dataclasses import replace
+
+        from srtctl.core import config as config_module
+
+        original_load = config_module.load_config
+
+        def load_with_passthrough(path):
+            config = original_load(path)
+            return replace(config, post_eval=replace(config.post_eval, passthrough_env=["SNAPSHOT_EVAL_LABEL"]))
+
+        monkeypatch.setattr(config_module, "load_config", load_with_passthrough)
+
+    ambient = {
+        "MODEL": "foo",
+        "ISL": "1024",
+        "FRAMEWORK": "x",
+        "PRECISION": "fp4",
+        "EVAL_CONC": "999",
+        "RUN_EVAL": "true",
+        "EVAL_ONLY": "false",
+        "SNAPSHOT_EVAL_LABEL": "ambient-label",
+    }
+    for key, value in ambient.items():
+        monkeypatch.setenv(key, value)
+    caller_environment = dict(os.environ)
+
+    actual = render_launch_plan(recipe)
+
+    assert dict(os.environ) == caller_environment
+    assert actual == snapshot_path(recipe).read_text()
+
+
 def test_every_runnable_example_runs_to_completion():
     for recipe in RECIPES:
         header = snapshot_path(recipe).read_text().splitlines()[:2]
         assert header[1] == "# exit_code: 0", f"{recipe.relative_to(REPO_ROOT)} fails under the mock orchestrator"
+
+
+@pytest.mark.parametrize("home", ["/root", "/home/snapshot-user"])
+@pytest.mark.parametrize(
+    "example,literal",
+    [("sglang/dynamo-agg.yaml", "${HOME:-/root}"), ("miles/qwen3-4b-grpo.yaml", "cd /root/miles")],
+)
+def test_snapshot_preserves_container_home_paths(monkeypatch, home: str, example: str, literal: str) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: Path(home)))
+    recipe = REPO_ROOT / "examples" / example
+    actual = render_launch_plan(recipe)
+    assert literal in actual
+    assert actual == snapshot_path(recipe).read_text()
 
 
 def test_no_orphan_snapshots():

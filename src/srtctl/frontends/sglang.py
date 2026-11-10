@@ -6,13 +6,16 @@
 The router-free single-replica mode is `frontend.type: sglang`; see sglang_direct.py.
 """
 
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from srtctl.core.slurm import get_hostname_ip, start_srun_process
 from srtctl.core.topology import Process
 from srtctl.frontends.base import register_frontend
 from srtctl.frontends.static_router import StaticRouterFrontend
 from srtctl.ports import SGLANG_ROUTER_METRICS_PORT
+
+if TYPE_CHECKING:
+    from srtctl.core.runtime import RuntimeContext
 
 
 def router_metrics_port(frontend_args: dict[str, Any] | None) -> int:
@@ -33,7 +36,7 @@ class SGLangRouterFrontend(StaticRouterFrontend):
     executable: ClassVar[tuple[str, ...]] = ("python", "-m", "sglang_router.launch_router")
     pd_flag: ClassVar[str] = "--pd-disaggregation"
     process_name: ClassVar[str] = "sglang_router"
-    log_label: ClassVar[str] = "router"
+    log_label: ClassVar[str | None] = "router"
     # Preserve the historical launch shape used by dry-run/topology callers
     # that construct the frontend before populating worker processes.
     allow_empty_workers: ClassVar[bool] = True
@@ -50,6 +53,7 @@ class SGLangRouterFrontend(StaticRouterFrontend):
         config: Any,
         backend: Any,
         backend_processes: list[Process],
+        runtime: "RuntimeContext | None" = None,
     ) -> list[str]:
         """Expose the gateway's Prometheus listener unless the recipe configured it itself.
 

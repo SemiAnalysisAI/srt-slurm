@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from srtctl.backends import SGLangBackend
-from srtctl.core.schema import PlacementConfig, SrtConfig, RoleConfig
+from srtctl.core.schema import PlacementConfig, RoleConfig, SrtConfig
 from srtctl.ports import (
     KV_EVENTS_PORT_BASE,
     SGLANG_HTTP_PORT_BASE,
@@ -2613,6 +2613,12 @@ class TestVLLMDataParallelMode:
         assert backend_dp.is_dp_mode("decode") is True
         assert backend_dp._get_dp_size("prefill") == 16
 
+        backend_dp1 = VLLMBackend(
+            roles={"prefill": RoleConfig(args={"data-parallel-size": 1, "pipeline-parallel-size": 6})}
+        )
+        assert backend_dp1._get_dp_size("prefill") == 1
+        assert backend_dp1.is_dp_mode("prefill") is False
+
     def test_dp_per_gpu_mode_creates_per_gpu_processes(self):
         """The deprecated compatibility mode still creates one process per GPU."""
         from srtctl.backends import VLLMBackend
@@ -2656,6 +2662,64 @@ class TestVLLMDataParallelMode:
         # dp_rank (stored in node_rank) should go from 0 to 15
         dp_ranks = [p.node_rank for p in processes]
         assert dp_ranks == list(range(16))
+
+    def test_dp_size_one_pp_across_nodes_uses_nnodes_not_dp_ranks(self):
+        """PP6 on 2×3 GPUs is TP/PP launch, not one DP rank owning 6 GPUs."""
+        from pathlib import Path
+        from unittest.mock import MagicMock, patch
+
+        from srtctl.backends import VLLMBackend
+        from srtctl.core.topology import allocate_endpoints
+
+        backend = VLLMBackend(
+            roles={
+                "prefill": RoleConfig(
+                    args={
+                        "tensor-parallel-size": 1,
+                        "pipeline-parallel-size": 6,
+                        "data-parallel-size": 1,
+                    }
+                )
+            }
+        )
+        endpoints = allocate_endpoints(
+            num_prefill=1,
+            num_decode=0,
+            num_agg=0,
+            gpus_per_prefill=6,
+            gpus_per_decode=1,
+            gpus_per_agg=0,
+            gpus_per_node=4,
+            available_nodes=("node0", "node1"),
+        )
+        assert endpoints[0].total_gpus == 6
+        assert endpoints[0].gpu_indices == frozenset({0, 1, 2})
+
+        processes = backend.endpoints_to_processes(endpoints)
+        assert len(processes) == 2
+        assert [p.node for p in processes] == ["node0", "node1"]
+        assert all(p.gpu_indices == frozenset({0, 1, 2}) for p in processes)
+        assert [p.node_rank for p in processes] == [0, 1]
+
+        mock_runtime = MagicMock()
+        mock_runtime.model_path = Path("/model")
+        mock_runtime.is_hf_model = False
+        mock_runtime.request_plane = "tcp"
+
+        with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):
+            follower = backend.build_worker_command(
+                process=processes[1],
+                endpoint_processes=processes,
+                runtime=mock_runtime,
+            )
+
+        assert follower[follower.index("--nnodes") + 1] == "2"
+        assert follower[follower.index("--node-rank") + 1] == "1"
+        assert "--headless" in follower
+        assert "--data-parallel-rank" not in follower
+        assert follower[follower.index("--pipeline-parallel-size") + 1] == "6"
+        assert follower[follower.index("--data-parallel-size") + 1] == "1"
+        assert follower[follower.index("--device-ids") + 1] == "0,1,2"
 
     def test_dp_mode_defaults_to_per_node_processes(self):
         """DP defaults to one process per node with rank-sized port blocks."""
@@ -2921,9 +2985,7 @@ class TestVLLMDataParallelMode:
         from srtctl.backends import VLLMBackend
         from srtctl.core.topology import Endpoint
 
-        backend = VLLMBackend(
-            roles={"agg": RoleConfig(args={"data-parallel-size": 8, "enable-expert-parallel": True})}
-        )
+        backend = VLLMBackend(roles={"agg": RoleConfig(args={"data-parallel-size": 8, "enable-expert-parallel": True})})
 
         endpoint = Endpoint(
             mode="agg",
@@ -2992,6 +3054,7 @@ class TestVLLMDataParallelMode:
         runtime = MagicMock()
         runtime.model_path = Path("/model")
         runtime.is_hf_model = False
+        runtime.worker_model_arg = "/model"
         runtime.frontend_port = 9000
         runtime.network_interface = "eth0"
 
@@ -3030,6 +3093,7 @@ class TestVLLMDataParallelMode:
         runtime = MagicMock()
         runtime.model_path = Path("/model")
         runtime.is_hf_model = False
+        runtime.worker_model_arg = "/model"
         runtime.frontend_port = 8000
 
         with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):
@@ -3076,6 +3140,7 @@ class TestVLLMDataParallelMode:
         runtime = SimpleNamespace(
             model_path=Path("Qwen/Qwen3-0.6B"),
             is_hf_model=True,
+            worker_model_arg="Qwen/Qwen3-0.6B",
             frontend_port=8000,
             head_node_ip="10.20.30.40",
             network_interface="ib0",
@@ -3121,6 +3186,7 @@ class TestVLLMDataParallelMode:
         runtime = SimpleNamespace(
             model_path=Path("/model"),
             is_hf_model=False,
+            worker_model_arg="/model",
             frontend_port=8000,
             head_node_ip="10.0.0.1",
             network_interface=None,
@@ -3162,6 +3228,7 @@ class TestVLLMDataParallelMode:
         runtime = MagicMock()
         runtime.model_path = Path("/model")
         runtime.is_hf_model = False
+        runtime.worker_model_arg = "/model"
         runtime.frontend_port = 9000
         runtime.network_interface = "eth0"
 
@@ -3525,7 +3592,9 @@ class TestVLLMDataParallelMode:
             gpus_per_node=4,
         )
         processes = backend.endpoints_to_processes([endpoint])
-        runtime = MagicMock(model_path=Path("/model"), is_hf_model=False, request_plane="tcp")
+        runtime = MagicMock(
+            model_path=Path("/model"), is_hf_model=False, worker_model_arg="/model", request_plane="tcp"
+        )
 
         with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):
             commands = [backend.build_worker_command(process, processes, runtime) for process in processes]
@@ -3556,7 +3625,9 @@ class TestVLLMDataParallelMode:
             gpus_per_node=4,
         )
         processes = backend.endpoints_to_processes([endpoint])
-        runtime = MagicMock(model_path=Path("/model"), is_hf_model=False, request_plane="tcp")
+        runtime = MagicMock(
+            model_path=Path("/model"), is_hf_model=False, worker_model_arg="/model", request_plane="tcp"
+        )
 
         with patch("srtctl.core.slurm.get_hostname_ip", side_effect=lambda node: f"10.0.0.{int(node[-1]) + 1}"):
             commands = [backend.build_worker_command(process, processes, runtime) for process in processes]
@@ -3634,7 +3705,9 @@ class TestVLLMDataParallelMode:
             gpus_per_node=4,
         )
         processes = backend.endpoints_to_processes([endpoint])
-        runtime = MagicMock(model_path=Path("/model"), is_hf_model=False, request_plane="tcp")
+        runtime = MagicMock(
+            model_path=Path("/model"), is_hf_model=False, worker_model_arg="/model", request_plane="tcp"
+        )
 
         with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):
             commands = [backend.build_worker_command(process, processes, runtime) for process in processes]
@@ -4113,6 +4186,21 @@ class TestHuggingFaceModelSupport:
         idx = cmd.index("--model")
         assert cmd[idx + 1] == "/model"
 
+    def test_vllm_uses_resolved_worker_model_path(self):
+        from unittest.mock import patch
+
+        from srtctl.backends import VLLMBackend
+
+        backend = VLLMBackend(connector=None)
+        process = self._make_process()
+        runtime = self._make_runtime(is_hf=False)
+        runtime.worker_model_arg = "/srtctl-model-cache/snapshots/revision"
+
+        with patch("srtctl.core.slurm.get_hostname_ip", return_value="10.0.0.1"):
+            cmd = backend.build_worker_command(process=process, endpoint_processes=[process], runtime=runtime)
+
+        assert cmd[cmd.index("--model") + 1] == "/srtctl-model-cache/snapshots/revision"
+
     # --- SGLang ---
 
     def test_sglang_hf_model_uses_model_id(self):
@@ -4336,12 +4424,14 @@ class TestHuggingFaceModelSupport:
             (False, "gb200", "decode", None, "dynamo"),
             ("local", "gb200", "decode", "local", "dynamo"),
             ("local", "h100", "agg", "local", "trtllm_serve"),
+            ("preferred", "gb300", "decode", "preferred", "trtllm_serve"),
+            ("preferred", "h100", "agg", "preferred", "dynamo"),
         ],
     )
     def test_trtllm_numa_cpu_bind_selects_memory_policy(
         self, memory_bind, gpu_type, mode, expected_policy, frontend_type
     ):
-        """CPU binding preserves old policies; only local mode binds in the wrapper."""
+        """CPU binding preserves old policies; only local and preferred modes set memory in the wrapper."""
         from pathlib import Path
         from unittest.mock import patch
 
@@ -4368,6 +4458,8 @@ class TestHuggingFaceModelSupport:
         prefix = ["bash", "/configs/numa_cpu_bind.sh"]
         if expected_policy == "local":
             prefix.append("--bind-memory")
+        elif expected_policy == "preferred":
+            prefix.append("--prefer-memory")
         prefix.extend(["nsys", "profile"])
         if expected_policy == "0,1":
             prefix.extend(["numactl", "-m", "0,1"])
@@ -4375,10 +4467,11 @@ class TestHuggingFaceModelSupport:
         assert cmd[: len(prefix)] == prefix
         assert ("numactl" in cmd) is (expected_policy == "0,1")
 
-        env = backend.get_environment_for_mode("decode")
+        # Preserve the launch CPU mask under every memory policy.
+        env = backend.get_environment_for_mode(mode)
         assert env["TLLM_NUMA_AWARE_WORKER_AFFINITY"] == "0"
 
-    def test_trtllm_numa_cpu_bind_wraps_prefill_command_with_taskset(self):
+    def test_trtllm_numa_cpu_bind_wraps_prefill_command(self):
         """numa_cpu_bind=True wraps prefill commands with configs/numa_cpu_bind.sh too."""
         from pathlib import Path
         from unittest.mock import patch
@@ -4402,7 +4495,7 @@ class TestHuggingFaceModelSupport:
         prefill_env = backend.get_environment_for_mode("prefill")
         assert prefill_env["TLLM_NUMA_AWARE_WORKER_AFFINITY"] == "0"
 
-    def test_trtllm_numa_cpu_bind_wraps_agg_command_with_taskset(self):
+    def test_trtllm_numa_cpu_bind_wraps_agg_command(self):
         """numa_cpu_bind=True wraps aggregated-mode commands too."""
         from pathlib import Path
         from unittest.mock import patch
@@ -4449,6 +4542,24 @@ class TestHuggingFaceModelSupport:
         decode_env = backend.get_environment_for_mode("decode")
         assert "TLLM_NUMA_AWARE_WORKER_AFFINITY" not in decode_env
         assert "NUMA_CPU_BIND_RANGES" not in decode_env
+
+    @pytest.mark.parametrize("memory_bind", [None, True, False, "local", "preferred"])
+    @pytest.mark.parametrize("override", ["0", "1"])
+    def test_trtllm_numa_cpu_bind_keeps_role_worker_affinity(self, memory_bind, override):
+        """Explicit worker affinity passes through unchanged under every memory policy."""
+        from srtctl.backends import TRTLLMBackend
+
+        backend = TRTLLMBackend(
+            roles={
+                "prefill": RoleConfig(env={"TLLM_NUMA_AWARE_WORKER_AFFINITY": override}),
+                "decode": RoleConfig(),
+            },
+            numa_cpu_bind=True,
+            numa_memory_bind=memory_bind,
+        )
+
+        assert backend.get_environment_for_mode("prefill")["TLLM_NUMA_AWARE_WORKER_AFFINITY"] == override
+        assert backend.get_environment_for_mode("decode")["TLLM_NUMA_AWARE_WORKER_AFFINITY"] == "0"
 
 
 class TestInfmaxWorkspaceMount:
@@ -4666,6 +4777,7 @@ class TestDirectVllmMultiNode:
         runtime = MagicMock()
         runtime.model_path = Path("/model")
         runtime.is_hf_model = False
+        runtime.worker_model_arg = "/model"
         runtime.frontend_port = 9000
         runtime.network_interface = "eth0"
 

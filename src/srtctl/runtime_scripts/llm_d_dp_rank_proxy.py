@@ -49,7 +49,8 @@ def rank_app(session: ClientSession, upstream: str, rank: int) -> web.Applicatio
     async def handle(request: web.Request) -> web.StreamResponse:
         url = upstream + request.rel_url.raw_path_qs
         if request.method == "GET" and request.path == "/metrics":
-            async with session.get(url) as upstream_response:
+            # Uncompressed: the session leaves bodies encoded so the proxied routes pass through as-is.
+            async with session.get(url, headers={"Accept-Encoding": "identity"}) as upstream_response:
                 return web.Response(text=rank_metrics(await upstream_response.text(), rank), content_type="text/plain")
         headers = {key: value for key, value in request.headers.items() if key.lower() not in HOP_HEADERS}
         headers[RANK_HEADER] = str(rank)

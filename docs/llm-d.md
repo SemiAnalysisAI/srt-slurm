@@ -80,8 +80,10 @@ A vLLM `MultiConnector` maps through the first connector it wraps that has a pro
 NIXL next to vLLM's `OffloadingConnector` (CPU KV offloading, as in llm-d's tiered
 wide-EP guide) runs `nixlv2`. For SGLang prefill/decode jobs, srtctl also sets
 `SGLANG_BOOTSTRAP_PORT=7200` (`SGLANG_BOOTSTRAP_PORT_BASE`) in the sidecar environment
-to match the `--disaggregation-bootstrap-port` given to each prefill worker. Any other
-decode connector is rejected at load time.
+to match the `--disaggregation-bootstrap-port` given to each prefill worker; on GB200,
+set `SGLANG_MOONCAKE_CUSTOM_MEM_POOL=True` in the workers' `env` so NIXL uses the NVLink
+memory pool across trays instead of falling back to TCP. Any other decode connector is
+rejected at load time.
 
 ## Endpoint discovery
 
@@ -272,6 +274,11 @@ that rank.
   `SGLANG_BOOTSTRAP_PORT` (`7200`).
 - `roles.<role>.kv_events` is supported on vLLM only; with SGLang, use
   `approx-prefix-cache-producer` in `frontend.epp_config`.
+- SGLang DP attention (`enable-dp-attention`) on `agg` or `prefill` workers loses
+  prefix-cache affinity: the EPP sees one endpoint per SGLang server, and SGLang spreads
+  requests across its DP ranks (`round_robin` for `agg`, `follow_bootstrap_room` with the
+  sidecar's random bootstrap room for prefill), each with its own radix cache. DP
+  attention on `decode` alone is unaffected.
 - One router replica: the EPP keeps its scheduling state (the approximate prefix index,
   in-flight load) in memory. Multi-node jobs require `enable_multiple_frontends: false`:
   nginx would put the router on a different node from the public endpoint, where readiness

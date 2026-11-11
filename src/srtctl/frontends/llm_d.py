@@ -39,6 +39,7 @@ from srtctl.core.health import WorkerHealthResult
 from srtctl.frontends.base import numactl_prefix, register_frontend
 from srtctl.frontends.static_router import StaticRouterFrontend
 from srtctl.ports import (
+    LLM_D_DP_RANK_PROXY_PORT_BASE,
     LLM_D_ENVOY_ADMIN_PORT,
     LLM_D_EPP_GRPC_PORT,
     LLM_D_EPP_HEALTH_PORT,
@@ -469,6 +470,38 @@ class LLMDFrontend(StaticRouterFrontend):
             )
         return {"endpoints": endpoints}
 
+    def pin_dp_ranks(
+        self, config: Any, endpoints: list[dict[str, Any]], backend_processes: list[Process], router_host: str
+    ) -> tuple[list[dict[str, Any]], list[str]]:
+        """Replace each SGLang DP server the EPP prefix-routes to with one endpoint per DP rank.
+
+        SGLang serves all ranks on one port and dispatches to them itself (round robin, or the
+        sidecar's random bootstrap room), and every rank has its own radix cache, so prefix
+        affinity to the server is lost inside it. Each rank's endpoint is a router-node proxy
+        listener that pins requests with ``X-Data-Parallel-Rank``. Decode workers keep one
+        endpoint: their cache is filled by the prefill transfer, not by prefix reuse.
+        Returns the endpoints and the proxy's ``PORT=URL#RANK`` routes.
+        """
+        from srtctl.backends.sglang import SGLangBackend
+
+        routable = [process for process in backend_processes if process.http_port > 0]
+        pinned: list[dict[str, Any]] = []
+        routes: list[str] = []
+        for process, endpoint in zip(routable, endpoints, strict=True):
+            backend = config.backend_for_role(process.endpoint_mode)
+            ranks = backend.num_dp_ranks(process.endpoint_mode) if isinstance(backend, SGLangBackend) else 1
+            if ranks == 1 or process.endpoint_mode == "decode":
+                pinned.append(endpoint)
+                continue
+            upstream = f"http://{endpoint['address']}:{process.http_port}"
+            for rank in range(ranks):
+                port = LLM_D_DP_RANK_PROXY_PORT_BASE + len(routes)
+                routes.append(f"{port}={upstream}#{rank}")
+                pinned.append(
+                    {**endpoint, "name": f"{endpoint['name']}-dp{rank}", "address": router_host, "port": str(port)}
+                )
+        return pinned, routes
+
     def render_url(self, backend_processes: list[Process], network_interface: str | None) -> str:
         """Direct worker API for tokenization; prefer the first prefill worker."""
         routable = [process for process in backend_processes if process.http_port > 0]
@@ -511,6 +544,13 @@ class LLMDFrontend(StaticRouterFrontend):
         )
 
         endpoints = self.endpoints_document(backend_processes, runtime.network_interface, backend.type)
+        router_node = topology.frontend_nodes[0]
+        endpoints["endpoints"], rank_routes = self.pin_dp_ranks(
+            config,
+            endpoints["endpoints"],
+            backend_processes,
+            self.resolve_worker_host(router_node, runtime.network_interface),
+        )
         (runtime.log_dir / ENDPOINTS_FILE).write_text(yaml.safe_dump(endpoints, sort_keys=False))
         epp_config = config.frontend.epp_config
         epp_document = epp_config_document(
@@ -536,6 +576,34 @@ class LLMDFrontend(StaticRouterFrontend):
         container_image = config.frontend.container_image or str(runtime.container_image)
         env = {**runtime.environment, **(config.frontend.env or {})}
         processes: list[ManagedProcess] = []
+        if rank_routes:
+            # The SGLang image has aiohttp; the router image need not have Python.
+            log_file = runtime.log_dir / f"{router_node}_{self.process_name}-dp-rank-proxy.out"
+            step_name = f"{self.process_name}-dp-rank-proxy"
+            proc = self.start_process(
+                command=["python3", "/srtctl-runtime/llm_d_dp_rank_proxy.py", *rank_routes],
+                nodelist=[router_node],
+                output=str(log_file),
+                container_image=str(runtime.container_image),
+                reuse_container=runtime.reuse_container,
+                container_prepare_timeout_seconds=runtime.container_prepare_timeout_seconds,
+                container_mounts=runtime.container_mounts,
+                env_to_set=None,
+                het_group=runtime.nodes.het_group_for(router_node),
+                step_name=step_name,
+                srun_options=runtime.srun_options,
+            )
+            processes.append(
+                ManagedProcess(
+                    name=step_name,
+                    popen=proc,
+                    log_file=log_file,
+                    node=router_node,
+                    critical=True,
+                    terminate_timeout=FRONTEND_TERMINATE_TIMEOUT_SECONDS,
+                    step_name=step_name,
+                )
+            )
         for idx, node in enumerate(topology.frontend_nodes):
             for component, command in commands.items():
                 cmd = numactl_prefix(config) + command

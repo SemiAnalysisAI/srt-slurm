@@ -48,6 +48,8 @@ LLM_D_EPP_GRPC_PORT = 9002
 LLM_D_EPP_HEALTH_PORT = 9003
 LLM_D_EPP_METRICS_PORT = 9090
 LLM_D_ENVOY_ADMIN_PORT = 9901
+# Router-node listeners, one per SGLang DP rank the EPP routes to (runtime_scripts/llm_d_dp_rank_proxy.py).
+LLM_D_DP_RANK_PROXY_PORT_BASE = 9700
 # EPP binds this ZMQ subscriber; all KV-event publishers connect to it.
 LLM_D_EPP_KV_EVENTS_PORT = 5557
 # Per-worker proxy listeners, including llm-d decode sidecars; see PROXY_PORTS.

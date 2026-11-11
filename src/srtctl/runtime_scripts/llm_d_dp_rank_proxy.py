@@ -85,7 +85,15 @@ def rank_app(
                 headers={k: v for k, v in upstream_response.headers.items() if k.lower() not in HOP_HEADERS},
             )
             await response.prepare(request)
-            async for chunk in upstream_response.content.iter_any():
+            # Forward the server's HTTP chunks one for one: SSE clients can mishandle several
+            # events in one chunk (AgentX scored merged one-token streams as empty).
+            chunk = b""
+            async for data, end_of_chunk in upstream_response.content.iter_chunks():
+                chunk += data
+                if end_of_chunk:
+                    await response.write(chunk)
+                    chunk = b""
+            if chunk:
                 await response.write(chunk)
             await response.write_eof()
             return response
